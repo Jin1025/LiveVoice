@@ -165,9 +165,9 @@ class VCTKDataset(Dataset):
         try:
             data = torch.load(feat_path, map_location="cpu", weights_only=True)
             feats = data["feats"].float()
-            audio_stride = int(data["audio_stride"])
-            n_frames = int(round(self.target_len / audio_stride))
-            start_frame = start_sample // audio_stride
+            # HuBERT is always 50 fps regardless of training SR — compute from target_sr directly
+            n_frames = int(round(self.target_len * 50 / self.target_sr))
+            start_frame = int(start_sample * 50 / self.target_sr)
             chunk = feats[start_frame : start_frame + n_frames]
             if chunk.shape[0] < n_frames:
                 chunk = torch.nn.functional.pad(chunk, (0, 0, 0, n_frames - chunk.shape[0]))

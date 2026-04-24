@@ -209,15 +209,15 @@ def main():
     pv = sub.add_parser("vctk")
     pv.add_argument("--vctk_path", default="/mnt/data/disk2/VCTK-Corpus")
     pv.add_argument("--out_dir", default="/mnt/data/disk2/yejin/features/vctk")
-    pv.add_argument("--training_sr", type=int, default=24000,
-                    help="training sample rate — determines audio_stride (e.g. 24000 for DAC 24kHz)")
+    pv.add_argument("--training_sr", type=int, default=16000,
+                    help="training sample rate — determines audio_stride (e.g. 16000 for DAC 16kHz)")
 
     pl = sub.add_parser("libritts")
     pl.add_argument("--libritts_path", default="/mnt/data/disk2/LibriTTS")
     pl.add_argument("--splits", default="train-clean-100,train-clean-360,dev-clean")
     pl.add_argument("--out_dir", default="/mnt/data/disk2/yejin/LiveVoice/features/libritts")
-    pl.add_argument("--training_sr", type=int, default=24000,
-                    help="training sample rate — determines audio_stride (e.g. 24000 for DAC 24kHz)")
+    pl.add_argument("--training_sr", type=int, default=16000,
+                    help="training sample rate — determines audio_stride (e.g. 16000 for DAC 16kHz)")
 
     for sp in [pv, pl]:
         sp.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
