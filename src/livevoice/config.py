@@ -29,9 +29,9 @@ class LiveVoiceConfig:
     # dac_model_type: 16kHz speech model has 12 RVQ codebooks, hop=320 (50 frames/sec)
     # dac_model_type: 24kHz speech model has 9 RVQ codebooks, hop=320 (75 frames/sec)
     # dac_model_type: 44kHz speech model has 9 RVQ codebooks, hop=320 (137.5 frames/sec)
-    dac_model_type: str = "24khz" # "16khz" or "24khz" or "44khz"
-    dac_sample_rate: int = 24000 # 24000 or 44100
-    dac_n_codebooks: int = 9
+    dac_model_type: str = "16khz" # "16khz" or "24khz" or "44khz"
+    dac_sample_rate: int = 16000 # 24000 or 44100
+    dac_n_codebooks: int = 12
     dac_codebook_size: int = 1024
     dac_depth: int = 9
     dac_latent_dim: int = 1024
@@ -40,7 +40,7 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     # Audio / windowing
     # ------------------------------------------------------------------
-    sample_rate: int = 44100 # 24000 or 44100
+    sample_rate: int = 16000 # 24000 or 44100
     audio_duration: float = 4.0  # seconds per training window
     train_batch_size: int = 16
     val_batch_size: int = 4
