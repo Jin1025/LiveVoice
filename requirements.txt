@@ -1,0 +1,29 @@
+# Core dependencies
+torch>=2.0.0
+torchaudio>=2.0.0
+lightning>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Audio codec + features
+descript-audio-codec>=1.0.0
+transformers>=4.40.0       # HuBERT
+librosa>=0.10.0
+soundfile>=0.12.1
+torchcrepe>=0.0.19         # F0 / periodicity (optional prosody)
+
+# Data / logging
+pandas>=2.0.0
+huggingface-hub<1.0.0
+tensorboard>=2.13.0
+wandb>=0.16.0
+matplotlib>=3.7.0
+einops>=0.7.0
+
+# Evaluation
+jiwer>=3.0.0               # WER for intelligibility
+# speechbrain>=1.0.0       # optional: ECAPA-TDNN for SECS (speaker similarity)
+
+# Optional / dev
+jupyter>=1.0.0
+ipython>=8.0.0
