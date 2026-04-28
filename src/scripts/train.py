@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
     WandbLogger = None
 
 from livevoice.config import LiveVoiceConfig
-from livevoice.model import DACModel, HuBERTContentExtractor, ProsodyExtractor, LiveVoiceModel
+from livevoice.model import build_codec, HuBERTContentExtractor, ProsodyExtractor, LiveVoiceModel
 from livevoice.lightning import LiveVoiceLightningModule
 from livevoice.data.datamodule import VCTKDataModule, LibriTTSDataModule
 
@@ -60,6 +60,9 @@ def parse_args():
     p.set_defaults(use_wandb=True)
     p.add_argument("--wandb_project", type=str, default="LiveVoice")
     p.add_argument("--wandb_entity", type=str, default=None)
+    # Codec
+    p.add_argument("--codec", type=str, default="mimi", choices=["dac", "mimi"])
+    p.add_argument("--mimi_cache_dir", type=str, default="/mnt/data/disk2/yejin/LiveVoice/mimi_precomputed")
     # Ablations
     p.add_argument("--zero_speaker", action="store_true")
     p.add_argument("--zero_content", action="store_true")
@@ -71,8 +74,6 @@ def main():
     args = parse_args()
     L.seed_everything(args.seed)
 
-    # LibriTTS → automatically switch to 24 kHz DAC config
-    is_libritts = (args.dataset == "libritts")
     config = LiveVoiceConfig(
         exp_name=args.exp_name,
         output_dir=args.output_dir,
@@ -97,20 +98,14 @@ def main():
         zero_speaker=args.zero_speaker,
         zero_content=args.zero_content,
         ablate_cross_attn=args.ablate_cross_attn,
-        # 24 kHz overrides for LibriTTS
-        **({
-            "sample_rate": 24000,
-            "dac_model_type": "24khz",
-            "dac_sample_rate": 24000,
-            "dac_n_codebooks": 9,
-            "dac_hop_length": 320,
-        } if is_libritts else {}),
+        codec=args.codec
     )
-    print(f"[train] Dataset: {args.dataset}  SR: {config.sample_rate} Hz  "
-          f"DAC: {config.dac_model_type}  n_codebooks: {config.n_codebooks_predict}")
 
-    print(f"[train] Building DAC model ({config.dac_model_type})...")
-    dac_model = DACModel(config)
+    print(f"[train] Dataset: {args.dataset}  SR: {config.sample_rate} Hz  "
+          f"codec: {config.codec}  n_codebooks: {config.n_codebooks_predict}")
+
+    print(f"[train] Building codec ({config.codec})...")
+    codec_model = build_codec(config)
 
     print(f"[train] Building HuBERT content extractor ({config.hubert_model_name}, layer {config.hubert_layer})...")
     content_extractor = HuBERTContentExtractor(config)
@@ -121,7 +116,7 @@ def main():
         prosody_extractor = ProsodyExtractor(config)
 
     print("[train] Building LiveVoiceModel...")
-    model = LiveVoiceModel(config, dac_model, content_extractor, prosody_extractor)
+    model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor)
 
     if args.compile:
         print("[train] torch.compile ...")
@@ -132,7 +127,7 @@ def main():
     print(f"[train] Parameters: {trainable / 1e6:.2f}M trainable / {total / 1e6:.2f}M total")
 
     lit_model = LiveVoiceLightningModule(config, model)
-    dm = LibriTTSDataModule(config) if is_libritts else VCTKDataModule(config)
+    dm = LibriTTSDataModule(config) if args.dataset == "libritts" else VCTKDataModule(config)
 
     log_dir = os.path.join(config.output_dir, "logs")
     ckpt_dir = os.path.join(config.output_dir, "checkpoints", config.exp_name)

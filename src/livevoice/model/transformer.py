@@ -196,23 +196,24 @@ class LiveVoiceModel(nn.Module):
         # Per-codebook decoder input projections + output heads (MusicGen delay)
         K = int(config.n_codebooks_predict)
         self.n_codebooks_predict = K
+        latent_dim    = dac_model.latent_dim
+        codebook_size = dac_model.codebook_size
+
         for k in range(K):
-            qk = dac_model.dac_model.quantizer.quantizers[k]
-            with torch.no_grad():
-                cb = qk.codebook.weight  # (codebook_size, codebook_dim)
-                cb_for_conv = cb.T.unsqueeze(0)
-                effective_emb = qk.out_proj(cb_for_conv).squeeze(0).T  # (codebook_size, D_dac)
-            self.register_buffer(f"codebook_vectors_{k}", effective_emb)
+            emb = dac_model.get_codebook_embeddings(k)
+            if emb is None:
+                emb = torch.randn(codebook_size, latent_dim) * 0.02
+            self.register_buffer(f"codebook_vectors_{k}", emb.float())
 
         self.decoder_input_projs = nn.ModuleList([
-            nn.Linear(config.dac_latent_dim, config.hidden_dim) for _ in range(K)
+            nn.Linear(latent_dim, config.hidden_dim) for _ in range(K)
         ])
         self.codebook_heads = nn.ModuleList([
-            nn.Linear(config.hidden_dim, config.dac_codebook_size) for _ in range(K)
+            nn.Linear(config.hidden_dim, codebook_size) for _ in range(K)
         ])
 
         # Speaker / reference → hidden_dim
-        self.speaker_proj = nn.Linear(config.dac_latent_dim, config.hidden_dim)
+        self.speaker_proj = nn.Linear(latent_dim, config.hidden_dim)
 
     # --------------------- helpers ---------------------
     def align_to_tokens(self, feats: torch.Tensor, num_tokens: int, causal: bool = True) -> torch.Tensor:
@@ -282,10 +283,19 @@ class LiveVoiceModel(nn.Module):
         return codes.transpose(1, 2)
 
     # --------------------- feature extractors ---------------------
-    def encode_speaker_reference(self, reference_audio: torch.Tensor) -> torch.Tensor:
+    def encode_speaker_reference(
+        self,
+        reference_audio: torch.Tensor | None,
+        reference_z: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Reference audio → per-frame speaker embedding at decoder hidden dim."""
-        with torch.no_grad():
-            _, z = self.dac_model.encode_continuous(reference_audio)  # (B, T_enc, D_dac)
+        if reference_z is None:
+            if reference_audio is None:
+                raise ValueError("Either reference_audio or reference_z must be provided.")
+            with torch.no_grad():
+                _, z = self.dac_model.encode_continuous(reference_audio)  # (B, T_enc, D_dac)
+        else:
+            z = reference_z
         spk = self.speaker_proj(z)  # (B, T_enc, D)
 
         if str(getattr(self.config, "speaker_conditioning", "crossattn")) == "global_avg":
@@ -319,7 +329,7 @@ class LiveVoiceModel(nn.Module):
                 return zeros_add, film_raw
             return self.content_extractor.from_precomputed(content_feats), None
 
-        # Online path: optional perturbation → HuBERT inference
+        # Online path: perturbation → HuBERT (VTLN step in perturbation runs on CPU internally)
         if self.use_content_perturbation and self.training:
             content_audio = self.content_perturbation(content_audio)
 
@@ -340,6 +350,7 @@ class LiveVoiceModel(nn.Module):
         target_codes: torch.Tensor,
         prosody_audio: torch.Tensor | None = None,
         content_feats: torch.Tensor | None = None,
+        reference_z: torch.Tensor | None = None,
     ) -> dict:
         """Teacher-forced training forward.
 
@@ -381,7 +392,7 @@ class LiveVoiceModel(nn.Module):
             prev_emb = torch.where(mask, null, prev_emb)
 
         # 2. speaker
-        spk = self.encode_speaker_reference(reference_audio)
+        spk = self.encode_speaker_reference(reference_audio, reference_z=reference_z)
         drop_spk_all = drop_spk | drop_both
         if drop_spk_all.any():
             spk = spk.clone()
@@ -459,7 +470,12 @@ class LiveVoiceModel(nn.Module):
         content_add_raw, film_raw = self.extract_content(content_audio)
         T_dec = content_add_raw.shape[1]
         if max_steps is None:
-            max_steps = T_dec
+            # Use codec frame count as generation horizon.
+            # HuBERT/content frames (e.g. 50 fps) can differ from codec frames
+            # (e.g. Mimi 12.5 fps), so using T_dec directly may over-generate.
+            hop = int(getattr(self.dac_model, "hop_length", getattr(self.config, "dac_hop_length", 320)))
+            n_samples = int(content_audio.shape[-1])
+            max_steps = max(1, int(round(n_samples / float(hop))))
         T_total = (max_steps + K - 1) if use_delay else max_steps
 
         content_add = self.align_to_tokens(content_add_raw, T_total, causal=False)

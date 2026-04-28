@@ -113,7 +113,7 @@ class VCTKDataset(Dataset):
 
         try:
             content_wave, start_sample = self._load_window(content_path)
-            ref_wave, _ = self._load_window(ref_path)
+            ref_wave, ref_start_sample = self._load_window(ref_path)
         except Exception:
             return self.__getitem__(random.randint(0, len(self.items) - 1))
 
@@ -126,6 +126,10 @@ class VCTKDataset(Dataset):
             "target_audio": content_wave,
             "speaker_id": speaker_id,
             "content_hubert": content_hubert,
+            "content_path": content_path,
+            "content_start_sample": start_sample,
+            "ref_path": ref_path,
+            "ref_start_sample": ref_start_sample,
         }
 
     def _load_window(self, path: str) -> tuple[torch.Tensor, int]:

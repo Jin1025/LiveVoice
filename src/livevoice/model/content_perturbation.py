@@ -28,6 +28,7 @@ class ContentPerturbation(nn.Module):
         super().__init__()
         self.sr = int(config.sample_rate)
         self.pitch_max = float(getattr(config, "perturb_pitch_semitones", 4.0))
+        self.use_vtln = bool(getattr(config, "use_vtln", False))
         self.vtln_range = float(getattr(config, "perturb_vtln_alpha_range", 0.12))
         self.eq_gain_db = float(getattr(config, "perturb_eq_gain_db", 6.0))
         self.p = float(getattr(config, "perturb_prob", 1.0))
@@ -49,31 +50,35 @@ class ContentPerturbation(nn.Module):
                 out_list.append(x)
                 continue
 
-            # 1. Pitch shift ±N semitones
+            # 1. Pitch shift ±N semitones (always exclude near-zero range)
+            # Sample from [-pitch_max, -1] U [1, pitch_max].
             if self.pitch_max > 0:
-                n_steps = random.uniform(-self.pitch_max, self.pitch_max)
-                if abs(n_steps) > 0.5:
+                min_abs = 1.0
+                if self.pitch_max >= min_abs:
+                    sign = -1.0 if random.random() < 0.5 else 1.0
+                    mag = random.uniform(min_abs, self.pitch_max)
+                    n_steps = sign * mag
                     try:
                         x = torchaudio.functional.pitch_shift(x, self.sr, n_steps)
                     except Exception:
                         pass
 
             # 2. VTLN-style formant shift via resample trick
-            #    Resample to sr*alpha (compresses/expands vocal tract resonances),
-            #    then resample back to sr to restore time length.
-            #    This approximates vocal tract length perturbation (VTLP).
-            if self.vtln_range > 0:
+            #    Done on CPU: arbitrary int(sr*alpha) ratios have huge LCM with sr,
+            #    causing torchaudio to allocate enormous sinc filter tensors on GPU.
+            if self.use_vtln and self.vtln_range > 0:
                 alpha = 1.0 + random.uniform(-self.vtln_range, self.vtln_range)
                 if abs(alpha - 1.0) > 0.02:
                     orig_len = x.shape[-1]
                     shifted_sr = max(8000, int(self.sr * alpha))
-                    x = torchaudio.functional.resample(x, self.sr, shifted_sr)
-                    x = torchaudio.functional.resample(x, shifted_sr, self.sr)
-                    # Restore exact length after resampling rounding
-                    if x.shape[-1] > orig_len:
-                        x = x[..., :orig_len]
-                    elif x.shape[-1] < orig_len:
-                        x = F.pad(x, (0, orig_len - x.shape[-1]))
+                    x_cpu = x.cpu()
+                    x_cpu = torchaudio.functional.resample(x_cpu, self.sr, shifted_sr)
+                    x_cpu = torchaudio.functional.resample(x_cpu, shifted_sr, self.sr)
+                    if x_cpu.shape[-1] > orig_len:
+                        x_cpu = x_cpu[..., :orig_len]
+                    elif x_cpu.shape[-1] < orig_len:
+                        x_cpu = F.pad(x_cpu, (0, orig_len - x_cpu.shape[-1]))
+                    x = x_cpu.to(device)
 
             # 3. 4-band random EQ
             if self.eq_gain_db > 0:

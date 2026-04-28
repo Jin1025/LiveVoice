@@ -6,7 +6,7 @@ class LiveVoiceConfig:
     """Configuration for the LiveVoice voice-conversion model.
 
     Mirrors sonic's SonicConfig but adapted for speech:
-    - DAC 16 or 24 kHz codec (speech-optimized)
+    - "dac" or "mimi" codec (speech-optimized)
     - HuBERT-base content features (linguistic)
     - Reference cross-attention for speaker timbre
     - Optional F0/loudness prosody conditioning
@@ -24,23 +24,32 @@ class LiveVoiceConfig:
     max_seq_len: int = 1024
 
     # ------------------------------------------------------------------
-    # Codec (DAC 16 or 24 kHz speech model)
+    # Codec — "dac" or "mimi"
+    # ------------------------------------------------------------------
+    codec: str = "mimi"
+
+    # Mimi (kyutai/mimi) — 24 kHz, 12.5 fps, 8 codebooks, codebook_size 2048
+    mimi_model_name: str = "kyutai/mimi"
+    mimi_n_codebooks: int = 8
+
+    # ------------------------------------------------------------------
+    # DAC codec (dac 16 or 24 kHz speech model)
     # ------------------------------------------------------------------
     # dac_model_type: 16kHz speech model has 12 RVQ codebooks, hop=320 (50 frames/sec)
     # dac_model_type: 24kHz speech model has 9 RVQ codebooks, hop=320 (75 frames/sec)
     # dac_model_type: 44kHz speech model has 9 RVQ codebooks, hop=320 (137.5 frames/sec)
-    dac_model_type: str = "16khz" # "16khz" or "24khz" or "44khz"
-    dac_sample_rate: int = 16000 # 24000 or 44100
+    dac_model_type: str = "16khz" 
+    dac_sample_rate: int = 16000 
     dac_n_codebooks: int = 12
     dac_codebook_size: int = 1024
     dac_depth: int = 9
     dac_latent_dim: int = 1024
-    dac_hop_length: int = 320  # 24000/320 = 75 frames/sec at 24 kHz
+    dac_hop_length: int = 320  # 16000/320 = 50 frames/sec at 16 kHz
 
     # ------------------------------------------------------------------
     # Audio / windowing
     # ------------------------------------------------------------------
-    sample_rate: int = 16000 # 24000 or 44100
+    sample_rate: int = 24000 # 24000 or 44100
     audio_duration: float = 4.0  # seconds per training window
     train_batch_size: int = 16
     val_batch_size: int = 4
@@ -106,8 +115,8 @@ class LiveVoiceConfig:
 
     # MusicGen delay pattern over codec codebooks
     use_delay_pattern: bool = True
-    n_codebooks_predict: int = 9  # keep it small at 16 kHz (coarse bookss carry most info)
-    codebook_loss_weights: tuple[float, ...] = (1.5, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    n_codebooks_predict: int = 4  # keep it small at 16 kHz (coarse bookss carry most info)
+    codebook_loss_weights: tuple[float, ...] = (1.5, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
     # Conditioning ablations
     zero_speaker: bool = False
@@ -119,14 +128,24 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     use_content_perturbation: bool = True
     perturb_pitch_semitones: float = 4.0    # ±N semitones pitch shift
-    perturb_vtln_alpha_range: float = 0.12  # ±12% VTLN formant warp (resample trick)
+    use_vtln: bool = False                  # VTLN formant warp
+    perturb_vtln_alpha_range: float = 0.12  # ±12% VTLN warp range (only if use_vtln=True)
     perturb_eq_gain_db: float = 6.0         # ±dB per EQ band (4 bands)
     perturb_prob: float = 1.0               # fraction of batch items to perturb
+
+    # ------------------------------------------------------------------
+    # Training-time Mimi cache
+    # ------------------------------------------------------------------
+    use_mimi_cache: bool = True
+    mimi_cache_dir: str = "/mnt/data/disk2/yejin/LiveVoice/mimi_precomputed"
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     num_audio_log_samples: int = 4
+    log_val_wer: bool = True
+    wer_whisper_model: str = "base"
+    wer_device: str = "cuda"
 
     # ------------------------------------------------------------------
     # Dataset

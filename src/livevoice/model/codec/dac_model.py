@@ -30,6 +30,7 @@ class DACModel(nn.Module):
         self.depth = config.dac_depth
         self.codebook_size = config.dac_codebook_size
         self.hop_length = getattr(self.dac_model, "hop_length", config.dac_hop_length)
+        self.latent_dim = config.dac_latent_dim
 
         self.to(self.device)
 
@@ -62,6 +63,14 @@ class DACModel(nn.Module):
         z, codes, _, _, _ = self.dac_model.encode(audio)
         z = z.transpose(1, 2)  # (B, T_frames, D_dac)
         return codes, z
+
+    def get_codebook_embeddings(self, k: int) -> torch.Tensor:
+        """(codebook_size, latent_dim) — used to init decoder input embeddings."""
+        qk = self.dac_model.quantizer.quantizers[k]
+        with torch.no_grad():
+            cb = qk.codebook.weight                      # (codebook_size, codebook_dim)
+            cb_for_conv = cb.T.unsqueeze(0)
+            return qk.out_proj(cb_for_conv).squeeze(0).T  # (codebook_size, latent_dim)
 
     @torch.no_grad()
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
