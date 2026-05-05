@@ -5,11 +5,54 @@ LibriTTSDataModule — LibriTTS (24 kHz)
 """
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import lightning as L
-from torch.utils.data import DataLoader
+import soundfile as sf
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from tqdm import tqdm
 
 from .vctk_dataset import VCTKDataset, collate_fn
 from .libritts_dataset import LibriTTSDataset, collate_fn
+
+
+def _build_duration_weights(items_paths: list[str], cache_path: Path) -> list[float]:
+    """Return per-item weights = duration in seconds.
+
+    Caches durations to disk so subsequent runs (or `setup` calls) don't re-scan
+    the entire dataset. Cache is keyed by (cache_path); regenerated when item
+    list changes.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache: dict[str, float] = {}
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    missing = [p for p in items_paths if p not in cache]
+    if missing:
+        print(f"[duration-cache] Scanning {len(missing)} files (cached: {len(cache)})...")
+        for p in tqdm(missing, desc="sf.info"):
+            try:
+                info = sf.info(p)
+                cache[p] = float(info.frames) / float(info.samplerate)
+            except Exception:
+                cache[p] = 1.0  # fallback weight
+        with open(cache_path, "w") as f:
+            json.dump(cache, f)
+        print(f"[duration-cache] Saved → {cache_path}")
+
+    return [cache.get(p, 1.0) for p in items_paths]
+
+
+def _make_length_weighted_sampler(dataset, item_paths: list[str], cache_path: Path):
+    weights = _build_duration_weights(item_paths, cache_path)
+    return WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True)
 
 
 class VCTKDataModule(L.LightningDataModule):
@@ -23,10 +66,15 @@ class VCTKDataModule(L.LightningDataModule):
             self.val_dataset = VCTKDataset(self.config, split="val")
 
     def train_dataloader(self):
+        # Length-weighted sampling: long utterances picked proportionally to
+        # their duration so all 4-s windows are reached at equal rate over time.
+        item_paths = [it[0] for it in self.train_dataset.items]
+        cache_path = Path(self.config.output_dir) / "duration_cache" / "vctk_train.json"
+        sampler = _make_length_weighted_sampler(self.train_dataset, item_paths, cache_path)
         return DataLoader(
             self.train_dataset,
             batch_size=self.config.train_batch_size,
-            shuffle=True,
+            sampler=sampler,
             num_workers=self.config.num_workers,
             pin_memory=True,
             drop_last=True,
@@ -57,10 +105,17 @@ class LibriTTSDataModule(L.LightningDataModule):
             self.val_dataset = LibriTTSDataset(self.config, split="val")
 
     def train_dataloader(self):
+        # Length-weighted sampling for LibriTTS — utterances vary 1-15s, plain
+        # uniform sampling under-represents long ones. This reaches every 4-s
+        # window at a roughly equal rate over enough epochs.
+        item_paths = [it[0] for it in self.train_dataset.items]
+        splits_tag = ",".join(self.config.libritts_train_splits)
+        cache_path = Path(self.config.output_dir) / "duration_cache" / f"libritts_train_{splits_tag}.json"
+        sampler = _make_length_weighted_sampler(self.train_dataset, item_paths, cache_path)
         return DataLoader(
             self.train_dataset,
             batch_size=self.config.train_batch_size,
-            shuffle=True,
+            sampler=sampler,
             num_workers=self.config.num_workers,
             pin_memory=True,
             drop_last=True,

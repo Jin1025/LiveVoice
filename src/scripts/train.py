@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from lightning.pytorch.loggers import TensorBoardLogger
 try:
     from lightning.pytorch.loggers import WandbLogger
@@ -22,6 +22,23 @@ from livevoice.config import LiveVoiceConfig
 from livevoice.model import build_codec, HuBERTContentExtractor, ProsodyExtractor, LiveVoiceModel
 from livevoice.lightning import LiveVoiceLightningModule
 from livevoice.data.datamodule import VCTKDataModule, LibriTTSDataModule
+
+
+class EveryNEpochCheckpoint(Callback):
+    """Save numbered checkpoints every N epochs (e.g., 5epoch, 10epoch)."""
+
+    def __init__(self, dirpath: str, every_n_epochs: int = 5):
+        super().__init__()
+        self.dirpath = dirpath
+        self.every_n_epochs = int(every_n_epochs)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch_num = int(trainer.current_epoch) + 1
+        if epoch_num % self.every_n_epochs != 0:
+            return
+        os.makedirs(self.dirpath, exist_ok=True)
+        ckpt_path = os.path.join(self.dirpath, f"{epoch_num}epoch.ckpt")
+        trainer.save_checkpoint(ckpt_path)
 
 
 def parse_args():
@@ -39,7 +56,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--val_batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--max_epochs", type=int, default=1000)
+    p.add_argument("--max_epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--audio_duration", type=float, default=4.0)
     p.add_argument("--use_prosody", action="store_true")
@@ -107,8 +124,15 @@ def main():
     print(f"[train] Building codec ({config.codec})...")
     codec_model = build_codec(config)
 
-    print(f"[train] Building HuBERT content extractor ({config.hubert_model_name}, layer {config.hubert_layer})...")
-    content_extractor = HuBERTContentExtractor(config)
+    # Skip HuBERT when content_source is not "hubert" — it would be loaded
+    # only to sit on the GPU unused (94M params + ~500 modules in eval mode).
+    content_source = str(getattr(config, "content_source", "hubert")).lower()
+    if content_source == "hubert":
+        print(f"[train] Building HuBERT content extractor ({config.hubert_model_name}, layer {config.hubert_layer})...")
+        content_extractor = HuBERTContentExtractor(config)
+    else:
+        print(f"[train] content_source={content_source} → skipping HuBERT build")
+        content_extractor = None
 
     prosody_extractor = None
     if config.use_prosody:
@@ -162,6 +186,7 @@ def main():
             enable_version_counter=False,
             save_last=False,
         ),
+        EveryNEpochCheckpoint(dirpath=ckpt_dir, every_n_epochs=5),
         LearningRateMonitor(logging_interval="step"),
     ]
 

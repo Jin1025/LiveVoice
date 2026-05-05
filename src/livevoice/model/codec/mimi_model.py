@@ -128,20 +128,45 @@ class MimiCodec(nn.Module):
         return audio
 
     def get_codebook_embeddings(self, k: int) -> torch.Tensor | None:
-        """Try to return (codebook_size, latent_dim) embedding table for codebook k."""
-        try:
-            layer = self.model.quantizer.layers[k]
-            for attr in ["codebook", "_codebook"]:
-                obj = getattr(layer, attr, None)
-                if obj is None:
+        """Return (codebook_size, dim) embedding table for codebook k.
+
+        HF Mimi uses SplitResidualVectorQuantizer:
+          - codebook 0      → semantic_residual_vector_quantizer.layers[0]
+          - codebooks 1..N  → acoustic_residual_vector_quantizer.layers[k-1]
+        Falls back to a flat .layers[k] if the split structure isn't present.
+        """
+        candidates = []
+        q = self.model.quantizer
+
+        # Split RVQ (Mimi default in HF transformers)
+        sem = getattr(q, "semantic_residual_vector_quantizer", None)
+        ac = getattr(q, "acoustic_residual_vector_quantizer", None)
+        if sem is not None and ac is not None:
+            sem_layers = getattr(sem, "layers", None) or []
+            ac_layers = getattr(ac, "layers", None) or []
+            n_sem = len(sem_layers)
+            if k < n_sem:
+                candidates.append(sem_layers[k])
+            elif (k - n_sem) < len(ac_layers):
+                candidates.append(ac_layers[k - n_sem])
+
+        # Flat structure fallback
+        flat_layers = getattr(q, "layers", None)
+        if flat_layers is not None and k < len(flat_layers):
+            candidates.append(flat_layers[k])
+
+        for layer in candidates:
+            # Layer itself, or .codebook / ._codebook submodule
+            for path in [layer, getattr(layer, "codebook", None), getattr(layer, "_codebook", None)]:
+                if path is None:
                     continue
-                for sub in ["embed", "weight", "embeddings"]:
-                    emb = getattr(obj, sub, None)
-                    if emb is not None:
-                        emb = emb.detach().float()
-                        if emb.dim() == 3:          # (1, codebook_size, dim)
-                            emb = emb.squeeze(0)
-                        return emb                  # (codebook_size, dim)
-        except Exception:
-            pass
+                for sub in ["embed", "weight", "embeddings", "embed_avg"]:
+                    emb = getattr(path, sub, None)
+                    if emb is None or not isinstance(emb, torch.Tensor):
+                        continue
+                    emb = emb.detach().float()
+                    if emb.dim() == 3:          # (1, codebook_size, dim)
+                        emb = emb.squeeze(0)
+                    if emb.dim() == 2 and emb.shape[0] == self.CODEBOOK_SIZE:
+                        return emb              # (codebook_size, dim)
         return None

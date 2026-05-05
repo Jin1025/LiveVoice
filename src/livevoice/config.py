@@ -15,9 +15,9 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     # Transformer architecture
     # ------------------------------------------------------------------
-    hidden_dim: int = 512
+    hidden_dim: int = 768 # 512
     num_encoder_layers: int = 4
-    num_decoder_layers: int = 8
+    num_decoder_layers: int = 12 # 8
     num_heads: int = 8
     ffn_dim: int = 4 * hidden_dim
     dropout: float = 0.1
@@ -115,8 +115,27 @@ class LiveVoiceConfig:
 
     # MusicGen delay pattern over codec codebooks
     use_delay_pattern: bool = True
-    n_codebooks_predict: int = 4  # keep it small at 16 kHz (coarse bookss carry most info)
-    codebook_loss_weights: tuple[float, ...] = (1.5, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    n_codebooks_predict: int = 8  # keep it small at 16 kHz (coarse bookss carry most info)
+    # Coarse codebooks weighted higher (carry content/prosody, intelligibility);
+    # fine codebooks gently down-weighted but not too low (still need detail).
+    codebook_loss_weights: tuple[float, ...] = (2.0, 1.5, 1.2, 1.0, 1.0, 0.9, 0.8, 0.7)
+
+    # Auxiliary losses for artifact reduction
+    z_loss_weight: float = 1e-4               # PaLM-style logsumexp regularizer
+    latent_loss_weight: float = 0.5           # MSE on expected latent vs target latent
+
+    # CTC loss: forces decoder hidden states to be linguistically transcribable.
+    # Directly improves WER. Char-level vocab (ASR standard, no extra deps).
+    use_ctc_loss: bool = False
+    ctc_loss_weight: float = 0.3
+    ctc_vocab_size: int = 34                  # 33 chars + 1 blank
+
+    # Content source: how linguistic features are extracted from content audio.
+    #   "hubert"        — HuBERT layer-9 hidden states (heavy, bidirectional)
+    #   "mimi_semantic" — Mimi codec's first codebook (semantic, 12.5 fps,
+    #                     designed for speaker-invariance via WavLM distillation).
+    #                     Only valid when codec=="mimi".
+    content_source: str = "hubert"
 
     # Conditioning ablations
     zero_speaker: bool = False
@@ -146,6 +165,8 @@ class LiveVoiceConfig:
     log_val_wer: bool = True
     wer_whisper_model: str = "base"
     wer_device: str = "cuda"
+    wer_epoch_samples: int = 100
+    wer_seed: int = 12345                     # fixed seed for sample selection (stable across epochs)
 
     # ------------------------------------------------------------------
     # Dataset

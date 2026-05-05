@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import hashlib
 import random
+from pathlib import Path
+
+import soundfile as sf
+import librosa
 import torch
 import torch.nn.functional as F
 import lightning as L
@@ -18,6 +23,22 @@ try:
     import wandb
 except Exception:  # pragma: no cover
     wandb = None
+
+
+# ─────────────────────────────────────────────
+#  CTC vocab (character-level, ASR standard)
+# ─────────────────────────────────────────────
+# Index 0 = blank, indices 1..33 = chars below.
+# Standard for ASR CTC (DeepSpeech 2: 29, wav2vec2 ASR: 32, ours: 34).
+_CTC_BLANK = 0
+_CTC_CHARS = " abcdefghijklmnopqrstuvwxyz',.!?-"
+_CTC_C2I = {c: i + 1 for i, c in enumerate(_CTC_CHARS)}
+CTC_VOCAB_SIZE = len(_CTC_CHARS) + 1  # 34
+
+
+def _ctc_tokenize(text: str) -> list[int]:
+    """Lowercase + map to CTC vocab; drops chars not in the vocab."""
+    return [_CTC_C2I[c] for c in text.lower() if c in _CTC_C2I]
 
 
 # ─────────────────────────────────────────────
@@ -44,6 +65,49 @@ def _cross_entropy_loss(all_logits, delayed_targets, weights):
         total_weight += w
         per_book[f"loss_cb{k}"] = lk.detach()
     return total_loss / total_weight, per_book
+
+
+def _z_loss(all_logits, delayed_targets):
+    """PaLM-style logsumexp regularizer averaged over codebooks.
+
+    Penalizes logit magnitudes (logsumexp drift from 0) to prevent
+    over-confident codebook distributions. Stabilises training and
+    helps sampling diversity. Masks out -100 padding positions.
+    """
+    B, T, K, _V = all_logits.shape
+    z = 0.0
+    for k in range(K):
+        lg = all_logits[:, :, k, :]                        # (B, T, V)
+        valid = (delayed_targets[:, :, k] != -100).float() # (B, T)
+        ls = torch.logsumexp(lg, dim=-1)                   # (B, T)
+        z = z + ((ls ** 2) * valid).sum() / valid.sum().clamp(min=1)
+    return z / K
+
+
+def _latent_regression_loss(all_logits, delayed_targets, codebook_vectors_list):
+    """MSE between expected latent (probs @ codebook_table) and target latent.
+
+    Treats codebook entries as points in a continuous space; near-misses in
+    latent space cost less than CE. Reduces metallic/buzzy artefacts because
+    the model can hedge across acoustically-similar tokens without being
+    harshly penalised by CE.
+
+    all_logits:             (B, T, K, V)
+    delayed_targets:        (B, T, K) with -100 padding
+    codebook_vectors_list:  list of K (V, D) tensors (already on device)
+    """
+    B, T, K, _V = all_logits.shape
+    total = 0.0
+    for k in range(K):
+        cb = codebook_vectors_list[k]                  # (V, D)
+        probs = F.softmax(all_logits[:, :, k, :], dim=-1)  # (B, T, V)
+        pred_z = probs @ cb                            # (B, T, D)
+        valid = (delayed_targets[:, :, k] != -100)     # (B, T)
+        tgt_codes = delayed_targets[:, :, k].clamp(min=0)
+        target_z = cb[tgt_codes]                       # (B, T, D)
+        diff = ((pred_z - target_z) ** 2).mean(dim=-1) # (B, T)
+        total = total + (diff * valid.float()).sum() / valid.float().sum().clamp(min=1)
+    return total / K
 
 
 def _cosine_lr_schedule(optimizer, warmup_steps: int, total_steps: int):
@@ -76,6 +140,54 @@ def _log_audio_batch(logger, tag: str, wav_batch: torch.Tensor, sample_rate: int
                 exp.add_audio(f"{tag}/{i}", wav_batch[i], global_step=global_step, sample_rate=sample_rate)
     except Exception:
         pass
+
+
+def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
+    """Load entire wav, resample to target_sr, peak-normalize (no window crop)."""
+    import torchaudio
+
+    try:
+        with sf.SoundFile(path) as f:
+            audio_np = f.read(dtype="float32", always_2d=True)
+            sr = int(f.samplerate)
+        audio = torch.from_numpy(audio_np).float().mean(dim=1)
+    except Exception:
+        audio_np, sr = librosa.load(path, sr=None, mono=True)
+        audio = torch.from_numpy(audio_np.astype("float32"))
+        sr = int(sr)
+    if sr != target_sr:
+        audio = torchaudio.functional.resample(audio, sr, target_sr)
+    return audio / (audio.abs().max() + 1e-8)
+
+
+def _read_libritts_normalized_text(wav_path: str) -> str | None:
+    txt_path = Path(wav_path).with_suffix(".normalized.txt")
+    if not txt_path.exists():
+        return None
+    try:
+        text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        return text if text else None
+    except Exception:
+        return None
+
+
+def _libritts_pick_ref_path(ds, content_wav_path: str, utt_id: str, spk: str) -> str:
+    """Same pairing rule as LibriTTSDataset.__getitem__ (reference utterance path)."""
+    spk_utts = ds.speaker_utts[spk]
+    pairing = str(getattr(ds, "pairing", "same_speaker"))
+    split = str(getattr(ds, "split", "train"))
+    if pairing == "reconstruct":
+        return content_wav_path
+    if split == "train":
+        candidates = [(p, u) for p, u in spk_utts if p != content_wav_path]
+        if not candidates:
+            return content_wav_path
+        return random.choice(candidates)[0]
+    ref_path, _ = next(
+        ((p, u) for p, u in spk_utts if p != content_wav_path),
+        (content_wav_path, utt_id),
+    )
+    return ref_path
 
 
 # ─────────────────────────────────────────────
@@ -192,11 +304,26 @@ class LiveVoiceLightningModule(L.LightningModule):
         self._whisper_model = None
         self._whisper_loaded = False
 
+        if bool(getattr(config, "use_ctc_loss", False)):
+            print(f"[CTC] char-level  vocab_size={getattr(config, 'ctc_vocab_size', '?')}")
+
+    @staticmethod
+    def _normalize_text_for_wer(s: str) -> str:
+        """Lowercase, strip punctuation, collapse whitespace.
+        Without this, "Hello, world." vs "hello world" gives WER=1.0 spuriously.
+        """
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s']", " ", s)   # keep apostrophes for don't, can't
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
     def _word_wer(self, hyp: str, ref: str) -> float:
-        hyp_w = [w for w in hyp.strip().lower().split() if w]
-        ref_w = [w for w in ref.strip().lower().split() if w]
+        hyp_w = self._normalize_text_for_wer(hyp).split()
+        ref_w = self._normalize_text_for_wer(ref).split()
         if not ref_w:
             return float("nan")
+        # Levenshtein on words; clamp to [0, 2.0] so a runaway hyp doesn't
+        # explode the metric (still allows WER>1 which is mathematically valid).
         dp = list(range(len(hyp_w) + 1))
         for i, rw in enumerate(ref_w, start=1):
             prev = dp[0]
@@ -393,14 +520,88 @@ class LiveVoiceLightningModule(L.LightningModule):
         out = self.model(
             ref, ctn, codes, prosody_audio=None, content_feats=content_feats, reference_z=ref_z
         )
-        loss, per_book = _cross_entropy_loss(
+        ce_loss, per_book = _cross_entropy_loss(
             out["all_logits"], out["delayed_targets"],
             self.config.codebook_loss_weights,
         )
+
+        # ── auxiliary losses ────────────────────────────────────────
+        z_w = float(getattr(self.config, "z_loss_weight", 0.0))
+        lat_w = float(getattr(self.config, "latent_loss_weight", 0.0))
+        ctc_w = float(getattr(self.config, "ctc_loss_weight", 0.0))
+
+        z_l = torch.tensor(0.0, device=ce_loss.device)
+        if z_w > 0:
+            z_l = _z_loss(out["all_logits"], out["delayed_targets"])
+
+        lat_l = torch.tensor(0.0, device=ce_loss.device)
+        if lat_w > 0:
+            K = int(self.config.n_codebooks_predict)
+            cb_list = [getattr(self.model, f"codebook_vectors_{k}") for k in range(K)]
+            lat_l = _latent_regression_loss(out["all_logits"], out["delayed_targets"], cb_list)
+
+        ctc_l = torch.tensor(0.0, device=ce_loss.device)
+        if ctc_w > 0 and getattr(self.model, "use_ctc_loss", False):
+            ctc_l = self._compute_ctc_loss(out["decoder_output"], batch.get("content_text", None))
+
+        loss = ce_loss + z_w * z_l + lat_w * lat_l + ctc_w * ctc_l
+
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        self.log("train/ce_loss", ce_loss.detach(), on_step=True, on_epoch=False, sync_dist=True)
+        if z_w > 0:
+            self.log("train/z_loss", z_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
+        if lat_w > 0:
+            self.log("train/latent_loss", lat_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
+        if ctc_w > 0:
+            self.log("train/ctc_loss", ctc_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
         for k, v in per_book.items():
             self.log(f"train/{k}", v, on_step=True, on_epoch=False, sync_dist=True)
         return loss
+
+    def _compute_ctc_loss(self, decoder_output: torch.Tensor, texts) -> torch.Tensor:
+        """CTC loss on decoder hidden states vs character-level transcripts.
+
+        Works with any content_source — operates on decoder output, not the
+        content path itself. Drops samples where target is too long for
+        T_input (CTC alignment requirement).
+
+        decoder_output: (B, T_seq, hidden_dim)
+        texts:          list[str | None] (from batch["content_text"])
+        """
+        if not isinstance(texts, list) or len(texts) == 0:
+            return torch.tensor(0.0, device=decoder_output.device)
+
+        device = decoder_output.device
+        T_seq = decoder_output.size(1)
+
+        valid_idxs: list[int] = []
+        flat_targets: list[int] = []
+        target_lengths: list[int] = []
+        for i, t in enumerate(texts):
+            if not t:
+                continue
+            tok = _ctc_tokenize(t)
+            if not tok or len(tok) > T_seq:    # CTC needs T_in >= T_target
+                continue
+            valid_idxs.append(i)
+            flat_targets.extend(tok)
+            target_lengths.append(len(tok))
+
+        if not valid_idxs:
+            return torch.tensor(0.0, device=device)
+
+        idx_t = torch.tensor(valid_idxs, device=device, dtype=torch.long)
+        sub = decoder_output.index_select(0, idx_t)               # (B', T_seq, H)
+        logits = self.model.ctc_head(sub)                          # (B', T_seq, V)
+        log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T, B', V) for CTC
+        targets_t = torch.tensor(flat_targets, device=device, dtype=torch.long)
+        target_lengths_t = torch.tensor(target_lengths, device=device, dtype=torch.long)
+        input_lengths_t = torch.full((len(valid_idxs),), T_seq, device=device, dtype=torch.long)
+
+        return F.ctc_loss(
+            log_probs, targets_t, input_lengths_t, target_lengths_t,
+            blank=_CTC_BLANK, zero_infinity=True, reduction="mean",
+        )
 
     def validation_step(self, batch, batch_idx):
         ref = batch["reference_audio"]
@@ -432,18 +633,90 @@ class LiveVoiceLightningModule(L.LightningModule):
 
             ref_same = ref[sel]
             ctn_same = ctn[sel]
-            content_texts = batch.get("content_text", None)
-            texts_sel = None
-            if isinstance(content_texts, list) and len(content_texts) == ref.size(0):
-                texts_sel = [content_texts[i] for i in sel]
-            self._log_vc_sample(ref_same, ctn_same, tag_prefix="val", content_texts=texts_sel)
+            self._log_vc_sample(ref_same, ctn_same, tag_prefix="val")
 
             # Also log a "diff speaker reference" condition for easier listening.
             speaker_ids = batch.get("speaker_id", None)  # list[str] from collate_fn
             if isinstance(speaker_ids, list) and len(speaker_ids) == ref.size(0):
                 spk_sel = [str(speaker_ids[i]) for i in sel]
                 ref_diff = self._pick_diff_speaker_refs(spk_sel, n=len(spk_sel), device=ref.device)
-                self._log_vc_sample(ref_diff, ctn_same, tag_prefix="Media/val_diff_spk", content_texts=texts_sel)
+                self._log_vc_sample(ref_diff, ctn_same, tag_prefix="Media/val_diff_spk")
+
+    @torch.no_grad()
+    def on_train_epoch_end(self):
+        """Once per training epoch: WER on full utterance (full wav vs full normalized text)."""
+        if not bool(getattr(self.config, "log_val_wer", False)):
+            return
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+        dm = getattr(self.trainer, "datamodule", None)
+        ds = getattr(dm, "val_dataset", None) if dm is not None else None
+        if ds is None or not hasattr(ds, "items"):
+            return
+        if type(ds).__name__ != "LibriTTSDataset":
+            print(f"[WER] skip full-utterance WER: val_dataset is {type(ds).__name__}, not LibriTTSDataset")
+            return
+
+        w = self._get_whisper()
+        if w is None:
+            raise RuntimeError(
+                "log_val_wer=True but Whisper is unavailable. "
+                "Install openai-whisper and ensure ffmpeg is available."
+            )
+
+        import torchaudio
+
+        n = int(getattr(self.config, "wer_epoch_samples", 4))
+        n = max(1, min(n, len(ds)))
+        # FIXED sample set across epochs — seeded RNG so the same N items are
+        # measured every epoch. This isolates model improvement from sampling
+        # noise; comparing val/wer trends across epochs becomes meaningful.
+        wer_seed = int(getattr(self.config, "wer_seed", 12345))
+        idxs = sorted(random.Random(wer_seed).sample(range(len(ds)), n))
+        target_sr = int(self.config.sample_rate)
+        device = next(self.model.parameters()).device
+
+        was_training = self.model.training
+        self.model.eval()
+        wers: list[float] = []
+        try:
+            for ix in idxs:
+                wav_path, utt_id, spk = ds.items[ix]
+                ref_path = _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
+                ref_txt = _read_libritts_normalized_text(wav_path)
+                if not ref_txt:
+                    continue
+                ctn = _load_full_mono_wav(wav_path, target_sr).unsqueeze(0).to(device)
+                ref = _load_full_mono_wav(ref_path, target_sr).unsqueeze(0).to(device)
+                # Greedy decoding (temperature=0 → argmax). Removes sampling
+                # variance so two runs at the same ckpt give the same WER.
+                codes = self.model.generate(
+                    reference_audio=ref,
+                    content_audio=ctn,
+                    temperature=0.0,
+                    top_p=None,
+                    top_k=None,
+                )
+                gen = self.model.decode_to_audio(codes)
+                wavs = gen.detach().float().cpu()
+                if target_sr != 16000:
+                    wavs = torchaudio.functional.resample(wavs, target_sr, 16000)
+                hyp_txt = w.transcribe(wavs[0].numpy(), fp16=False)["text"]
+                wers.append(self._word_wer(hyp_txt, ref_txt))
+        finally:
+            if was_training:
+                self.model.train()
+
+        if not wers:
+            raise RuntimeError(
+                "log_val_wer=True but no LibriTTS normalized transcripts found for sampled val items."
+            )
+        wer_mean = float(sum(wers) / len(wers))
+        step = int(getattr(self.trainer, "global_step", self.global_step))
+        self.log("val/wer_full_epoch_mean", wer_mean, on_epoch=True, sync_dist=True, prog_bar=False)
+        exp = getattr(self.logger, "experiment", None)
+        if exp is not None and hasattr(exp, "log"):
+            exp.log({"val/wer_full_epoch_mean": wer_mean}, step=step)
 
     @torch.no_grad()
     def _log_vc_sample(
@@ -451,7 +724,6 @@ class LiveVoiceLightningModule(L.LightningModule):
         ref_audio: torch.Tensor,
         ctn_audio: torch.Tensor,
         tag_prefix: str = "val",
-        content_texts: list[str | None] | None = None,
     ):
         codes = self.model.generate(
             reference_audio=ref_audio,
@@ -474,48 +746,6 @@ class LiveVoiceLightningModule(L.LightningModule):
             self.log("val/spk_sim_dac", spk_sim.mean(), on_epoch=True, sync_dist=True)
         except Exception:
             pass
-
-        # ── WER (Whisper transcription) ─────────────────────────────────
-        if (
-            bool(getattr(self.config, "log_val_wer", False))
-            and content_texts is not None
-            and getattr(self.trainer, "is_global_zero", True)
-        ):
-            w = self._get_whisper()
-            if w is None:
-                raise RuntimeError(
-                    "log_val_wer=True but Whisper model is unavailable. "
-                    "Install openai-whisper and ensure ffmpeg is available."
-                )
-            try:
-                import torchaudio
-                wavs = gen_audio.detach().float().cpu()
-                if sr != 16000:
-                    wavs = torchaudio.functional.resample(wavs, sr, 16000)
-                wers = []
-                for i in range(wavs.size(0)):
-                    ref_txt = content_texts[i] if i < len(content_texts) else None
-                    if not ref_txt:
-                        continue
-                    hyp_txt = w.transcribe(wavs[i].numpy(), fp16=False)["text"]
-                    wers.append(self._word_wer(hyp_txt, ref_txt))
-                if not wers:
-                    raise RuntimeError(
-                        "log_val_wer=True but no valid reference texts were found in this validation batch."
-                    )
-                wer_mean = float(sum(wers) / len(wers))
-                exp = getattr(self.logger, "experiment", None)
-                if exp is not None and hasattr(exp, "log"):
-                    exp.log({f"{tag_prefix}/wer_mean": wer_mean}, step=self.global_step)
-                else:
-                    self.log(f"{tag_prefix}/wer_mean", wer_mean, on_step=False, on_epoch=True, sync_dist=False)
-            except Exception as e:
-                raise RuntimeError(f"WER logging failed: {e}") from e
-        elif bool(getattr(self.config, "log_val_wer", False)) and getattr(self.trainer, "is_global_zero", True):
-            raise RuntimeError(
-                "log_val_wer=True but content_texts is missing. "
-                "Ensure dataset returns transcript text (e.g., LibriTTS normalized text)."
-            )
 
         # ── Audio logging ────────────────────────────────────────────────
         _log_audio_batch(self.logger, f"{tag_prefix}/generated_vc", gen_audio, sr, self.global_step)

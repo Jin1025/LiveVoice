@@ -199,11 +199,27 @@ class LiveVoiceModel(nn.Module):
         latent_dim    = dac_model.latent_dim
         codebook_size = dac_model.codebook_size
 
+        n_proper_init = 0
         for k in range(K):
             emb = dac_model.get_codebook_embeddings(k)
             if emb is None:
                 emb = torch.randn(codebook_size, latent_dim) * 0.02
+            else:
+                n_proper_init += 1
+                # Pad/truncate to latent_dim if codec's codebook dim differs
+                if emb.shape[1] != latent_dim:
+                    if emb.shape[1] < latent_dim:
+                        pad = torch.zeros(
+                            emb.shape[0],
+                            latent_dim - emb.shape[1],
+                            device=emb.device,
+                            dtype=emb.dtype,
+                        )
+                        emb = torch.cat([emb, pad], dim=1)
+                    else:
+                        emb = emb[:, :latent_dim]
             self.register_buffer(f"codebook_vectors_{k}", emb.float())
+        print(f"[LiveVoiceModel] codebook_vectors: {n_proper_init}/{K} initialized from codec (rest random)")
 
         self.decoder_input_projs = nn.ModuleList([
             nn.Linear(latent_dim, config.hidden_dim) for _ in range(K)
@@ -214,6 +230,46 @@ class LiveVoiceModel(nn.Module):
 
         # Speaker / reference → hidden_dim
         self.speaker_proj = nn.Linear(latent_dim, config.hidden_dim)
+
+        # ── Content source path ────────────────────────────────────
+        # "hubert"        — uses self.content_extractor (HuBERT)
+        # "mimi_semantic" — uses dac_model codebook 0 directly. Lightweight,
+        #                   matches codec frame-rate, designed by Kyutai for
+        #                   speaker-invariant semantic representation.
+        codec_name = str(getattr(config, "codec", "dac")).lower()
+        default_src = "mimi_semantic" if codec_name == "mimi" else "hubert"
+        self.content_source = str(getattr(config, "content_source", default_src)).lower()
+        if self.content_source == "mimi_semantic" and codec_name != "mimi":
+            # Silently fall back; HuBERT works for any codec.
+            self.content_source = "hubert"
+        # If HuBERT extractor wasn't supplied but is needed, fall back
+        if self.content_source == "hubert" and self.content_extractor is None:
+            raise ValueError(
+                "content_source='hubert' but content_extractor was not provided. "
+                "Either pass HuBERTContentExtractor or set content_source='mimi_semantic'."
+            )
+        print(f"[LiveVoiceModel] content_source={self.content_source}  codec={codec_name}")
+
+        if self.content_source == "mimi_semantic":
+            # Use Mimi *continuous* encoder output z (pre-quantization) as content.
+            # Discrete codebook 0 lookup loses too much information — z is
+            # 50× richer (512-dim continuous vs 11-bit discrete at 12.5fps).
+            # Encoder is causal, so this stays streaming-compatible.
+            sem_dim = int(getattr(dac_model, "latent_dim", config.content_proj_dim))
+            self.semantic_proj = nn.Linear(sem_dim, config.content_proj_dim)
+            self.semantic_to_hidden = nn.Linear(config.content_proj_dim, config.hidden_dim)
+            print(f"[LiveVoiceModel] mimi_semantic = continuous z (latent_dim={sem_dim})")
+
+        # ── Auxiliary CTC head for content alignment ───────────────
+        # Predicts character-level text from decoder hidden states. Forces the
+        # decoder to encode linguistic content (phoneme-level alignment),
+        # directly improving WER. Works with any content_source — operates on
+        # the decoder output, not the content path itself.
+        self.use_ctc_loss = bool(getattr(config, "use_ctc_loss", False))
+        if self.use_ctc_loss:
+            self.ctc_vocab_size = int(getattr(config, "ctc_vocab_size", 34))
+            self.ctc_head = nn.Linear(config.hidden_dim, self.ctc_vocab_size)
+            print(f"[LiveVoiceModel] CTC head: hidden_dim={config.hidden_dim} → vocab={self.ctc_vocab_size}")
 
     # --------------------- helpers ---------------------
     def align_to_tokens(self, feats: torch.Tensor, num_tokens: int, causal: bool = True) -> torch.Tensor:
@@ -310,11 +366,10 @@ class LiveVoiceModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Returns (content_add, film_feats_or_None).
 
-        Two input modes:
-          content_feats provided → skip HuBERT, use precomputed hidden states directly
-          content_audio only    → optionally perturb, then run HuBERT online
-
-        Target codes are never touched by either path.
+        Three input modes:
+          content_feats provided          → skip extractor, project precomputed HuBERT directly
+          content_source=="mimi_semantic" → perturb (train) → Mimi encoder → continuous z
+          else (HuBERT path)              → perturb (train) → HuBERT online
         """
         use_film = str(getattr(self.config, "content_conditioning", "additive")) == "film"
 
@@ -329,10 +384,24 @@ class LiveVoiceModel(nn.Module):
                 return zeros_add, film_raw
             return self.content_extractor.from_precomputed(content_feats), None
 
-        # Online path: perturbation → HuBERT (VTLN step in perturbation runs on CPU internally)
+        # Apply perturbation to source audio first (used by both paths below)
         if self.use_content_perturbation and self.training:
             content_audio = self.content_perturbation(content_audio)
 
+        # ── Mimi semantic path: codec encoder → continuous z (pre-quantization) ──
+        if self.content_source == "mimi_semantic":
+            with torch.no_grad():
+                _, z = self.dac_model.encode_continuous(content_audio)  # (B, T, latent_dim)
+            sem_emb = self.semantic_proj(z)                              # (B, T, content_proj_dim)
+            if use_film:
+                zeros_add = torch.zeros(
+                    sem_emb.shape[0], sem_emb.shape[1], self.config.hidden_dim,
+                    device=sem_emb.device, dtype=sem_emb.dtype,
+                )
+                return zeros_add, sem_emb
+            return self.semantic_to_hidden(sem_emb), None
+
+        # ── HuBERT path (legacy) ───────────────────────────────────────────
         if use_film:
             film_raw = self.content_extractor.forward_raw(content_audio)
             zeros_add = torch.zeros(
