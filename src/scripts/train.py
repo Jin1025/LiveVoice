@@ -71,7 +71,6 @@ def parse_args():
     p.add_argument("--precision", type=str, default="32")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--resume_from", type=str, default=None)
-    p.add_argument("--val_check_interval", type=float, default=0.2)
     p.add_argument("--use_wandb", dest="use_wandb", action="store_true")
     p.add_argument("--no_wandb", dest="use_wandb", action="store_false")
     p.set_defaults(use_wandb=True)
@@ -111,7 +110,6 @@ def main():
         seed=args.seed,
         precision=args.precision,
         compile=args.compile,
-        val_check_interval=args.val_check_interval,
         zero_speaker=args.zero_speaker,
         zero_content=args.zero_content,
         ablate_cross_attn=args.ablate_cross_attn,
