@@ -21,8 +21,8 @@ Usage examples:
         --content /mnt/data/disk2/VCTK-Corpus/wav48/p225/p225_001.wav \
         --codec mimi
 
-    CUDA_VISIBLE_DEVICES=3 python scripts/generate.py vc \
-        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/libritts_mimi_resume/step_latest.ckpt \
+    CUDA_VISIBLE_DEVICES=2 python scripts/generate.py vc \
+        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/mimi_semantic_new/step_latest.ckpt \
         --reference /mnt/data/disk2/LibriTTS/test-clean/121/121726/121_121726_000020_000001.wav  \
         --content /mnt/data/disk2/LibriTTS/test-clean/5105/28240/5105_28240_000013_000005.wav  \
         --codec mimi
@@ -41,9 +41,10 @@ import soundfile as sf
 import librosa
 
 from livevoice.config import LiveVoiceConfig
-from livevoice.model import DACModel, HuBERTContentExtractor, LiveVoiceModel, UnconditionalModel
+from livevoice.model import HuBERTContentExtractor, LiveVoiceModel, UnconditionalModel
 from livevoice.model import build_codec
 from livevoice.lightning import UnconditionalLightningModule, LiveVoiceLightningModule
+from livevoice.utils.checkpoint import infer_content_source_from_ckpt
 
 
 # ─────────────────────────────────────────────
@@ -147,7 +148,24 @@ def _build_inference_config(args) -> LiveVoiceConfig:
     if getattr(args, "n_codebooks", None) is not None:
         cfg_kwargs["n_codebooks_predict"] = int(args.n_codebooks)
 
+    src = str(getattr(args, "content_source", "auto")).lower()
+    if src != "auto":
+        cfg_kwargs["content_source"] = src
+
     return LiveVoiceConfig(**cfg_kwargs)
+
+
+def _resolve_content_source(args, codec_name: str) -> str:
+    src = str(getattr(args, "content_source", "auto")).lower()
+    if src != "auto":
+        return src
+    inferred = infer_content_source_from_ckpt(args.ckpt)
+    if inferred is not None:
+        print(f"[generate] content_source=auto → {inferred!r} (from checkpoint keys)")
+        return inferred
+    fallback = "mimi_semantic" if codec_name == "mimi" else "hubert"
+    print(f"[generate] content_source=auto → {fallback!r} (fallback; ckpt keys ambiguous)")
+    return fallback
 
 
 # ─────────────────────────────────────────────
@@ -195,11 +213,20 @@ def cmd_uncond(args):
 
 def cmd_vc(args):
     print(f"[generate/vc] Loading checkpoint: {args.ckpt}")
+    codec_name = str(getattr(args, "codec", "mimi")).lower()
+    content_source = _resolve_content_source(args, codec_name)
+    args.content_source = content_source
     config = _build_inference_config(args)
     codec_model = build_codec(config)
-    print(f"  codec={config.codec}  codec_sr={codec_model.sample_rate}  n_codebooks_predict={config.n_codebooks_predict}")
-    content_extractor = HuBERTContentExtractor(config)
-    model = LiveVoiceModel(config, codec_model, content_extractor)
+    print(
+        f"  codec={config.codec}  content_source={config.content_source}  "
+        f"codec_sr={codec_model.sample_rate}  n_codebooks_predict={config.n_codebooks_predict}"
+    )
+    if config.content_source == "hubert":
+        content_extractor = HuBERTContentExtractor(config)
+    else:
+        content_extractor = None
+    model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor=None)
 
     lit = LiveVoiceLightningModule.load_from_checkpoint(
         args.ckpt, config=config, model=model, strict=False
@@ -264,7 +291,7 @@ def main():
     # ── vc ──────────────────────────────────
     pv = sub.add_parser("vc")
     pv.add_argument("--ckpt", required=True)
-    pv.add_argument("--codec", type=str, default="dac", choices=["dac", "mimi"])
+    pv.add_argument("--codec", type=str, default="mimi", choices=["dac", "mimi"])
     pv.add_argument("--n_codebooks", type=int, default=None,
                     help="Override config.n_codebooks_predict to match the ckpt (DAC ckpts often used 9).")
     pv.add_argument("--dac_model_type", type=str, default="16khz", choices=["16khz", "24khz", "44khz"])
@@ -279,6 +306,13 @@ def main():
     pv.add_argument("--top_p", type=float, default=0.9)
     pv.add_argument("--top_k", type=int, default=0)
     pv.add_argument("--cfg_scale", type=float, default=1.0)
+    pv.add_argument(
+        "--content_source",
+        type=str,
+        default="auto",
+        choices=["auto", "hubert", "mimi_semantic"],
+        help="Content path. 'auto' inspects ckpt (same as eval_libritts_test_clean_wer.py).",
+    )
 
     args = p.parse_args()
     if args.cmd == "uncond":

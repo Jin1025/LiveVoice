@@ -76,3 +76,5 @@ src/output/
 
 src/tea_debug.log
 src/scripts/tea_debug.log
+
+src/eval/ckpt/

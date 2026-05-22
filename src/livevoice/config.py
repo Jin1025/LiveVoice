@@ -135,7 +135,7 @@ class LiveVoiceConfig:
     #   "mimi_semantic" — Mimi codec's first codebook (semantic, 12.5 fps,
     #                     designed for speaker-invariance via WavLM distillation).
     #                     Only valid when codec=="mimi".
-    content_source: str = "hubert"
+    content_source: str = "mimi_semantic"
 
     # Conditioning ablations
     zero_speaker: bool = False
