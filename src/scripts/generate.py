@@ -26,6 +26,12 @@ Usage examples:
         --reference /mnt/data/disk2/LibriTTS/test-clean/121/121726/121_121726_000020_000001.wav  \
         --content /mnt/data/disk2/LibriTTS/test-clean/5105/28240/5105_28240_000013_000005.wav  \
         --codec mimi
+
+    CUDA_VISIBLE_DEVICES=5 python scripts/generate.py vc \
+        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/prefix_speechbrain/step_latest.ckpt \
+        --reference /mnt/data/disk2/LibriTTS/test-clean/121/121726/121_121726_000020_000001.wav  \
+        --content /mnt/data/disk2/LibriTTS/test-clean/5105/28240/5105_28240_000013_000005.wav  \
+        --codec mimi
 """
 import argparse
 import os
@@ -41,10 +47,19 @@ import soundfile as sf
 import librosa
 
 from livevoice.config import LiveVoiceConfig
-from livevoice.model import HuBERTContentExtractor, LiveVoiceModel, UnconditionalModel
+from livevoice.model import (
+    HuBERTContentExtractor,
+    StreamVoiceAnonContentEncoder,
+    LiveVoiceModel,
+    UnconditionalModel,
+)
 from livevoice.model import build_codec
 from livevoice.lightning import UnconditionalLightningModule, LiveVoiceLightningModule
-from livevoice.utils.checkpoint import infer_content_source_from_ckpt
+from livevoice.utils.checkpoint import (
+    infer_content_source_from_ckpt,
+    infer_speaker_conditioning_from_ckpt,
+    infer_speaker_encoder_from_ckpt,
+)
 
 
 # ─────────────────────────────────────────────
@@ -151,6 +166,26 @@ def _build_inference_config(args) -> LiveVoiceConfig:
     src = str(getattr(args, "content_source", "auto")).lower()
     if src != "auto":
         cfg_kwargs["content_source"] = src
+    speaker = str(getattr(args, "speaker_conditioning", "auto")).lower()
+    if speaker != "auto":
+        cfg_kwargs["speaker_conditioning"] = speaker
+    if getattr(args, "speaker_prefix_len", None) is not None:
+        cfg_kwargs["speaker_prefix_len"] = int(args.speaker_prefix_len)
+    speaker_encoder = str(getattr(args, "speaker_encoder_type", "auto")).lower()
+    if speaker_encoder != "auto":
+        cfg_kwargs["speaker_encoder_type"] = speaker_encoder
+    for name in (
+        "speechbrain_source",
+        "speechbrain_savedir",
+        "speechbrain_sample_rate",
+        "speechbrain_embedding_dim",
+        "streamvoiceanon_repo",
+        "streamvoiceanon_encoder_config",
+        "streamvoiceanon_encoder_ckpt",
+    ):
+        value = getattr(args, name, None)
+        if value:
+            cfg_kwargs[name] = value
 
     return LiveVoiceConfig(**cfg_kwargs)
 
@@ -165,6 +200,32 @@ def _resolve_content_source(args, codec_name: str) -> str:
         return inferred
     fallback = "mimi_semantic" if codec_name == "mimi" else "hubert"
     print(f"[generate] content_source=auto → {fallback!r} (fallback; ckpt keys ambiguous)")
+    return fallback
+
+
+def _resolve_speaker_conditioning(args) -> str:
+    speaker = str(getattr(args, "speaker_conditioning", "auto")).lower()
+    if speaker != "auto":
+        return speaker
+    inferred = infer_speaker_conditioning_from_ckpt(args.ckpt)
+    if inferred is not None:
+        print(f"[generate] speaker_conditioning=auto → {inferred!r} (from checkpoint keys)")
+        return inferred
+    fallback = "prefix"
+    print(f"[generate] speaker_conditioning=auto → {fallback!r} (fallback; ckpt keys ambiguous)")
+    return fallback
+
+
+def _resolve_speaker_encoder_type(args) -> str:
+    speaker_encoder = str(getattr(args, "speaker_encoder_type", "auto")).lower()
+    if speaker_encoder != "auto":
+        return speaker_encoder
+    inferred = infer_speaker_encoder_from_ckpt(args.ckpt)
+    if inferred is not None:
+        print(f"[generate] speaker_encoder_type=auto → {inferred!r} (from checkpoint keys)")
+        return inferred
+    fallback = "codec"
+    print(f"[generate] speaker_encoder_type=auto → {fallback!r} (fallback; ckpt keys ambiguous)")
     return fallback
 
 
@@ -216,14 +277,20 @@ def cmd_vc(args):
     codec_name = str(getattr(args, "codec", "mimi")).lower()
     content_source = _resolve_content_source(args, codec_name)
     args.content_source = content_source
+    args.speaker_conditioning = _resolve_speaker_conditioning(args)
+    args.speaker_encoder_type = _resolve_speaker_encoder_type(args)
     config = _build_inference_config(args)
     codec_model = build_codec(config)
     print(
         f"  codec={config.codec}  content_source={config.content_source}  "
+        f"speaker_conditioning={config.speaker_conditioning}  "
+        f"speaker_encoder_type={config.speaker_encoder_type}  "
         f"codec_sr={codec_model.sample_rate}  n_codebooks_predict={config.n_codebooks_predict}"
     )
     if config.content_source == "hubert":
         content_extractor = HuBERTContentExtractor(config)
+    elif config.content_source == "streamvoiceanon":
+        content_extractor = StreamVoiceAnonContentEncoder(config)
     else:
         content_extractor = None
     model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor=None)
@@ -310,8 +377,40 @@ def main():
         "--content_source",
         type=str,
         default="auto",
-        choices=["auto", "hubert", "mimi_semantic"],
+        choices=["auto", "hubert", "mimi_semantic", "streamvoiceanon"],
         help="Content path. 'auto' inspects ckpt (same as eval_libritts_test_clean_wer.py).",
+    )
+    pv.add_argument(
+        "--speaker_conditioning",
+        type=str,
+        default="auto",
+        choices=["auto", "crossattn", "global_avg", "prefix"],
+    )
+    pv.add_argument("--speaker_prefix_len", type=int, default=8)
+    pv.add_argument(
+        "--speaker_encoder_type",
+        type=str,
+        default="auto",
+        choices=["auto", "codec", "speechbrain_ecapa"],
+    )
+    pv.add_argument("--speechbrain_source", type=str, default="speechbrain/spkrec-ecapa-voxceleb")
+    pv.add_argument(
+        "--speechbrain_savedir",
+        type=str,
+        default="/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb",
+    )
+    pv.add_argument("--speechbrain_sample_rate", type=int, default=16000)
+    pv.add_argument("--speechbrain_embedding_dim", type=int, default=192)
+    pv.add_argument("--streamvoiceanon_repo", type=str, default="/workspace/StreamVoiceAnon")
+    pv.add_argument(
+        "--streamvoiceanon_encoder_config",
+        type=str,
+        default="/workspace/StreamVoiceAnon/configs/hydra_arcs/speech_tokenizers/causal-encoder-lfq-8192.yaml",
+    )
+    pv.add_argument(
+        "--streamvoiceanon_encoder_ckpt",
+        type=str,
+        default="/workspace/StreamVoiceAnon/ckpt/asr_s2s_bsq_8192_causal_down_whisper.pth",
     )
 
     args = p.parse_args()

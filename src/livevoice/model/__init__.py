@@ -2,6 +2,8 @@ from .codec.dac_model import DACModel
 from .codec.mimi_model import MimiCodec
 from .codec import build_codec
 from .content_extractor import HuBERTContentExtractor
+from .streamvoiceanon_content import StreamVoiceAnonContentEncoder
+from .speechbrain_speaker_encoder import SpeechBrainECAPASpeakerEncoder
 from .content_perturbation import ContentPerturbation
 from .prosody_extractor import ProsodyExtractor
 from .transformer import LiveVoiceModel
@@ -12,6 +14,8 @@ __all__ = [
     "MimiCodec",
     "build_codec",
     "HuBERTContentExtractor",
+    "StreamVoiceAnonContentEncoder",
+    "SpeechBrainECAPASpeakerEncoder",
     "ContentPerturbation",
     "ProsodyExtractor",
     "LiveVoiceModel",

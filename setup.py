@@ -21,6 +21,10 @@ setup(
         "pandas>=2.0.0",
         "tensorboard>=2.13.0",
         "einops>=0.7.0",
+        "hydra-core>=1.3.2",
+        "omegaconf>=2.3.0",
+        "pyyaml>=6.0",
+        "speechbrain>=1.0.0",
     ],
     extras_require={
         "dev": [

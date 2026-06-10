@@ -1,8 +1,8 @@
 """LiveVoice transformer: streaming voice conversion.
 
 Mirrors sonic's SketchTransformer / SketchModel but rewired for speech:
-- Reference audio → DAC continuous z → cross-attention (speaker / timbre)
-- Content audio   → HuBERT features  → additive or FiLM conditioning (linguistic)
+- Reference audio → codec continuous z → cross-attention or decoder prefix (speaker / timbre)
+- Content audio   → HuBERT / Mimi z / StreamVoiceAnon tokens → additive or FiLM conditioning
 - Optional prosody (F0 + loudness)   → additive (only if config.use_prosody)
 - AR decoder over DAC codebooks with MusicGen delay pattern
 """
@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from livevoice.nn.layer import TransformerBlock, init_kv_cache_ext
 from livevoice.model.content_perturbation import ContentPerturbation
+from livevoice.model.speechbrain_speaker_encoder import SpeechBrainECAPASpeakerEncoder
 
 try:
     from tqdm.auto import tqdm
@@ -35,12 +36,20 @@ class LiveVoiceTransformer(nn.Module):
         self.max_seq_len = config.max_seq_len
         self.num_heads = config.num_heads
 
-        self.encoder_layers = nn.ModuleList([
-            TransformerBlock(config, purpose="encoder")
-            for _ in range(config.num_encoder_layers)
-        ])
+        self.use_speaker_prefix = (
+            str(getattr(config, "speaker_conditioning", "crossattn")).lower() == "prefix"
+        )
+        self.encoder_layers = nn.ModuleList(
+            []
+            if self.use_speaker_prefix
+            else [
+                TransformerBlock(config, purpose="encoder")
+                for _ in range(config.num_encoder_layers)
+            ]
+        )
+        decoder_purpose = "decoder_only" if self.use_speaker_prefix else "decoder"
         self.decoder_layers = nn.ModuleList([
-            TransformerBlock(config, purpose="decoder")
+            TransformerBlock(config, purpose=decoder_purpose)
             for _ in range(config.num_decoder_layers)
         ])
 
@@ -75,7 +84,7 @@ class LiveVoiceTransformer(nn.Module):
         decoder_input: torch.Tensor,
         content_add: torch.Tensor,
         film_feats: torch.Tensor | None,
-        encoder_output: torch.Tensor,
+        encoder_output: torch.Tensor | None,
         use_cache: bool = False,
     ) -> torch.Tensor:
         if self.use_film:
@@ -98,7 +107,7 @@ class LiveVoiceTransformer(nn.Module):
         decoder_input: torch.Tensor,
         content_add: torch.Tensor,
         film_feats: torch.Tensor | None,
-        encoder_output: torch.Tensor,
+        encoder_output: torch.Tensor | None,
         caches: list,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, list]:
@@ -139,10 +148,17 @@ class LiveVoiceTransformer(nn.Module):
     def init_caches(self, batch_size: int, device: torch.device) -> list:
         caches = []
         head_dim = self.hidden_dim // self.num_heads
-        for _ in range(len(self.decoder_layers)):
+        for layer in self.decoder_layers:
+            self_sink = int(getattr(layer.self_attn, "sink_size", 1))
             caches.append({
-                "self": init_kv_cache_ext(batch_size, self.num_heads, self.max_seq_len, head_dim, device),
-                "cross": init_kv_cache_ext(batch_size, self.num_heads, self.max_seq_len, head_dim, device),
+                "self": init_kv_cache_ext(
+                    batch_size, self.num_heads, self.max_seq_len, head_dim, device,
+                    sink_size=self_sink,
+                ),
+                "cross": init_kv_cache_ext(
+                    batch_size, self.num_heads, self.max_seq_len, head_dim, device,
+                    sink_size=1,
+                ),
             })
         return caches
 
@@ -162,7 +178,7 @@ class LiveVoiceModel(nn.Module):
 
     Components:
       - dac_model:        frozen DAC (16 kHz speech)
-      - content_extractor: HuBERT-based content features
+      - content_extractor: HuBERT or StreamVoiceAnon content features
       - prosody_extractor: (optional) F0 + loudness
       - transformer:      LiveVoiceTransformer
     """
@@ -228,17 +244,46 @@ class LiveVoiceModel(nn.Module):
             nn.Linear(config.hidden_dim, codebook_size) for _ in range(K)
         ])
 
-        # Speaker / reference → hidden_dim
-        self.speaker_proj = nn.Linear(latent_dim, config.hidden_dim)
+        self.speaker_conditioning = str(
+            getattr(config, "speaker_conditioning", "crossattn")
+        ).lower()
+        if self.speaker_conditioning not in {"crossattn", "global_avg", "prefix"}:
+            raise ValueError(
+                "speaker_conditioning must be one of: crossattn, global_avg, prefix; "
+                f"got {self.speaker_conditioning!r}"
+            )
+        if self.speaker_conditioning == "prefix" and int(getattr(config, "speaker_prefix_len", 8)) <= 0:
+            raise ValueError("speaker_conditioning='prefix' requires speaker_prefix_len > 0.")
+        self.speaker_encoder_type = str(getattr(config, "speaker_encoder_type", "codec")).lower()
+        if self.speaker_encoder_type not in {"codec", "speechbrain_ecapa"}:
+            raise ValueError(
+                "speaker_encoder_type must be one of: codec, speechbrain_ecapa; "
+                f"got {self.speaker_encoder_type!r}"
+            )
+        if self.speaker_encoder_type == "speechbrain_ecapa":
+            self.speaker_encoder = SpeechBrainECAPASpeakerEncoder(config)
+            spk_dim = int(getattr(config, "speechbrain_embedding_dim", 192))
+            self.speaker_proj = nn.Linear(spk_dim, config.hidden_dim)
+            if self.speaker_conditioning == "prefix":
+                prefix_len = int(getattr(config, "speaker_prefix_len", 8))
+                self.speaker_prefix_proj = nn.Linear(spk_dim, prefix_len * config.hidden_dim)
+        else:
+            self.speaker_encoder = None
+            self.speaker_proj = nn.Linear(latent_dim, config.hidden_dim)
 
         # ── Content source path ────────────────────────────────────
-        # "hubert"        — uses self.content_extractor (HuBERT)
-        # "mimi_semantic" — uses dac_model codebook 0 directly. Lightweight,
-        #                   matches codec frame-rate, designed by Kyutai for
-        #                   speaker-invariant semantic representation.
+        # "hubert"          — uses self.content_extractor (HuBERT)
+        # "mimi_semantic"   — uses Mimi continuous z directly.
+        # "streamvoiceanon" — uses StreamVoiceAnon causal content tokenizer.
         codec_name = str(getattr(config, "codec", "dac")).lower()
         default_src = "mimi_semantic" if codec_name == "mimi" else "hubert"
         self.content_source = str(getattr(config, "content_source", default_src)).lower()
+        valid_content_sources = {"hubert", "mimi_semantic", "streamvoiceanon"}
+        if self.content_source not in valid_content_sources:
+            raise ValueError(
+                f"content_source must be one of {sorted(valid_content_sources)}; "
+                f"got {self.content_source!r}"
+            )
         if self.content_source == "mimi_semantic" and codec_name != "mimi":
             # Silently fall back; HuBERT works for any codec.
             self.content_source = "hubert"
@@ -248,7 +293,16 @@ class LiveVoiceModel(nn.Module):
                 "content_source='hubert' but content_extractor was not provided. "
                 "Either pass HuBERTContentExtractor or set content_source='mimi_semantic'."
             )
-        print(f"[LiveVoiceModel] content_source={self.content_source}  codec={codec_name}")
+        if self.content_source == "streamvoiceanon" and self.content_extractor is None:
+            raise ValueError(
+                "content_source='streamvoiceanon' but content_extractor was not provided. "
+                "Pass StreamVoiceAnonContentEncoder."
+            )
+        print(
+            f"[LiveVoiceModel] content_source={self.content_source}  codec={codec_name}  "
+            f"speaker_conditioning={self.speaker_conditioning}  "
+            f"speaker_encoder_type={self.speaker_encoder_type}"
+        )
 
         if self.content_source == "mimi_semantic":
             # Use Mimi *continuous* encoder output z (pre-quantization) as content.
@@ -259,6 +313,12 @@ class LiveVoiceModel(nn.Module):
             self.semantic_proj = nn.Linear(sem_dim, config.content_proj_dim)
             self.semantic_to_hidden = nn.Linear(config.content_proj_dim, config.hidden_dim)
             print(f"[LiveVoiceModel] mimi_semantic = continuous z (latent_dim={sem_dim})")
+        elif self.content_source == "streamvoiceanon":
+            self.streamvoiceanon_to_hidden = nn.Linear(config.content_proj_dim, config.hidden_dim)
+            print(
+                "[LiveVoiceModel] streamvoiceanon = causal semantic tokenizer "
+                f"(content_dim={config.content_proj_dim})"
+            )
 
         # ── Auxiliary CTC head for content alignment ───────────────
         # Predicts character-level text from decoder hidden states. Forces the
@@ -281,7 +341,7 @@ class LiveVoiceModel(nn.Module):
         if T_src == num_tokens:
             return feats
         if T_src < num_tokens:
-            idx = torch.linspace(0, T_src - 1, num_tokens).long()
+            idx = torch.linspace(0, T_src - 1, num_tokens, device=feats.device).long()
             return feats[:, idx, :]
         if causal:
             out = []
@@ -291,7 +351,7 @@ class LiveVoiceModel(nn.Module):
                 e = int((t + 1) * ratio)
                 out.append(feats[:, s:e, :].mean(dim=1))
             return torch.stack(out, dim=1)
-        idx = torch.linspace(0, T_src - 1, num_tokens).long()
+        idx = torch.linspace(0, T_src - 1, num_tokens, device=feats.device).long()
         return feats[:, idx, :]
 
     # --------------------- delay pattern ---------------------
@@ -345,6 +405,20 @@ class LiveVoiceModel(nn.Module):
         reference_z: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reference audio → per-frame speaker embedding at decoder hidden dim."""
+        if self.speaker_encoder_type == "speechbrain_ecapa":
+            if reference_audio is None:
+                raise ValueError("reference_audio is required for SpeechBrain speaker encoder.")
+            assert self.speaker_encoder is not None
+            with torch.no_grad():
+                emb = self.speaker_encoder(reference_audio)  # (B, D_ecapa)
+            if self.speaker_conditioning == "prefix" and hasattr(self, "speaker_prefix_proj"):
+                B = emb.size(0)
+                P = int(getattr(self.config, "speaker_prefix_len", 8))
+                spk = self.speaker_prefix_proj(emb).view(B, P, self.config.hidden_dim)
+            else:
+                spk = self.speaker_proj(emb).unsqueeze(1)
+            return spk
+
         if reference_z is None:
             if reference_audio is None:
                 raise ValueError("Either reference_audio or reference_z must be provided.")
@@ -354,10 +428,43 @@ class LiveVoiceModel(nn.Module):
             z = reference_z
         spk = self.speaker_proj(z)  # (B, T_enc, D)
 
-        if str(getattr(self.config, "speaker_conditioning", "crossattn")) == "global_avg":
+        if self.speaker_conditioning == "global_avg":
             # Pool to a single speaker token
             spk = spk.mean(dim=1, keepdim=True)  # (B, 1, D)
         return spk
+
+    def _uses_speaker_prefix(self) -> bool:
+        return self.speaker_conditioning == "prefix"
+
+    def _build_speaker_prefix(self, spk: torch.Tensor) -> torch.Tensor:
+        prefix_len = int(getattr(self.config, "speaker_prefix_len", 8))
+        if prefix_len <= 0:
+            return spk[:, :0, :]
+        if spk.size(1) == prefix_len:
+            return spk
+        return self.align_to_tokens(spk, prefix_len, causal=False)
+
+    def _prepend_speaker_prefix(
+        self,
+        spk: torch.Tensor,
+        prev_emb: torch.Tensor,
+        content_add: torch.Tensor,
+        film_feats: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        prefix = self._build_speaker_prefix(spk).to(device=prev_emb.device, dtype=prev_emb.dtype)
+        B, P, D = prefix.shape
+        zero_content = torch.zeros(B, P, D, device=prev_emb.device, dtype=prev_emb.dtype)
+        prev_full = torch.cat([prefix, prev_emb], dim=1)
+        content_full = torch.cat([zero_content, content_add], dim=1)
+        if film_feats is None:
+            film_full = None
+        else:
+            null_f = self.null_film_feature.expand(B, P, -1).to(
+                device=film_feats.device,
+                dtype=film_feats.dtype,
+            )
+            film_full = torch.cat([null_f, film_feats], dim=1)
+        return prefix, prev_full, content_full, film_full
 
     def extract_content(
         self,
@@ -367,13 +474,14 @@ class LiveVoiceModel(nn.Module):
         """Returns (content_add, film_feats_or_None).
 
         Three input modes:
-          content_feats provided          → skip extractor, project precomputed HuBERT directly
-          content_source=="mimi_semantic" → perturb (train) → Mimi encoder → continuous z
-          else (HuBERT path)              → perturb (train) → HuBERT online
+          content_feats + hubert              → project precomputed HuBERT directly
+          content_source=="mimi_semantic"     → perturb (train) → Mimi encoder → continuous z
+          content_source=="streamvoiceanon"   → perturb (train) → StreamVoiceAnon tokens
+          else (HuBERT path)                  → perturb (train) → HuBERT online
         """
         use_film = str(getattr(self.config, "content_conditioning", "additive")) == "film"
 
-        if content_feats is not None:
+        if content_feats is not None and self.content_source == "hubert":
             # Fast path: precomputed HuBERT features (no perturbation needed — already baked in)
             if use_film:
                 film_raw = self.content_extractor.from_precomputed_raw(content_feats)
@@ -400,6 +508,17 @@ class LiveVoiceModel(nn.Module):
                 )
                 return zeros_add, sem_emb
             return self.semantic_to_hidden(sem_emb), None
+
+        # ── StreamVoiceAnon path: causal tokenizer → learned content embedding ──
+        if self.content_source == "streamvoiceanon":
+            sva_emb = self.content_extractor(content_audio)  # (B, T_codes, content_proj_dim)
+            if use_film:
+                zeros_add = torch.zeros(
+                    sva_emb.shape[0], sva_emb.shape[1], self.config.hidden_dim,
+                    device=sva_emb.device, dtype=sva_emb.dtype,
+                )
+                return zeros_add, sva_emb
+            return self.streamvoiceanon_to_hidden(sva_emb), None
 
         # ── HuBERT path (legacy) ───────────────────────────────────────────
         if use_film:
@@ -496,11 +615,26 @@ class LiveVoiceModel(nn.Module):
             content_add = content_add + prosody_add
 
         # 5. transformer
-        out = self.transformer(
-            spk, content_add, film_feats, prev_emb,
-            use_cache=False,
-        )
-        decoder_output = out["decoder_output"]
+        if self._uses_speaker_prefix():
+            prefix, prev_full, content_full, film_full = self._prepend_speaker_prefix(
+                spk, prev_emb, content_add, film_feats,
+            )
+            decoder_full = self.transformer.decode_step(
+                prev_full,
+                content_full,
+                film_full,
+                encoder_output=None,
+                use_cache=False,
+            )
+            decoder_output = decoder_full[:, prefix.size(1) :, :]
+            encoder_output = prefix
+        else:
+            out = self.transformer(
+                spk, content_add, film_feats, prev_emb,
+                use_cache=False,
+            )
+            decoder_output = out["decoder_output"]
+            encoder_output = out["encoder_output"]
 
         # 6. per-codebook logits
         all_logits = torch.stack([h(decoder_output) for h in self.codebook_heads], dim=2)
@@ -508,7 +642,7 @@ class LiveVoiceModel(nn.Module):
             "all_logits": all_logits,
             "delayed_targets": targets,
             "decoder_output": decoder_output,
-            "encoder_output": out["encoder_output"],
+            "encoder_output": encoder_output,
         }
 
     # --------------------- generation ---------------------
@@ -529,15 +663,19 @@ class LiveVoiceModel(nn.Module):
         K = self.n_codebooks_predict
         device = reference_audio.device
         B = reference_audio.shape[0]
+        use_prefix = self._uses_speaker_prefix()
+        if use_prefix and not use_cache:
+            raise RuntimeError("speaker_conditioning='prefix' generation requires use_cache=True.")
 
         spk = self.encode_speaker_reference(reference_audio)
-        spk_enc = self.transformer.encode_speaker(spk)
-        if cfg_scale != 1.0:
-            null_spk = self.null_speaker_embedding.expand_as(spk).to(device=device, dtype=spk.dtype)
-            spk_enc_null = self.transformer.encode_speaker(null_spk)
+        if use_prefix:
+            spk_prefix = self._build_speaker_prefix(spk)
+            spk_enc = None
+        else:
+            spk_prefix = None
+            spk_enc = self.transformer.encode_speaker(spk)
 
         content_add_raw, film_raw = self.extract_content(content_audio)
-        T_dec = content_add_raw.shape[1]
         if max_steps is None:
             # Use codec frame count as generation horizon.
             # HuBERT/content frames (e.g. 50 fps) can differ from codec frames
@@ -562,21 +700,74 @@ class LiveVoiceModel(nn.Module):
 
         use_cfg = cfg_scale != 1.0
         if use_cfg:
+            null_spk = self.null_speaker_embedding.expand_as(spk).to(device=device, dtype=spk.dtype)
             null_caches = self.transformer.init_caches(B, device)
+            if use_prefix:
+                null_prefix = self._build_speaker_prefix(null_spk).to(
+                    device=device,
+                    dtype=prev_emb.dtype,
+                )
+                null_spk_enc = None
+            else:
+                null_prefix = None
+                null_spk_enc = self.transformer.encode_speaker(null_spk)
+        else:
+            null_caches = None
+            null_prefix = None
+            null_spk_enc = None
+
+        if use_prefix:
+            assert spk_prefix is not None
+            prefix = spk_prefix.to(device=device, dtype=prev_emb.dtype)
+            prefix_content = torch.zeros(
+                B,
+                prefix.size(1),
+                self.config.hidden_dim,
+                device=device,
+                dtype=prev_emb.dtype,
+            )
+            if film_feats is None:
+                prefix_film = None
+            else:
+                prefix_film = self.null_film_feature.expand(B, prefix.size(1), -1).to(
+                    device=device,
+                    dtype=film_feats.dtype,
+                )
+            self.transformer.decode_step(
+                prefix,
+                prefix_content,
+                prefix_film,
+                encoder_output=None,
+                use_cache=False,
+            )
+            if use_cfg:
+                assert null_caches is not None and null_prefix is not None
+                null_prefix_content = torch.zeros_like(prefix_content)
+                null_prefix_film = None if prefix_film is None else prefix_film.clone()
+                _, null_caches = self.transformer.decode_step_stateless(
+                    null_prefix,
+                    null_prefix_content,
+                    null_prefix_film,
+                    encoder_output=None,
+                    caches=null_caches,
+                    use_cache=False,
+                )
 
         for t in tqdm(range(T_total), desc="VC generating", leave=False):
             c_t = content_add[:, t : t + 1, :]
             f_t = film_feats[:, t : t + 1, :] if film_feats is not None else None
+            step_use_cache = use_cache and (t > 0 or use_prefix)
 
             dec_out = self.transformer.decode_step(
-                prev_emb, c_t, f_t, spk_enc, use_cache=(use_cache and t > 0),
+                prev_emb, c_t, f_t, spk_enc, use_cache=step_use_cache,
             )
             hidden_full = dec_out[:, -1, :]
 
             if use_cfg:
+                assert null_caches is not None
                 null_out, null_caches = self.transformer.decode_step_stateless(
-                    prev_emb, c_t, f_t, spk_enc_null, null_caches,
-                    use_cache=(t > 0),
+                    prev_emb, c_t, f_t, null_spk_enc, null_caches,
+                    use_cache=step_use_cache,
                 )
                 hidden_null = null_out[:, -1, :]
 

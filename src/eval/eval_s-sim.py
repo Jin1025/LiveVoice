@@ -45,8 +45,18 @@ from tqdm import tqdm
 from livevoice.config import LiveVoiceConfig
 from livevoice.data.libritts_dataset import LibriTTSDataset
 from livevoice.lightning import LiveVoiceLightningModule
-from livevoice.model import HuBERTContentExtractor, LiveVoiceModel, build_codec
-from livevoice.utils.checkpoint import infer_content_source_from_ckpt, load_model_weights_from_ckpt
+from livevoice.model import (
+    HuBERTContentExtractor,
+    StreamVoiceAnonContentEncoder,
+    LiveVoiceModel,
+    build_codec,
+)
+from livevoice.utils.checkpoint import (
+    infer_content_source_from_ckpt,
+    infer_speaker_conditioning_from_ckpt,
+    infer_speaker_encoder_from_ckpt,
+    load_model_weights_from_ckpt,
+)
 
 
 def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
@@ -95,6 +105,16 @@ def _build_vc_config(args: argparse.Namespace) -> LiveVoiceConfig:
         ffn_dim=4 * int(args.hidden_dim),
         n_codebooks_predict=int(args.n_codebooks),
         content_source=str(args.content_source).lower(),
+        speaker_conditioning=str(args.speaker_conditioning).lower(),
+        speaker_prefix_len=int(args.speaker_prefix_len),
+        speaker_encoder_type=str(args.speaker_encoder_type).lower(),
+        speechbrain_source=args.speechbrain_source,
+        speechbrain_savedir=args.speechbrain_savedir,
+        speechbrain_sample_rate=int(args.speechbrain_sample_rate),
+        speechbrain_embedding_dim=int(args.speechbrain_embedding_dim),
+        streamvoiceanon_repo=args.streamvoiceanon_repo,
+        streamvoiceanon_encoder_config=args.streamvoiceanon_encoder_config,
+        streamvoiceanon_encoder_ckpt=args.streamvoiceanon_encoder_ckpt,
         features_dir=None,
         output_dir=args.output_dir,
     )
@@ -293,11 +313,33 @@ def run_libritts_test_clean(args: argparse.Namespace) -> None:
         if inferred is None:
             raise SystemExit(
                 "Could not infer content_source from ckpt. "
-                "Pass --content_source hubert or mimi_semantic."
+                "Pass --content_source hubert, mimi_semantic, or streamvoiceanon."
             )
         content_source = inferred
         print(f"[s-sim] content_source=auto → {content_source!r}")
     args.content_source = content_source
+
+    speaker_conditioning = str(args.speaker_conditioning).lower()
+    if speaker_conditioning == "auto":
+        inferred_spk = infer_speaker_conditioning_from_ckpt(args.ckpt)
+        if inferred_spk is None:
+            inferred_spk = "prefix"
+            print("[s-sim] speaker_conditioning=auto → 'prefix' (fallback; ckpt keys ambiguous)")
+        else:
+            print(f"[s-sim] speaker_conditioning=auto → {inferred_spk!r}")
+        speaker_conditioning = inferred_spk
+    args.speaker_conditioning = speaker_conditioning
+
+    speaker_encoder_type = str(args.speaker_encoder_type).lower()
+    if speaker_encoder_type == "auto":
+        inferred_enc = infer_speaker_encoder_from_ckpt(args.ckpt)
+        if inferred_enc is None:
+            inferred_enc = "codec"
+            print("[s-sim] speaker_encoder_type=auto → 'codec' (fallback; ckpt keys ambiguous)")
+        else:
+            print(f"[s-sim] speaker_encoder_type=auto → {inferred_enc!r}")
+        speaker_encoder_type = inferred_enc
+    args.speaker_encoder_type = speaker_encoder_type
 
     cfg_model = _build_vc_config(args)
     if cfg_model.content_source == "mimi_semantic" and cfg_model.codec != "mimi":
@@ -321,7 +363,12 @@ def run_libritts_test_clean(args: argparse.Namespace) -> None:
         f"[s-sim] mode=libritts_cross_speaker_vc  split={args.split_dir}  "
         f"utterances={len(ds.items)}  speakers={len(speaker_utts)}"
     )
-    print(f"[s-sim] ckpt={args.ckpt}  codec={cfg_model.codec}  content_source={cfg_model.content_source}")
+    print(
+        f"[s-sim] ckpt={args.ckpt}  codec={cfg_model.codec}  "
+        f"content_source={cfg_model.content_source}  "
+        f"speaker_conditioning={cfg_model.speaker_conditioning}  "
+        f"speaker_encoder_type={cfg_model.speaker_encoder_type}"
+    )
 
     target_sr = int(cfg_model.sample_rate)
     dev = torch.device(cfg_model.device if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -330,6 +377,8 @@ def run_libritts_test_clean(args: argparse.Namespace) -> None:
     codec_model = build_codec(cfg_model)
     if cfg_model.content_source == "hubert":
         content_extractor = HuBERTContentExtractor(cfg_model)
+    elif cfg_model.content_source == "streamvoiceanon":
+        content_extractor = StreamVoiceAnonContentEncoder(cfg_model)
     else:
         content_extractor = None
     core = LiveVoiceModel(cfg_model, codec_model, content_extractor, prosody_extractor=None)
@@ -596,7 +645,39 @@ def main() -> None:
         "--content_source",
         type=str,
         default="auto",
-        choices=["auto", "hubert", "mimi_semantic"],
+        choices=["auto", "hubert", "mimi_semantic", "streamvoiceanon"],
+    )
+    p.add_argument(
+        "--speaker_conditioning",
+        type=str,
+        default="auto",
+        choices=["auto", "crossattn", "global_avg", "prefix"],
+    )
+    p.add_argument("--speaker_prefix_len", type=int, default=8)
+    p.add_argument(
+        "--speaker_encoder_type",
+        type=str,
+        default="auto",
+        choices=["auto", "codec", "speechbrain_ecapa"],
+    )
+    p.add_argument("--speechbrain_source", type=str, default="speechbrain/spkrec-ecapa-voxceleb")
+    p.add_argument(
+        "--speechbrain_savedir",
+        type=str,
+        default="/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb",
+    )
+    p.add_argument("--speechbrain_sample_rate", type=int, default=16000)
+    p.add_argument("--speechbrain_embedding_dim", type=int, default=192)
+    p.add_argument("--streamvoiceanon_repo", type=str, default="/home/yejin/StreamVoiceAnon")
+    p.add_argument(
+        "--streamvoiceanon_encoder_config",
+        type=str,
+        default="/home/yejin/StreamVoiceAnon/configs/hydra_arcs/speech_tokenizers/causal-encoder-lfq-8192.yaml",
+    )
+    p.add_argument(
+        "--streamvoiceanon_encoder_ckpt",
+        type=str,
+        default="/home/yejin/StreamVoiceAnon/ckpt/asr_s2s_bsq_8192_causal_down_whisper.pth",
     )
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top_p", type=float, default=0.9)
@@ -612,11 +693,6 @@ def main() -> None:
         help="ecapa=SpeechBrain ECAPA; wavlm=UniSpeech WavLM+TDNN; both=record both columns.",
     )
     p.add_argument(
-        "--speechbrain_source",
-        type=str,
-        default="speechbrain/spkrec-ecapa-voxceleb",
-    )
-    p.add_argument(
         "--wavlm_ckpt",
         type=str,
         default='/workspace/LiveVoice/src/eval/ckpt/wavlm_large_finetune.pth',
@@ -629,7 +705,6 @@ def main() -> None:
         choices=["wavlm_large", "wavlm_base_plus"],
     )
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--speechbrain_savedir", type=str, default=None)
     p.add_argument("--max_audio_sec", type=float, default=None)
     # Pairwise inputs
     p.add_argument("--ref_wav", type=str, default=None)

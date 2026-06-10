@@ -476,6 +476,8 @@ class LiveVoiceLightningModule(L.LightningModule):
         return torch.cat(out, dim=0)
 
     def _load_reference_z_or_fallback(self, ref: torch.Tensor, ref_paths, ref_starts):
+        if str(getattr(self.model, "speaker_encoder_type", "codec")).lower() != "codec":
+            return None
         if not self.use_mimi_cache or ref_paths is None or ref_starts is None:
             with torch.no_grad():
                 _, z = self.model.dac_model.encode_continuous(ref)

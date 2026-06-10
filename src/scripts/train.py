@@ -1,4 +1,4 @@
-"""Train full LiveVoice VC model: speaker cross-attn + HuBERT content.
+"""Train full LiveVoice VC model.
 
 Usage (inside docker `yejin2`, conda `sound`):
     CUDA_VISIBLE_DEVICES=2 python scripts/train.py --exp_name base_vctk
@@ -19,7 +19,13 @@ except Exception:  # pragma: no cover
     WandbLogger = None
 
 from livevoice.config import LiveVoiceConfig
-from livevoice.model import build_codec, HuBERTContentExtractor, ProsodyExtractor, LiveVoiceModel
+from livevoice.model import (
+    build_codec,
+    HuBERTContentExtractor,
+    StreamVoiceAnonContentEncoder,
+    ProsodyExtractor,
+    LiveVoiceModel,
+)
 from livevoice.lightning import LiveVoiceLightningModule
 from livevoice.data.datamodule import VCTKDataModule, LibriTTSDataModule
 
@@ -60,10 +66,31 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--audio_duration", type=float, default=4.0)
     p.add_argument("--use_prosody", action="store_true")
-    p.add_argument("--content_conditioning", type=str, default="film",
-                   choices=["additive", "film"])
-    p.add_argument("--speaker_conditioning", type=str, default="crossattn",
-                   choices=["crossattn", "global_avg"])
+    # p.add_argument("--content_conditioning", type=str, default="film", choices=["additive", "film"])
+    # p.add_argument("--speaker_conditioning", type=str, default="prefix", choices=["crossattn", "global_avg", "prefix"])
+    p.add_argument("--speaker_prefix_len", type=int, default=8)
+    # p.add_argument("--speaker_encoder_type", type=str, default="speechbrain_ecapa", choices=["codec", "speechbrain_ecapa"])
+    # p.add_argument("--speechbrain_source", type=str, default="speechbrain/spkrec-ecapa-voxceleb")
+    # p.add_argument(
+    #     "--speechbrain_savedir",
+    #     type=str,
+    #     default="/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb",
+    # )
+    p.add_argument("--speechbrain_sample_rate", type=int, default=16000)
+    p.add_argument("--speechbrain_embedding_dim", type=int, default=192)
+    # p.add_argument("--content_source", type=str, default="streamvoiceanon",
+    #                choices=["hubert", "mimi_semantic", "streamvoiceanon"])
+    # p.add_argument("--streamvoiceanon_repo", type=str, default="/workspace/StreamVoiceAnon")
+    # p.add_argument(
+    #     "--streamvoiceanon_encoder_config",
+    #     type=str,
+    #     default="/workspace/StreamVoiceAnon/configs/hydra_arcs/speech_tokenizers/causal-encoder-lfq-8192.yaml",
+    # )
+    # p.add_argument(
+    #     "--streamvoiceanon_encoder_ckpt",
+    #     type=str,
+    #     default="/workspace/StreamVoiceAnon/ckpt/asr_s2s_bsq_8192_causal_down_whisper.pth",
+    # )
     p.add_argument("--pairing", type=str, default="same_speaker",
                    choices=["same_speaker", "reconstruct"])
     p.add_argument("--max_windows", type=int, default=None)
@@ -89,6 +116,8 @@ def parse_args():
 def main():
     args = parse_args()
     L.seed_everything(args.seed)
+    if args.codec != "mimi":
+        raise SystemExit("Requires --codec mimi")
 
     config = LiveVoiceConfig(
         exp_name=args.exp_name,
@@ -103,8 +132,18 @@ def main():
         learning_rate=args.lr,
         audio_duration=args.audio_duration,
         use_prosody=args.use_prosody,
-        content_conditioning=args.content_conditioning,
-        speaker_conditioning=args.speaker_conditioning,
+        # content_conditioning=args.content_conditioning,
+        # speaker_conditioning=args.speaker_conditioning,
+        speaker_prefix_len=args.speaker_prefix_len,
+        # speaker_encoder_type=args.speaker_encoder_type,
+        # speechbrain_source=args.speechbrain_source,
+        # speechbrain_savedir=args.speechbrain_savedir,
+        speechbrain_sample_rate=args.speechbrain_sample_rate,
+        speechbrain_embedding_dim=args.speechbrain_embedding_dim,
+        # content_source=args.content_source,
+        # streamvoiceanon_repo=args.streamvoiceanon_repo,
+        # streamvoiceanon_encoder_config=args.streamvoiceanon_encoder_config,
+        # streamvoiceanon_encoder_ckpt=args.streamvoiceanon_encoder_ckpt,
         pairing=args.pairing,
         max_windows=args.max_windows,
         seed=args.seed,
@@ -115,9 +154,12 @@ def main():
         ablate_cross_attn=args.ablate_cross_attn,
         codec=args.codec
     )
+    if str(config.content_source).lower() != "hubert":
+        config.features_dir = None
 
     print(f"[train] Dataset: {args.dataset}  SR: {config.sample_rate} Hz  "
-          f"codec: {config.codec}  n_codebooks: {config.n_codebooks_predict}")
+          f"codec: {config.codec}  n_codebooks: {config.n_codebooks_predict}  "
+          f"speaker_encoder: {config.speaker_encoder_type}")
 
     print(f"[train] Building codec ({config.codec})...")
     codec_model = build_codec(config)
@@ -128,6 +170,9 @@ def main():
     if content_source == "hubert":
         print(f"[train] Building HuBERT content extractor ({config.hubert_model_name}, layer {config.hubert_layer})...")
         content_extractor = HuBERTContentExtractor(config)
+    elif content_source == "streamvoiceanon":
+        print("[train] Building StreamVoiceAnon causal content encoder...")
+        content_extractor = StreamVoiceAnonContentEncoder(config)
     else:
         print(f"[train] content_source={content_source} → skipping HuBERT build")
         content_extractor = None

@@ -19,10 +19,13 @@ tensorboard>=2.13.0
 wandb>=0.16.0
 matplotlib>=3.7.0
 einops>=0.7.0
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+pyyaml>=6.0
 
 # Evaluation
 jiwer>=3.0.0               # WER for intelligibility
-# speechbrain>=1.0.0       # optional: ECAPA-TDNN for SECS (speaker similarity)
+speechbrain>=1.0.0         # ECAPA-TDNN speaker encoder / speaker similarity
 
 # Optional / dev
 jupyter>=1.0.0

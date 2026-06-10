@@ -7,17 +7,47 @@ import torch
 def infer_content_source_from_ckpt(ckpt_path: str) -> str | None:
     """Guess content path from ``state_dict`` keys.
 
-    Returns ``"mimi_semantic"`` if ``model.semantic_proj`` weights exist,
-    ``"hubert"`` if ``model.content_extractor`` exists, else ``None``.
+    Returns ``"streamvoiceanon"`` if the StreamVoiceAnon token path exists,
+    ``"mimi_semantic"`` if ``model.semantic_proj`` weights exist,
+    ``"hubert"`` if HuBERT ``model.content_extractor`` exists, else ``None``.
     """
     obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = obj.get("state_dict", obj)
+    has_streamvoiceanon = any(
+        k.startswith("model.streamvoiceanon_to_hidden.")
+        or k.startswith("model.content_extractor.code_embedding.")
+        or k.startswith("model.content_extractor.out_norm.")
+        for k in sd
+    )
     has_mimi = any(k.startswith("model.semantic_proj.") for k in sd)
     has_hubert = any(k.startswith("model.content_extractor.") for k in sd)
+    if has_streamvoiceanon:
+        return "streamvoiceanon"
     if has_mimi:
         return "mimi_semantic"
     if has_hubert:
         return "hubert"
+    return None
+
+
+def infer_speaker_conditioning_from_ckpt(ckpt_path: str) -> str | None:
+    """Guess speaker conditioning from ``state_dict`` keys.
+
+    ``crossattn`` and ``global_avg`` share the same parameter topology, so old
+    checkpoints with decoder cross-attention are reported as ``"crossattn"``.
+    Prefix checkpoints omit decoder cross-attention parameters.
+    """
+    obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = obj.get("state_dict", obj)
+    has_decoder_cross = any(
+        k.startswith("model.transformer.decoder_layers.") and ".cross_attn." in k
+        for k in sd
+    )
+    has_encoder_layers = any(k.startswith("model.transformer.encoder_layers.") for k in sd)
+    if has_decoder_cross or has_encoder_layers:
+        return "crossattn"
+    if any(k.startswith("model.speaker_proj.") for k in sd):
+        return "prefix"
     return None
 
 
@@ -41,3 +71,17 @@ def load_model_weights_from_ckpt(
             "(WER Whisper is loaded separately for eval)."
         )
     return model.load_state_dict(model_sd, strict=False)
+
+
+def infer_speaker_encoder_from_ckpt(ckpt_path: str) -> str | None:
+    """Guess speaker encoder type from checkpoint parameter topology."""
+    obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = obj.get("state_dict", obj)
+    if any(k.startswith("model.speaker_prefix_proj.") for k in sd):
+        return "speechbrain_ecapa"
+    w = sd.get("model.speaker_proj.weight")
+    if isinstance(w, torch.Tensor):
+        if w.dim() == 2 and w.shape[1] == 192:
+            return "speechbrain_ecapa"
+        return "codec"
+    return None

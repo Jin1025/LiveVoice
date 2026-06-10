@@ -164,32 +164,44 @@ class MultiHeadAttention(nn.Module):
         
         self.num_heads = num_heads
         self.head_dim = model_dim // num_heads
-        
+
         # Cache capacity
         if purpose == "encoder":
             self.self_capacity = config.max_seq_len
         elif purpose == "decoder":
             self.self_capacity = config.max_seq_len
-        
+
+        # Prefix-aware behavior: when speaker_conditioning == "prefix" and this
+        # is decoder self-attn, the first P tokens are speaker prefix. They get
+        # zero ALiBi distance penalty (always accessible regardless of distance)
+        # and are pinned in the KV cache as extended attention sink.
+        # Cross-attn and encoder self-attn are unaffected.
+        spk_cond = str(getattr(config, "speaker_conditioning", "crossattn")).lower()
+        if (not cross_attn) and purpose == "decoder" and spk_cond == "prefix":
+            self.alibi_prefix_len = int(getattr(config, "speaker_prefix_len", 0))
+        else:
+            self.alibi_prefix_len = 0
+        self.sink_size = max(1, self.alibi_prefix_len)
+
         # Projection layers
         self.key = nn.Linear(model_dim, model_dim)
         self.value = nn.Linear(model_dim, model_dim)
         self.query = nn.Linear(model_dim, model_dim)
         self.proj = nn.Linear(model_dim, model_dim)
-        
+
         # Dropout layers
         self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
-        
+
         # Initialize attention mask with ALiBi
         self._init_attn_mask(self.self_capacity)
-        
-        # Rotational cache state (ring buffer with attention sink at index 0)
+
+        # Rotational cache state (ring buffer with attention sink at indices 0..sink_size-1)
         self._cache_inited = False
-        self._ring_write_pos = 1  # next write position in [1..capacity-1]
-        self._non_sink_len = 0    # number of valid non-sink slots currently filled (<= capacity-1)
+        self._ring_write_pos = self.sink_size  # next write position in [sink_size..capacity-1]
+        self._non_sink_len = 0    # number of valid non-sink slots currently filled (<= capacity-sink_size)
         self._total_seen = 0      # total number of non-sink tokens appended (monotonic)
-        self.cur_cache_len = 0    # 1 + _non_sink_len (exposed for compatibility)
+        self.cur_cache_len = 0    # sink_size + _non_sink_len (exposed for compatibility)
     
     def _init_attn_mask(self, capacity: int):
         """Initialize causal mask and ALiBi bias.
@@ -236,8 +248,14 @@ class MultiHeadAttention(nn.Module):
             )
             causal_attn_bias = causal_attn_bias.unsqueeze(0).unsqueeze(0)  # [1, 1, L, L]
             self.register_buffer("causal_attn_bias", causal_attn_bias)
-            
+
             alibi_attn_bias = (m * relative_positions).unsqueeze(0)  # [1, H, L, L]
+            # Prefix-aware: zero distance penalty for prefix columns so they
+            # stay accessible from any query position regardless of distance.
+            # The causal mask is unchanged — queries still can't see future
+            # tokens, but past prefix tokens are no longer penalized.
+            if self.alibi_prefix_len > 0:
+                alibi_attn_bias[..., : self.alibi_prefix_len] = 0.0
             self.register_buffer("alibi_attn_bias", alibi_attn_bias)
     
     def forward(self, x, mem=None, use_cache=False):
@@ -367,7 +385,8 @@ class MultiHeadAttention(nn.Module):
         if kv_cache_in is None:
             device = x.device
             kv_cache_in = init_kv_cache_ext(
-                batch_size, self.num_heads, self.self_capacity, self.head_dim, device
+                batch_size, self.num_heads, self.self_capacity, self.head_dim, device,
+                sink_size=self.sink_size,
             )
         
         kv_cache_out = kv_cache_in
@@ -415,16 +434,17 @@ class MultiHeadAttention(nn.Module):
         return x.view(x.size(0), x.size(1), self.num_heads, self.head_dim).transpose(1, 2)
     
     def _update_cache(self, new_k, new_v, in_cache_len):
-        """Append new K/V into rotational cache (index 0 is reserved for sink)."""
+        """Append new K/V into rotational cache (indices 0..sink_size-1 are reserved for sink)."""
         if in_cache_len <= 0:
             return
-        ring_size = self.k_cache.size(2) - 1  # non-sink region length
+        sink = self.sink_size
+        ring_size = self.k_cache.size(2) - sink  # non-sink region length
         # Write possibly in two segments (tail then wrap)
         write_from = 0
         remaining = in_cache_len
         while remaining > 0:
-            pos = self._ring_write_pos  # in [1..ring_size]
-            space = ring_size - (pos - 1)
+            pos = self._ring_write_pos  # in [sink..sink+ring_size-1]
+            space = ring_size - (pos - sink)
             take = min(remaining, space)
             dst_slice = slice(pos, pos + take)
             src_slice = slice(write_from, write_from + take)
@@ -432,18 +452,19 @@ class MultiHeadAttention(nn.Module):
             self.v_cache[:, :, dst_slice, :] = new_v[:, :, src_slice, :]
             write_from += take
             remaining -= take
-            self._ring_write_pos = 1 + ((pos - 1 + take) % ring_size)
+            self._ring_write_pos = sink + ((pos - sink + take) % ring_size)
         self._non_sink_len = min(ring_size, self._non_sink_len + in_cache_len)
         self._total_seen += in_cache_len
-        self.cur_cache_len = 1 + self._non_sink_len
+        self.cur_cache_len = sink + self._non_sink_len
         return
-    
+
     def _reset_cache(self, new_k, new_v, seq_len):
-        """Reset cache for new sequence and initialize sink at position 0."""
+        """Reset cache for new sequence and initialize sink at indices 0..sink_size-1."""
         capacity = self.self_capacity
         device = new_k.device if new_k is not None else self.query.weight.device
         batch_size = new_k.size(0) if new_k is not None else 1
-        
+        sink = self.sink_size
+
         # Allocate caches [B,H,L,Hd]
         self.k_cache = torch.zeros(
             batch_size,
@@ -459,94 +480,108 @@ class MultiHeadAttention(nn.Module):
             self.head_dim,
             device=device,
         )
-        
-        # Initialize sink at index 0
+
+        # Initialize sink at indices [0..sink_size-1]
         if new_k is not None and seq_len > 0:
-            self.k_cache[:, :, 0:1, :] = new_k[:, :, 0:1, :]
-            self.v_cache[:, :, 0:1, :] = new_v[:, :, 0:1, :]
+            n_sink = min(sink, seq_len)
+            self.k_cache[:, :, :n_sink, :] = new_k[:, :, :n_sink, :]
+            self.v_cache[:, :, :n_sink, :] = new_v[:, :, :n_sink, :]
             # Fill the rest (excluding sink) through rotational writer
-            self._ring_write_pos = 1
+            self._ring_write_pos = sink
             self._non_sink_len = 0
             self._total_seen = 0
-            if seq_len - 1 > 0:
-                self._update_cache(new_k[:, :, 1:, :], new_v[:, :, 1:, :], seq_len - 1)
+            if seq_len - n_sink > 0:
+                self._update_cache(new_k[:, :, n_sink:, :], new_v[:, :, n_sink:, :], seq_len - n_sink)
             else:
-                self.cur_cache_len = 1
+                self.cur_cache_len = n_sink
         else:
             # No initial tokens; keep sink zeros
-            self._ring_write_pos = 1
+            self._ring_write_pos = sink
             self._non_sink_len = 0
             self._total_seen = 0
-            self.cur_cache_len = 1
+            self.cur_cache_len = sink
         self._cache_inited = True
-    
+
     def _gather_cache_view(self):
-        """Return (k, v) view assembled as [sink] + [oldest..newest] from ring."""
+        """Return (k, v) view assembled as [sink_tokens] + [oldest..newest] from ring."""
         B, H, L, Hd = self.k_cache.size()
-        ring_size = L - 1
+        sink = self.sink_size
+        ring_size = L - sink
         tail = self._non_sink_len
         if tail <= 0:
-            k = self.k_cache[:, :, 0:1, :]
-            v = self.v_cache[:, :, 0:1, :]
-            self.cur_cache_len = 1
+            k = self.k_cache[:, :, :sink, :]
+            v = self.v_cache[:, :, :sink, :]
+            self.cur_cache_len = sink
             return k, v
-        # Compute chronological indices in non-sink ring [1..L-1]
-        start = (self._ring_write_pos - tail - 1) % ring_size  # 0-based in [0..ring_size-1]
+        # Compute chronological indices in non-sink ring [sink..L-1]
+        start = (self._ring_write_pos - tail - sink) % ring_size  # 0-based in [0..ring_size-1]
         idx = (start + torch.arange(tail, device=self.k_cache.device)) % ring_size
-        idx = idx + 1  # shift to [1..L-1]
-        all_idx = torch.cat([torch.zeros(1, device=self.k_cache.device, dtype=idx.dtype), idx], dim=0)
+        idx = idx + sink  # shift to [sink..L-1]
+        sink_idx = torch.arange(sink, device=self.k_cache.device, dtype=idx.dtype)
+        all_idx = torch.cat([sink_idx, idx], dim=0)
         index = all_idx.view(1, 1, -1, 1).expand(B, H, -1, Hd)
         k = torch.gather(self.k_cache, 2, index)
         v = torch.gather(self.v_cache, 2, index)
-        self.cur_cache_len = 1 + tail
+        self.cur_cache_len = sink + tail
         return k, v
 
 
 # =============================
 # External KV-cache utilities
 # =============================
-def init_kv_cache_ext(batch_size: int, num_heads: int, capacity: int, head_dim: int, device: torch.device):
-    """Initialize external KV cache."""
+def init_kv_cache_ext(
+    batch_size: int,
+    num_heads: int,
+    capacity: int,
+    head_dim: int,
+    device: torch.device,
+    sink_size: int = 1,
+):
+    """Initialize external KV cache. sink_size pins the first N tokens (e.g. speaker prefix)."""
     k_cache = torch.zeros(batch_size, num_heads, capacity, head_dim, device=device)
     v_cache = torch.zeros(batch_size, num_heads, capacity, head_dim, device=device)
+    sink = max(1, int(sink_size))
     return {
         "k": k_cache,
         "v": v_cache,
-        "ring_write_pos": 1,
+        "ring_write_pos": sink,
         "non_sink_len": 0,
         "total_seen": 0,
         "cur_cache_len": 0,
         "cache_inited": False,
         "capacity": capacity,
+        "sink_size": sink,
     }
 
 
 def reset_cache_ext(kv_cache: dict, new_k, new_v, seq_len: int, cross_attn: bool, num_heads: int, head_dim: int):
     """Reset external KV cache."""
     capacity = kv_cache["capacity"]
+    sink = int(kv_cache.get("sink_size", 1))
     device = new_k.device if new_k is not None else kv_cache["k"].device
     batch_size = new_k.size(0) if new_k is not None else kv_cache["k"].size(0)
-    
+
     if kv_cache["k"].size(0) != batch_size or kv_cache["k"].size(2) != capacity:
         kv_cache["k"] = torch.zeros(batch_size, num_heads, capacity, head_dim, device=device)
         kv_cache["v"] = torch.zeros(batch_size, num_heads, capacity, head_dim, device=device)
-    
-    # Initialize sink at index 0
+
+    # Initialize sink at indices [0..sink-1]
     if new_k is not None and seq_len > 0:
-        kv_cache["k"][:, :, 0:1, :] = new_k[:, :, 0:1, :]
-        kv_cache["v"][:, :, 0:1, :] = new_v[:, :, 0:1, :]
-        kv_cache["ring_write_pos"] = 1
+        n_sink = min(sink, seq_len)
+        kv_cache["k"][:, :, :n_sink, :] = new_k[:, :, :n_sink, :]
+        kv_cache["v"][:, :, :n_sink, :] = new_v[:, :, :n_sink, :]
+        kv_cache["ring_write_pos"] = sink
         kv_cache["non_sink_len"] = 0
         kv_cache["total_seen"] = 0
-        if seq_len - 1 > 0:
-            kv_cache = update_cache_ext(kv_cache, new_k[:, :, 1:, :], new_v[:, :, 1:, :], seq_len - 1)
+        if seq_len - n_sink > 0:
+            kv_cache = update_cache_ext(kv_cache, new_k[:, :, n_sink:, :], new_v[:, :, n_sink:, :], seq_len - n_sink)
         else:
-            kv_cache["cur_cache_len"] = 1
+            kv_cache["cur_cache_len"] = n_sink
     else:
-        kv_cache["ring_write_pos"] = 1
+        kv_cache["ring_write_pos"] = sink
         kv_cache["non_sink_len"] = 0
         kv_cache["total_seen"] = 0
-        kv_cache["cur_cache_len"] = 1
+        kv_cache["cur_cache_len"] = sink
     kv_cache["cache_inited"] = True
     return kv_cache
 
@@ -555,12 +590,13 @@ def update_cache_ext(kv_cache: dict, new_k, new_v, in_cache_len: int):
     """Update external KV cache."""
     if in_cache_len <= 0:
         return kv_cache
-    ring_size = kv_cache["k"].size(2) - 1
+    sink = int(kv_cache.get("sink_size", 1))
+    ring_size = kv_cache["k"].size(2) - sink
     write_from = 0
     remaining = in_cache_len
     while remaining > 0:
         pos = kv_cache["ring_write_pos"]
-        space = ring_size - (pos - 1)
+        space = ring_size - (pos - sink)
         take = min(remaining, space)
         dst_slice = slice(pos, pos + take)
         src_slice = slice(write_from, write_from + take)
@@ -568,31 +604,33 @@ def update_cache_ext(kv_cache: dict, new_k, new_v, in_cache_len: int):
         kv_cache["v"][:, :, dst_slice, :] = new_v[:, :, src_slice, :]
         write_from += take
         remaining -= take
-        kv_cache["ring_write_pos"] = 1 + ((pos - 1 + take) % ring_size)
+        kv_cache["ring_write_pos"] = sink + ((pos - sink + take) % ring_size)
     kv_cache["non_sink_len"] = min(ring_size, kv_cache["non_sink_len"] + in_cache_len)
     kv_cache["total_seen"] += in_cache_len
-    kv_cache["cur_cache_len"] = 1 + kv_cache["non_sink_len"]
+    kv_cache["cur_cache_len"] = sink + kv_cache["non_sink_len"]
     return kv_cache
 
 
 def gather_cache_view_ext(kv_cache: dict):
     """Gather cache view from external KV cache."""
     B, H, L, Hd = kv_cache["k"].size()
-    ring_size = L - 1
+    sink = int(kv_cache.get("sink_size", 1))
+    ring_size = L - sink
     tail = kv_cache["non_sink_len"]
     if tail <= 0:
-        k = kv_cache["k"][:, :, 0:1, :]
-        v = kv_cache["v"][:, :, 0:1, :]
-        kv_cache["cur_cache_len"] = 1
+        k = kv_cache["k"][:, :, :sink, :]
+        v = kv_cache["v"][:, :, :sink, :]
+        kv_cache["cur_cache_len"] = sink
         return k, v, kv_cache
-    start = (kv_cache["ring_write_pos"] - tail - 1) % ring_size
+    start = (kv_cache["ring_write_pos"] - tail - sink) % ring_size
     idx = (start + torch.arange(tail, device=kv_cache["k"].device)) % ring_size
-    idx = idx + 1
-    all_idx = torch.cat([torch.zeros(1, device=kv_cache["k"].device, dtype=idx.dtype), idx], dim=0)
+    idx = idx + sink
+    sink_idx = torch.arange(sink, device=kv_cache["k"].device, dtype=idx.dtype)
+    all_idx = torch.cat([sink_idx, idx], dim=0)
     index = all_idx.view(1, 1, -1, 1).expand(B, H, -1, Hd)
     k = torch.gather(kv_cache["k"], 2, index)
     v = torch.gather(kv_cache["v"], 2, index)
-    kv_cache["cur_cache_len"] = 1 + tail
+    kv_cache["cur_cache_len"] = sink + tail
     return k, v, kv_cache
 
 

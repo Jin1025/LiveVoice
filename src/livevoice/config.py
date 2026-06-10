@@ -58,7 +58,7 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     # Content features (HuBERT)
     # ------------------------------------------------------------------
-    # HuBERT-base operates at 44 kHz with hop=320 → 137.5 frames/sec (matches DAC 44 kHz)
+    # HuBERT-base
     hubert_model_name: str = "facebook/hubert-base-ls960"
     hubert_layer: int = 9          # layer 9 is the standard "content" layer (FreeVC/SoVITS)
     hubert_sample_rate: int = 16000 # 16000
@@ -93,8 +93,20 @@ class LiveVoiceConfig:
 
     # Speaker/reference handling:
     #   "crossattn"  — per-frame reference z through cross-attention (sonic default)
-    #   "global_avg" — pool reference z over time → single speaker vector as prefix
-    speaker_conditioning: str = "crossattn"
+    #   "global_avg" — pool reference z over time, then use cross-attention to one token
+    #   "prefix"     — prepend reference-derived speaker tokens to decoder self-attn
+    #                  (decoder-only path; no cross-attention)
+    speaker_conditioning: str = "prefix"
+    speaker_prefix_len: int = 8
+
+    # Speaker encoder:
+    #   "codec"             — codec continuous z from reference audio (old default)
+    #   "speechbrain_ecapa" — SpeechBrain ECAPA-TDNN utterance embedding
+    speaker_encoder_type: str = "speechbrain_ecapa"
+    speechbrain_source: str = "speechbrain/spkrec-ecapa-voxceleb"
+    speechbrain_savedir: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb"
+    speechbrain_sample_rate: int = 16000
+    speechbrain_embedding_dim: int = 192
 
     # Classifier-free guidance dropout (training)
     use_cfg_dropout: bool = True
@@ -132,10 +144,29 @@ class LiveVoiceConfig:
 
     # Content source: how linguistic features are extracted from content audio.
     #   "hubert"        — HuBERT layer-9 hidden states (heavy, bidirectional)
-    #   "mimi_semantic" — Mimi codec's first codebook (semantic, 12.5 fps,
-    #                     designed for speaker-invariance via WavLM distillation).
-    #                     Only valid when codec=="mimi".
-    content_source: str = "mimi_semantic"
+    #   "mimi_semantic"   — Mimi encoder z, 12.5 fps. Lightweight but not very
+    #                       speaker-invariant in practice.
+    #   "streamvoiceanon" — StreamVoiceAnon causal content tokenizer, 21.5 fps,
+    #                       discrete 8192 semantic tokens.
+    content_source: str = "streamvoiceanon" 
+
+    # StreamVoiceAnon causal content tokenizer.
+    streamvoiceanon_repo: str = "/workspace/StreamVoiceAnon"
+    streamvoiceanon_encoder_config: str = (
+        "/workspace/StreamVoiceAnon/configs/hydra_arcs/"
+        "speech_tokenizers/causal-encoder-lfq-8192.yaml"
+    )
+    streamvoiceanon_encoder_ckpt: str = (
+        "/workspace/StreamVoiceAnon/ckpt/asr_s2s_bsq_8192_causal_down_whisper.pth"
+    )
+    streamvoiceanon_sample_rate: int = 44100
+    streamvoiceanon_codebook_size: int = 8192
+    freeze_streamvoiceanon_encoder: bool = True
+    # If True, use pre-quantization continuous z (HuBERT-like — structurally
+    # coherent so a random linear projection already carries phonetic info).
+    # If False, use discrete codes + learnable nn.Embedding (slower to learn,
+    # prone to letting the model fall into a prev_codes+speaker shortcut).
+    streamvoiceanon_use_continuous: bool = True
 
     # Conditioning ablations
     zero_speaker: bool = False

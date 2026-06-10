@@ -39,8 +39,17 @@ from tqdm import tqdm
 from livevoice.config import LiveVoiceConfig
 from livevoice.data.libritts_dataset import LibriTTSDataset
 from livevoice.lightning import LiveVoiceLightningModule
-from livevoice.model import HuBERTContentExtractor, LiveVoiceModel, build_codec
-from livevoice.utils.checkpoint import infer_content_source_from_ckpt
+from livevoice.model import (
+    HuBERTContentExtractor,
+    StreamVoiceAnonContentEncoder,
+    LiveVoiceModel,
+    build_codec,
+)
+from livevoice.utils.checkpoint import (
+    infer_content_source_from_ckpt,
+    infer_speaker_conditioning_from_ckpt,
+    infer_speaker_encoder_from_ckpt,
+)
 
 
 def _normalize_text_for_wer(s: str) -> str:
@@ -131,6 +140,16 @@ def _build_model_config(args: argparse.Namespace) -> LiveVoiceConfig:
         ffn_dim=4 * int(args.hidden_dim),
         n_codebooks_predict=int(args.n_codebooks),
         content_source=str(args.content_source).lower(),
+        speaker_conditioning=str(args.speaker_conditioning).lower(),
+        speaker_prefix_len=int(args.speaker_prefix_len),
+        speaker_encoder_type=str(args.speaker_encoder_type).lower(),
+        speechbrain_source=args.speechbrain_source,
+        speechbrain_savedir=args.speechbrain_savedir,
+        speechbrain_sample_rate=int(args.speechbrain_sample_rate),
+        speechbrain_embedding_dim=int(args.speechbrain_embedding_dim),
+        streamvoiceanon_repo=args.streamvoiceanon_repo,
+        streamvoiceanon_encoder_config=args.streamvoiceanon_encoder_config,
+        streamvoiceanon_encoder_ckpt=args.streamvoiceanon_encoder_ckpt,
         features_dir=None,
         output_dir=args.output_dir,
     )
@@ -230,9 +249,43 @@ def main():
         "--content_source",
         type=str,
         default="auto",
-        choices=["auto", "hubert", "mimi_semantic"],
+        choices=["auto", "hubert", "mimi_semantic", "streamvoiceanon"],
         help="Content conditioning path. 'auto' reads ckpt state_dict "
-        "(semantic_proj → mimi_semantic, content_extractor → hubert).",
+        "(StreamVoiceAnon keys → streamvoiceanon, semantic_proj → mimi_semantic, "
+        "content_extractor → hubert).",
+    )
+    p.add_argument(
+        "--speaker_conditioning",
+        type=str,
+        default="auto",
+        choices=["auto", "crossattn", "global_avg", "prefix"],
+        help="Speaker path. 'auto' reads ckpt keys; prefix ckpts omit decoder cross-attn.",
+    )
+    p.add_argument("--speaker_prefix_len", type=int, default=8)
+    p.add_argument(
+        "--speaker_encoder_type",
+        type=str,
+        default="auto",
+        choices=["auto", "codec", "speechbrain_ecapa"],
+    )
+    p.add_argument("--speechbrain_source", type=str, default="speechbrain/spkrec-ecapa-voxceleb")
+    p.add_argument(
+        "--speechbrain_savedir",
+        type=str,
+        default="/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb",
+    )
+    p.add_argument("--speechbrain_sample_rate", type=int, default=16000)
+    p.add_argument("--speechbrain_embedding_dim", type=int, default=192)
+    p.add_argument("--streamvoiceanon_repo", type=str, default="/home/yejin/StreamVoiceAnon")
+    p.add_argument(
+        "--streamvoiceanon_encoder_config",
+        type=str,
+        default="/home/yejin/StreamVoiceAnon/configs/hydra_arcs/speech_tokenizers/causal-encoder-lfq-8192.yaml",
+    )
+    p.add_argument(
+        "--streamvoiceanon_encoder_ckpt",
+        type=str,
+        default="/home/yejin/StreamVoiceAnon/ckpt/asr_s2s_bsq_8192_causal_down_whisper.pth",
     )
     # For WER evaluation use greedy decoding by default (temperature=0). Sampling (T>0)
     # makes VC output stochastic and often blows up Whisper WER without improving the metric.
@@ -289,11 +342,33 @@ def main():
         if inferred is None:
             raise SystemExit(
                 f"Could not infer content_source from {args.ckpt}. "
-                "Pass --content_source hubert or mimi_semantic explicitly."
+                "Pass --content_source hubert, mimi_semantic, or streamvoiceanon explicitly."
             )
         content_source = inferred
         print(f"[eval] content_source=auto → {content_source!r} (from checkpoint keys)")
     args.content_source = content_source
+
+    speaker_conditioning = str(args.speaker_conditioning).lower()
+    if speaker_conditioning == "auto":
+        inferred_spk = infer_speaker_conditioning_from_ckpt(args.ckpt)
+        if inferred_spk is None:
+            inferred_spk = "prefix"
+            print("[eval] speaker_conditioning=auto → 'prefix' (fallback; ckpt keys ambiguous)")
+        else:
+            print(f"[eval] speaker_conditioning=auto → {inferred_spk!r} (from checkpoint keys)")
+        speaker_conditioning = inferred_spk
+    args.speaker_conditioning = speaker_conditioning
+
+    speaker_encoder_type = str(args.speaker_encoder_type).lower()
+    if speaker_encoder_type == "auto":
+        inferred_enc = infer_speaker_encoder_from_ckpt(args.ckpt)
+        if inferred_enc is None:
+            inferred_enc = "codec"
+            print("[eval] speaker_encoder_type=auto → 'codec' (fallback; ckpt keys ambiguous)")
+        else:
+            print(f"[eval] speaker_encoder_type=auto → {inferred_enc!r} (from checkpoint keys)")
+        speaker_encoder_type = inferred_enc
+    args.speaker_encoder_type = speaker_encoder_type
 
     cfg_model = _build_model_config(args)
     if cfg_model.content_source == "mimi_semantic" and cfg_model.codec != "mimi":
@@ -303,7 +378,9 @@ def main():
         f"[eval] ckpt={args.ckpt}\n"
         f"       codec={cfg_model.codec} sr={cfg_model.sample_rate} "
         f"hidden_dim={cfg_model.hidden_dim} num_decoder_layers={cfg_model.num_decoder_layers} "
-        f"n_codebooks_predict={cfg_model.n_codebooks_predict} content_source={cfg_model.content_source}"
+        f"n_codebooks_predict={cfg_model.n_codebooks_predict} content_source={cfg_model.content_source} "
+        f"speaker_conditioning={cfg_model.speaker_conditioning} "
+        f"speaker_encoder_type={cfg_model.speaker_encoder_type}"
     )
 
     ds: LibriTTSDataset | None = None
@@ -335,6 +412,8 @@ def main():
 
     if cfg_model.content_source == "hubert":
         content_extractor = HuBERTContentExtractor(cfg_model)
+    elif cfg_model.content_source == "streamvoiceanon":
+        content_extractor = StreamVoiceAnonContentEncoder(cfg_model)
     else:
         content_extractor = None
     core = LiveVoiceModel(cfg_model, codec_model, content_extractor, prosody_extractor=None)
