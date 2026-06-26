@@ -190,12 +190,28 @@ def _libritts_pick_ref_path(ds, content_wav_path: str, utt_id: str, spk: str) ->
     return ref_path
 
 
+def _libritts_pick_diff_speaker_ref_path(ds, spk: str, rng: random.Random) -> str | None:
+    """Pick a reference utterance from a DIFFERENT speaker than `spk`.
+
+    Used for cross-speaker VC evaluation (WER + speaker-similarity measured on the
+    same converted audio). Returns None if no other speaker is available.
+    """
+    other_spks = [s for s in ds.speaker_utts.keys() if s != spk]
+    if not other_spks:
+        return None
+    ref_spk = rng.choice(other_spks)
+    utts = ds.speaker_utts.get(ref_spk, [])
+    if not utts:
+        return None
+    return rng.choice(utts)[0]
+
+
 # ─────────────────────────────────────────────
 #  Unconditional module
 # ─────────────────────────────────────────────
 
 class UnconditionalLightningModule(L.LightningModule):
-    """Train UnconditionalModel: decoder-only AR over DAC codes."""
+    """Train UnconditionalModel: decoder-only AR over codec codes."""
 
     def __init__(self, config, model):
         super().__init__()
@@ -205,7 +221,7 @@ class UnconditionalLightningModule(L.LightningModule):
     def training_step(self, batch, batch_idx):
         target_audio = batch["target_audio"]
         with torch.no_grad():
-            codes = self.model.dac_model.encode(target_audio)  # (B, K_full, T)
+            codes = self.model.codec_model.encode(target_audio)  # (B, K_full, T)
         codes = codes[:, : self.config.n_codebooks_predict, :]
 
         out = self.model(codes)
@@ -228,7 +244,7 @@ class UnconditionalLightningModule(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         target_audio = batch["target_audio"]
         with torch.no_grad():
-            codes = self.model.dac_model.encode(target_audio)
+            codes = self.model.codec_model.encode(target_audio)
         codes = codes[:, : self.config.n_codebooks_predict, :]
 
         out = self.model(codes)
@@ -244,12 +260,12 @@ class UnconditionalLightningModule(L.LightningModule):
     @torch.no_grad()
     def _log_generated_sample(self, tag: str = "val/generated_uncond"):
         num_samples = int(getattr(self.config, "num_audio_log_samples", 4))
-        max_steps = int(
-            float(getattr(self.config, "audio_duration", 4.0))
-            * float(getattr(self.config, "dac_sample_rate", self.config.sample_rate))
-            / float(getattr(self.config, "dac_hop_length", 320))
+        codec = self.model.codec_model
+        frames_per_sec = float(codec.sample_rate) / float(codec.hop_length)
+        max_steps = max(
+            1,
+            int(float(getattr(self.config, "audio_duration", 4.0)) * frames_per_sec),
         )
-        max_steps = max(1, max_steps)
         codes = self.model.generate(
             batch_size=num_samples,
             max_steps=max_steps,
@@ -287,22 +303,45 @@ class UnconditionalLightningModule(L.LightningModule):
 class LiveVoiceLightningModule(L.LightningModule):
     """Train LiveVoiceModel: speaker cross-attn + HuBERT content conditioning."""
 
+    # Lazy-loaded eval-only modules (WER Whisper, val spk-sim ECAPA) must not be in ckpt.
+    _CKPT_EXCLUDE_PREFIXES = ("_whisper_model.", "_spk_encoder.")
+
+    @classmethod
+    def _strip_eval_only_modules_from_state_dict(cls, state_dict: dict) -> dict:
+        return {
+            k: v
+            for k, v in state_dict.items()
+            if not any(k.startswith(p) for p in cls._CKPT_EXCLUDE_PREFIXES)
+        }
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        sd = checkpoint.get("state_dict")
+        if isinstance(sd, dict):
+            checkpoint["state_dict"] = self._strip_eval_only_modules_from_state_dict(sd)
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        sd = checkpoint.get("state_dict")
+        if isinstance(sd, dict):
+            checkpoint["state_dict"] = self._strip_eval_only_modules_from_state_dict(sd)
+
     def __init__(self, config, model):
         super().__init__()
         self.config = config
         self.model = model
         self.use_mimi_cache = bool(getattr(config, "use_mimi_cache", True)) and str(
-            getattr(config, "codec", "dac")
+            getattr(config, "codec", "mimi")
         ).lower() == "mimi"
         self.mimi_cache_dir = str(
             getattr(config, "mimi_cache_dir", os.path.join(config.output_dir, "mimi_cache"))
         )
-        self._hop = int(getattr(self.model.dac_model, "hop_length", getattr(config, "dac_hop_length", 320)))
+        self._hop = int(getattr(self.model.codec_model, "hop_length"))
         self._target_len_samples = int(round(float(config.audio_duration) * float(config.sample_rate)))
         self._val_ref_bank = None  # dict with keys: "speaker_id" (list[str]), "reference_audio" (list[Tensor])
         self._val_ref_bank_epoch = None
         self._whisper_model = None
         self._whisper_loaded = False
+        self._spk_encoder = None
+        self._spk_encoder_loaded = False
 
         if bool(getattr(config, "use_ctc_loss", False)):
             print(f"[CTC] char-level  vocab_size={getattr(config, 'ctc_vocab_size', '?')}")
@@ -346,15 +385,35 @@ class LiveVoiceLightningModule(L.LightningModule):
         try:
             import whisper  # type: ignore
         except Exception:
-            self._whisper_model = None
+            object.__setattr__(self, "_whisper_model", None)
             return None
         name = str(getattr(self.config, "wer_whisper_model", "base"))
         device = str(getattr(self.config, "wer_device", "cpu"))
         try:
-            self._whisper_model = whisper.load_model(name, device=device)
+            # Avoid nn.Module registration so Whisper weights are not in Lightning ckpt.
+            object.__setattr__(
+                self, "_whisper_model", whisper.load_model(name, device=device)
+            )
         except Exception:
-            self._whisper_model = None
+            object.__setattr__(self, "_whisper_model", None)
         return self._whisper_model
+
+    def _get_spk_encoder(self):
+        """Independent SpeechBrain ECAPA encoder for val speaker-similarity (cached)."""
+        if self._spk_encoder_loaded:
+            return self._spk_encoder
+        self._spk_encoder_loaded = True
+        try:
+            from livevoice.model.speechbrain_speaker_encoder import (
+                SpeechBrainECAPASpeakerEncoder,
+            )
+            enc = SpeechBrainECAPASpeakerEncoder(self.config)
+            enc.eval()
+            object.__setattr__(self, "_spk_encoder", enc)
+        except Exception as e:
+            print(f"[spk_sim] SpeechBrain ECAPA unavailable, skipping val/spk_sim: {e}")
+            object.__setattr__(self, "_spk_encoder", None)
+        return self._spk_encoder
 
     def on_validation_epoch_start(self):
         # Build a small reference bank so we can always pick a different-speaker ref
@@ -418,7 +477,7 @@ class LiveVoiceLightningModule(L.LightningModule):
         return torch.stack(out, dim=0).to(device)
 
     def _cache_key(self, path: str) -> str:
-        codec_name = str(getattr(self.config, "codec", "dac")).lower()
+        codec_name = str(getattr(self.config, "codec", "mimi")).lower()
         raw = f"{codec_name}|sr={self.config.sample_rate}|path={path}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -450,7 +509,7 @@ class LiveVoiceLightningModule(L.LightningModule):
         K = int(self.config.n_codebooks_predict)
         if not self.use_mimi_cache or content_paths is None or content_starts is None:
             with torch.no_grad():
-                return self.model.dac_model.encode(tgt)[:, :K, :]
+                return self.model.codec_model.encode(tgt)[:, :K, :]
 
         n_frames = int(round(self._target_len_samples / max(1, self._hop)))
         out = []
@@ -469,7 +528,7 @@ class LiveVoiceLightningModule(L.LightningModule):
 
             if chunk is None:
                 with torch.no_grad():
-                    c = self.model.dac_model.encode(tgt[i:i + 1])[:, :K, :]
+                    c = self.model.codec_model.encode(tgt[i:i + 1])[:, :K, :]
                 out.append(c)
             else:
                 out.append(chunk.unsqueeze(0).to(tgt.device, dtype=torch.long))
@@ -480,7 +539,7 @@ class LiveVoiceLightningModule(L.LightningModule):
             return None
         if not self.use_mimi_cache or ref_paths is None or ref_starts is None:
             with torch.no_grad():
-                _, z = self.model.dac_model.encode_continuous(ref)
+                _, z = self.model.codec_model.encode_continuous(ref)
             return z
 
         n_frames = int(round(self._target_len_samples / max(1, self._hop)))
@@ -500,7 +559,7 @@ class LiveVoiceLightningModule(L.LightningModule):
 
             if chunk is None:
                 with torch.no_grad():
-                    _, z = self.model.dac_model.encode_continuous(ref[i:i + 1])
+                    _, z = self.model.codec_model.encode_continuous(ref[i:i + 1])
                 out.append(z)
             else:
                 out.append(chunk.unsqueeze(0).to(ref.device, dtype=ref.dtype))
@@ -629,7 +688,6 @@ class LiveVoiceLightningModule(L.LightningModule):
             if not getattr(self.trainer, "is_global_zero", True):
                 return
             n = min(ref.size(0), int(getattr(self.config, "num_audio_log_samples", 4)))
-            # Randomize which samples we log each validation
             perm = torch.randperm(ref.size(0), device=ref.device)
             sel = perm[:n].tolist()
 
@@ -637,11 +695,12 @@ class LiveVoiceLightningModule(L.LightningModule):
             ctn_same = ctn[sel]
             self._log_vc_sample(ref_same, ctn_same, tag_prefix="val")
 
-            # Also log a "diff speaker reference" condition for easier listening.
-            speaker_ids = batch.get("speaker_id", None)  # list[str] from collate_fn
+            speaker_ids = batch.get("speaker_id", None)
             if isinstance(speaker_ids, list) and len(speaker_ids) == ref.size(0):
                 spk_sel = [str(speaker_ids[i]) for i in sel]
                 ref_diff = self._pick_diff_speaker_refs(spk_sel, n=len(spk_sel), device=ref.device)
+                # Cross-speaker audio for listening only. The spk_sim *metric* is
+                # computed over the fixed 100-sample set in on_train_epoch_end.
                 self._log_vc_sample(ref_diff, ctn_same, tag_prefix="Media/val_diff_spk")
 
     @torch.no_grad()
@@ -678,16 +737,24 @@ class LiveVoiceLightningModule(L.LightningModule):
         target_sr = int(self.config.sample_rate)
         device = next(self.model.parameters()).device
 
+        want_spk_sim = bool(getattr(self.config, "log_val_spk_sim", False))
+        spk_enc = self._get_spk_encoder() if want_spk_sim else None
+
         was_training = self.model.training
         self.model.eval()
         wers: list[float] = []
+        spk_sims: list[float] = []
         try:
             for ix in idxs:
                 wav_path, utt_id, spk = ds.items[ix]
-                ref_path = _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
                 ref_txt = _read_libritts_normalized_text(wav_path)
                 if not ref_txt:
                     continue
+                # Cross-speaker VC: convert content to a DIFFERENT speaker. Same
+                # ref across epochs (seeded per item) so WER/spk_sim are comparable.
+                ref_rng = random.Random(wer_seed * 1_000_003 + ix)
+                ref_path = _libritts_pick_diff_speaker_ref_path(ds, spk, ref_rng) \
+                    or _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
                 ctn = _load_full_mono_wav(wav_path, target_sr).unsqueeze(0).to(device)
                 ref = _load_full_mono_wav(ref_path, target_sr).unsqueeze(0).to(device)
                 # Greedy decoding (temperature=0 → argmax). Removes sampling
@@ -705,6 +772,13 @@ class LiveVoiceLightningModule(L.LightningModule):
                     wavs = torchaudio.functional.resample(wavs, target_sr, 16000)
                 hyp_txt = w.transcribe(wavs[0].numpy(), fp16=False)["text"]
                 wers.append(self._word_wer(hyp_txt, ref_txt))
+                # Speaker-transfer similarity on the SAME converted output.
+                if spk_enc is not None:
+                    emb_gen = spk_enc(gen.detach().float())
+                    emb_ref = spk_enc(ref.detach().float())
+                    spk_sims.append(
+                        F.cosine_similarity(emb_gen, emb_ref, dim=-1).mean().item()
+                    )
         finally:
             if was_training:
                 self.model.train()
@@ -720,6 +794,12 @@ class LiveVoiceLightningModule(L.LightningModule):
         if exp is not None and hasattr(exp, "log"):
             exp.log({"val/wer_full_epoch_mean": wer_mean}, step=step)
 
+        if spk_sims:
+            spk_sim_mean = float(sum(spk_sims) / len(spk_sims))
+            self.log("val/spk_sim", spk_sim_mean, on_epoch=True, sync_dist=True, prog_bar=True)
+            if exp is not None and hasattr(exp, "log"):
+                exp.log({"val/spk_sim": spk_sim_mean}, step=step)
+
     @torch.no_grad()
     def _log_vc_sample(
         self,
@@ -733,26 +813,12 @@ class LiveVoiceLightningModule(L.LightningModule):
             temperature=float(getattr(self.config, "temperature", 1.0)),
             top_p=float(getattr(self.config, "top_p", 0.9)),
         )
-        gen_audio = self.model.decode_to_audio(codes)  # (N, T)
+        gen_audio = self.model.decode_to_audio(codes)
         sr = int(self.config.sample_rate)
-
-        # ── Speaker similarity (DAC-z cosine proxy) ──────────────────────
-        # Compare mean-pooled DAC continuous z of generated vs reference.
-        # This is a cheap proxy: DAC z captures timbre in its first few dimensions.
-        try:
-            _, z_gen = self.model.dac_model.encode_continuous(gen_audio)  # (N, T, D)
-            _, z_ref = self.model.dac_model.encode_continuous(ref_audio)  # (N, T, D)
-            z_gen_pool = z_gen.mean(dim=1)  # (N, D)
-            z_ref_pool = z_ref.mean(dim=1)  # (N, D)
-            spk_sim = F.cosine_similarity(z_gen_pool, z_ref_pool, dim=-1)  # (N,)
-            self.log("val/spk_sim_dac", spk_sim.mean(), on_epoch=True, sync_dist=True)
-        except Exception:
-            pass
-
-        # ── Audio logging ────────────────────────────────────────────────
         _log_audio_batch(self.logger, f"{tag_prefix}/generated_vc", gen_audio, sr, self.global_step)
         _log_audio_batch(self.logger, f"{tag_prefix}/reference_audio", ref_audio, sr, self.global_step)
         _log_audio_batch(self.logger, f"{tag_prefix}/content_audio", ctn_audio, sr, self.global_step)
+        return gen_audio
 
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]

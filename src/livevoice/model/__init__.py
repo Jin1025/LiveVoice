@@ -1,5 +1,5 @@
-from .codec.dac_model import DACModel
 from .codec.mimi_model import MimiCodec
+from .codec.jhcodec_model import JHCodecModel
 from .codec import build_codec
 from .content_extractor import HuBERTContentExtractor
 from .streamvoiceanon_content import StreamVoiceAnonContentEncoder
@@ -10,8 +10,8 @@ from .transformer import LiveVoiceModel
 from .unconditional import UnconditionalModel
 
 __all__ = [
-    "DACModel",
     "MimiCodec",
+    "JHCodecModel",
     "build_codec",
     "HuBERTContentExtractor",
     "StreamVoiceAnonContentEncoder",

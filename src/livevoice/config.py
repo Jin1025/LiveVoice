@@ -1,12 +1,25 @@
 from dataclasses import dataclass
 
+CODEC_SAMPLE_RATES: dict[str, int] = {"mimi": 24000, "jhcodec": 16000}
+
+
+def codec_sample_rate(codec: str) -> int:
+    """Return the dataset/windowing sample rate for a codec."""
+    name = str(codec).lower()
+    try:
+        return CODEC_SAMPLE_RATES[name]
+    except KeyError as e:
+        raise ValueError(
+            f"Unknown codec {codec!r}; expected one of {sorted(CODEC_SAMPLE_RATES)}"
+        ) from e
+
 
 @dataclass
 class LiveVoiceConfig:
     """Configuration for the LiveVoice voice-conversion model.
 
     Mirrors sonic's SonicConfig but adapted for speech:
-    - "dac" or "mimi" codec (speech-optimized)
+    - "mimi" or "jhcodec" codec (speech-optimized)
     - HuBERT-base content features (linguistic)
     - Reference cross-attention for speaker timbre
     - Optional F0/loudness prosody conditioning
@@ -24,32 +37,31 @@ class LiveVoiceConfig:
     max_seq_len: int = 1024
 
     # ------------------------------------------------------------------
-    # Codec — "dac" or "mimi"
+    # Codec — "mimi" or "jhcodec"
     # ------------------------------------------------------------------
-    codec: str = "mimi"
+    codec: str = "jhcodec"
 
     # Mimi (kyutai/mimi) — 24 kHz, 12.5 fps, 8 codebooks, codebook_size 2048
     mimi_model_name: str = "kyutai/mimi"
     mimi_n_codebooks: int = 8
 
     # ------------------------------------------------------------------
-    # DAC codec (dac 16 or 24 kHz speech model)
+    # JHCodec (mimi variant) — 16 kHz, 50 fps, 8 codebooks, codebook_size 1024.
+    # Low-latency streaming codec; no encoder downsampling loss like DAC/Mimi.
+    # When codec="jhcodec", set sample_rate=16000 so windowing/frame counts match.
     # ------------------------------------------------------------------
-    # dac_model_type: 16kHz speech model has 12 RVQ codebooks, hop=320 (50 frames/sec)
-    # dac_model_type: 24kHz speech model has 9 RVQ codebooks, hop=320 (75 frames/sec)
-    # dac_model_type: 44kHz speech model has 9 RVQ codebooks, hop=320 (137.5 frames/sec)
-    dac_model_type: str = "16khz" 
-    dac_sample_rate: int = 16000 
-    dac_n_codebooks: int = 12
-    dac_codebook_size: int = 1024
-    dac_depth: int = 9
-    dac_latent_dim: int = 1024
-    dac_hop_length: int = 320  # 16000/320 = 50 frames/sec at 16 kHz
+    jhcodec_repo: str = "/workspace/jhcodec"
+    jhcodec_config: str = "/workspace/jhcodec/config/config_mimi_recon.json"
+    jhcodec_ckpt: str = "/workspace/jhcodec/ckpt/jhcodec_mimi_1000000.pt"
+    jhcodec_sample_rate: int = 16000
+    jhcodec_n_codebooks: int = 8
+    jhcodec_codebook_size: int = 1024
+    jhcodec_hop_length: int = 320  # 16000/320 = 50 frames/sec at 16 kHz
 
     # ------------------------------------------------------------------
     # Audio / windowing
     # ------------------------------------------------------------------
-    sample_rate: int = 24000 # 24000 or 44100
+    sample_rate: int = 16000  # synced to codec in __post_init__ (mimi=24k, jhcodec=16k)
     audio_duration: float = 4.0  # seconds per training window
     train_batch_size: int = 16
     val_batch_size: int = 4
@@ -97,12 +109,15 @@ class LiveVoiceConfig:
     #   "prefix"     — prepend reference-derived speaker tokens to decoder self-attn
     #                  (decoder-only path; no cross-attention)
     speaker_conditioning: str = "prefix"
-    speaker_prefix_len: int = 8
+    speaker_prefix_len: int = 8 
 
     # Speaker encoder:
-    #   "codec"             — codec continuous z from reference audio (old default)
+    #   "codec"             — codec continuous z (pre-quantization) from reference
+    #                         audio. With speaker_conditioning="prefix" this z is
+    #                         projected (speaker_proj) and downsampled to
+    #                         speaker_prefix_len tokens → decoder prefix.
     #   "speechbrain_ecapa" — SpeechBrain ECAPA-TDNN utterance embedding
-    speaker_encoder_type: str = "speechbrain_ecapa"
+    speaker_encoder_type: str = "codec"
     speechbrain_source: str = "speechbrain/spkrec-ecapa-voxceleb"
     speechbrain_savedir: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb"
     speechbrain_sample_rate: int = 16000
@@ -148,7 +163,7 @@ class LiveVoiceConfig:
     #                       speaker-invariant in practice.
     #   "streamvoiceanon" — StreamVoiceAnon causal content tokenizer, 21.5 fps,
     #                       discrete 8192 semantic tokens.
-    content_source: str = "streamvoiceanon" 
+    content_source: str = "hubert" 
 
     # StreamVoiceAnon causal content tokenizer.
     streamvoiceanon_repo: str = "/workspace/StreamVoiceAnon"
@@ -177,7 +192,7 @@ class LiveVoiceConfig:
     # Source-side content perturbation (speaker de-identification)
     # ------------------------------------------------------------------
     use_content_perturbation: bool = True
-    perturb_pitch_semitones: float = 4.0    # ±N semitones pitch shift
+    perturb_pitch_semitones: float = .0    # ±N semitones pitch shift
     use_vtln: bool = False                  # VTLN formant warp
     perturb_vtln_alpha_range: float = 0.12  # ±12% VTLN warp range (only if use_vtln=True)
     perturb_eq_gain_db: float = 6.0         # ±dB per EQ band (4 bands)
@@ -194,6 +209,7 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     num_audio_log_samples: int = 4
     log_val_wer: bool = True
+    log_val_spk_sim: bool = True   # ECAPA cosine(gen, reference) — speaker-transfer metric
     wer_whisper_model: str = "base"
     wer_device: str = "cuda"
     wer_epoch_samples: int = 100
@@ -217,9 +233,8 @@ class LiveVoiceConfig:
     vctk_val_speakers: tuple[str, ...] = ()  # empty → auto-select
     train_split_ratio: float = 0.95       # if vctk_val_speakers is empty, 95/5 random utterance split
 
-    # LibriTTS (24 kHz)
-    # To use LibriTTS, also set: sample_rate=24000, dac_model_type="24khz",
-    # dac_sample_rate=24000, dac_n_codebooks=9, dac_hop_length=320
+    # LibriTTS (24 kHz). With codec="mimi" use sample_rate=24000;
+    # with codec="jhcodec" use sample_rate=16000.
     libritts_path: str = "/mnt/data/disk2/LibriTTS"
     libritts_train_splits: tuple[str, ...] = (
         "train-clean-100",
@@ -259,3 +274,7 @@ class LiveVoiceConfig:
     top_p: float = 0.9
     top_k: int = 1
     temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.codec = str(self.codec).lower()
+        self.sample_rate = codec_sample_rate(self.codec)

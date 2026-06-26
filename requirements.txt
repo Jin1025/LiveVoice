@@ -26,6 +26,9 @@ pyyaml>=6.0
 # Evaluation
 jiwer>=3.0.0               # WER for intelligibility
 speechbrain>=1.0.0         # ECAPA-TDNN speaker encoder / speaker similarity
+scikit-learn>=1.3.0        # VPC-style cosine EER (sklearn.metrics.pairwise)
+pyloudnorm>=0.1.1          # VPC ASV loudness normalization (eval_pre asv_ssl)
+hyperpyyaml>=1.2.0         # VPC SpeechBrain hyperparams loading
 
 # Optional / dev
 jupyter>=1.0.0

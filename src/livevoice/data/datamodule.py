@@ -144,9 +144,6 @@ if __name__ == "__main__":
     cfg = LiveVoiceConfig(
         libritts_path="/mnt/data/disk2/LibriTTS",
         sample_rate=24000,
-        dac_model_type="24khz",
-        dac_sample_rate=24000,
-        dac_n_codebooks=9,
         max_windows=32,
     )
     dm = LibriTTSDataModule(cfg)

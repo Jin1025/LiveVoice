@@ -4,7 +4,7 @@ Mirrors sonic's SketchTransformer / SketchModel but rewired for speech:
 - Reference audio → codec continuous z → cross-attention or decoder prefix (speaker / timbre)
 - Content audio   → HuBERT / Mimi z / StreamVoiceAnon tokens → additive or FiLM conditioning
 - Optional prosody (F0 + loudness)   → additive (only if config.use_prosody)
-- AR decoder over DAC codebooks with MusicGen delay pattern
+- AR decoder over codec codebooks with MusicGen delay pattern
 """
 from __future__ import annotations
 
@@ -177,16 +177,16 @@ class LiveVoiceModel(nn.Module):
     """Full VC pipeline.
 
     Components:
-      - dac_model:        frozen DAC (16 kHz speech)
+      - codec_model:        frozen codec (16 kHz or 24 kHz speech)
       - content_extractor: HuBERT or StreamVoiceAnon content features
       - prosody_extractor: (optional) F0 + loudness
       - transformer:      LiveVoiceTransformer
     """
 
-    def __init__(self, config, dac_model, content_extractor, prosody_extractor=None):
+    def __init__(self, config, codec_model, content_extractor, prosody_extractor=None):
         super().__init__()
         self.config = config
-        self.dac_model = dac_model
+        self.codec_model = codec_model
         self.content_extractor = content_extractor
         self.prosody_extractor = prosody_extractor
         self.use_prosody = bool(getattr(config, "use_prosody", False)) and (prosody_extractor is not None)
@@ -212,12 +212,12 @@ class LiveVoiceModel(nn.Module):
         # Per-codebook decoder input projections + output heads (MusicGen delay)
         K = int(config.n_codebooks_predict)
         self.n_codebooks_predict = K
-        latent_dim    = dac_model.latent_dim
-        codebook_size = dac_model.codebook_size
+        latent_dim    = codec_model.latent_dim
+        codebook_size = codec_model.codebook_size
 
         n_proper_init = 0
         for k in range(K):
-            emb = dac_model.get_codebook_embeddings(k)
+            emb = codec_model.get_codebook_embeddings(k)
             if emb is None:
                 emb = torch.randn(codebook_size, latent_dim) * 0.02
             else:
@@ -275,7 +275,7 @@ class LiveVoiceModel(nn.Module):
         # "hubert"          — uses self.content_extractor (HuBERT)
         # "mimi_semantic"   — uses Mimi continuous z directly.
         # "streamvoiceanon" — uses StreamVoiceAnon causal content tokenizer.
-        codec_name = str(getattr(config, "codec", "dac")).lower()
+        codec_name = str(getattr(config, "codec", "mimi")).lower()
         default_src = "mimi_semantic" if codec_name == "mimi" else "hubert"
         self.content_source = str(getattr(config, "content_source", default_src)).lower()
         valid_content_sources = {"hubert", "mimi_semantic", "streamvoiceanon"}
@@ -309,7 +309,7 @@ class LiveVoiceModel(nn.Module):
             # Discrete codebook 0 lookup loses too much information — z is
             # 50× richer (512-dim continuous vs 11-bit discrete at 12.5fps).
             # Encoder is causal, so this stays streaming-compatible.
-            sem_dim = int(getattr(dac_model, "latent_dim", config.content_proj_dim))
+            sem_dim = int(getattr(codec_model, "latent_dim", config.content_proj_dim))
             self.semantic_proj = nn.Linear(sem_dim, config.content_proj_dim)
             self.semantic_to_hidden = nn.Linear(config.content_proj_dim, config.hidden_dim)
             print(f"[LiveVoiceModel] mimi_semantic = continuous z (latent_dim={sem_dim})")
@@ -423,7 +423,7 @@ class LiveVoiceModel(nn.Module):
             if reference_audio is None:
                 raise ValueError("Either reference_audio or reference_z must be provided.")
             with torch.no_grad():
-                _, z = self.dac_model.encode_continuous(reference_audio)  # (B, T_enc, D_dac)
+                _, z = self.codec_model.encode_continuous(reference_audio)  # (B, T_enc, D_codec)
         else:
             z = reference_z
         spk = self.speaker_proj(z)  # (B, T_enc, D)
@@ -437,12 +437,15 @@ class LiveVoiceModel(nn.Module):
         return self.speaker_conditioning == "prefix"
 
     def _build_speaker_prefix(self, spk: torch.Tensor) -> torch.Tensor:
-        prefix_len = int(getattr(self.config, "speaker_prefix_len", 8))
-        if prefix_len <= 0:
-            return spk[:, :0, :]
-        if spk.size(1) == prefix_len:
-            return spk
-        return self.align_to_tokens(spk, prefix_len, causal=False)
+        """Prefix = the full speaker token sequence as-is (no pooling/striding).
+
+        - codec encoder: every reference frame (B, T_enc, hidden) becomes a prefix
+          token — the whole reference is prepended.
+        - speechbrain_ecapa: encode_speaker_reference already expanded the single
+          utterance embedding into speaker_prefix_len tokens via speaker_prefix_proj,
+          so this passes it through unchanged (old behaviour).
+        """
+        return spk
 
     def _prepend_speaker_prefix(
         self,
@@ -499,7 +502,7 @@ class LiveVoiceModel(nn.Module):
         # ── Mimi semantic path: codec encoder → continuous z (pre-quantization) ──
         if self.content_source == "mimi_semantic":
             with torch.no_grad():
-                _, z = self.dac_model.encode_continuous(content_audio)  # (B, T, latent_dim)
+                _, z = self.codec_model.encode_continuous(content_audio)  # (B, T, latent_dim)
             sem_emb = self.semantic_proj(z)                              # (B, T, content_proj_dim)
             if use_film:
                 zeros_add = torch.zeros(
@@ -545,7 +548,7 @@ class LiveVoiceModel(nn.Module):
         Args:
             reference_audio: (B, T_ref) — same speaker, different utterance
             content_audio:   (B, T_ctn) — linguistic source (used if content_feats is None)
-            target_codes:    (B, K, T)  — DAC codes of the target utterance
+            target_codes:    (B, K, T)  — codec codes of the target utterance
             prosody_audio:   (B, T)     — optional prosody source
             content_feats:   (B, T_frames, 768) — precomputed HuBERT features (skips HuBERT)
         """
@@ -645,6 +648,58 @@ class LiveVoiceModel(nn.Module):
             "encoder_output": encoder_output,
         }
 
+    # --------------------- anonymization (StreamVoiceAnon policy) ---------------------
+    @staticmethod
+    def apply_noise_mixing(spk: torch.Tensor, alpha: float) -> torch.Tensor:
+        """Matched-Gaussian noise mixing (StreamVoiceAnon infer_arvc.apply_noise_mixing).
+
+        alpha=1.0 → no noise (pure VC); lower → stronger anonymization.
+        """
+        if alpha >= 1.0:
+            return spk
+        mean, std = spk.mean(), spk.std()
+        noise = torch.randn_like(spk) * std + mean
+        return alpha * spk + (1.0 - alpha) * noise
+
+    @torch.no_grad()
+    def anonymized_speaker(
+        self, ref_audios: list[torch.Tensor], alpha: float = 1.0
+    ) -> torch.Tensor:
+        """Blend K pool references then mix noise → anonymized speaker rep.
+
+        Mirrors StreamVoiceAnon: average the speaker representation over K
+        reference utterances (avg collation), then apply alpha noise mixing.
+        Each ref_audios[i] is (B, T_i). Returns (B, L, hidden).
+        """
+        if not ref_audios:
+            raise ValueError("anonymized_speaker requires at least one reference.")
+        spks = [self.encode_speaker_reference(r) for r in ref_audios]
+        if len(spks) > 1:
+            # speaker token counts can differ across refs (codec path); align all
+            # to the shortest before averaging so blending is well-defined.
+            L = min(s.size(1) for s in spks)
+            spks = [
+                s if s.size(1) == L else self.align_to_tokens(s, L, causal=False)
+                for s in spks
+            ]
+        spk = torch.stack(spks, dim=0).mean(dim=0)
+        return self.apply_noise_mixing(spk, alpha)
+
+    @torch.no_grad()
+    def generate_anonymized(
+        self,
+        content_audio: torch.Tensor,
+        ref_audios: list[torch.Tensor],
+        alpha: float = 1.0,
+        **gen_kwargs,
+    ) -> torch.Tensor:
+        """VC with an anonymized speaker rep (K-pool blend + alpha noise)."""
+        spk = self.anonymized_speaker(ref_audios, alpha)
+        return self.generate(
+            reference_audio=None, content_audio=content_audio,
+            speaker_override=spk, **gen_kwargs,
+        )
+
     # --------------------- generation ---------------------
     @torch.no_grad()
     def generate(
@@ -658,16 +713,23 @@ class LiveVoiceModel(nn.Module):
         top_p: float | None = None,
         use_cache: bool = True,
         cfg_scale: float = 1.0,
+        speaker_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """If `speaker_override` (B, *, hidden) is given it replaces the speaker
+        representation from `reference_audio` (used by anonymized generation)."""
         use_delay = bool(getattr(self.config, "use_delay_pattern", True))
         K = self.n_codebooks_predict
-        device = reference_audio.device
-        B = reference_audio.shape[0]
+        device = content_audio.device
+        B = content_audio.shape[0]
         use_prefix = self._uses_speaker_prefix()
         if use_prefix and not use_cache:
             raise RuntimeError("speaker_conditioning='prefix' generation requires use_cache=True.")
 
-        spk = self.encode_speaker_reference(reference_audio)
+        spk = (
+            speaker_override
+            if speaker_override is not None
+            else self.encode_speaker_reference(reference_audio)
+        )
         if use_prefix:
             spk_prefix = self._build_speaker_prefix(spk)
             spk_enc = None
@@ -680,17 +742,29 @@ class LiveVoiceModel(nn.Module):
             # Use codec frame count as generation horizon.
             # HuBERT/content frames (e.g. 50 fps) can differ from codec frames
             # (e.g. Mimi 12.5 fps), so using T_dec directly may over-generate.
-            hop = int(getattr(self.dac_model, "hop_length", getattr(self.config, "dac_hop_length", 320)))
+            if not hasattr(self.codec_model, "hop_length"):
+                raise AttributeError(
+                    f"{type(self.codec_model).__name__} must set hop_length "
+                    "(samples per codec frame); no fallback."
+                )
+            hop = int(self.codec_model.hop_length)
+            if hop <= 0:
+                raise ValueError(f"codec hop_length must be positive, got {hop}")
             n_samples = int(content_audio.shape[-1])
             max_steps = max(1, int(round(n_samples / float(hop))))
         T_total = (max_steps + K - 1) if use_delay else max_steps
 
-        content_add = self.align_to_tokens(content_add_raw, T_total, causal=False)
-        film_feats = self.align_to_tokens(film_raw, T_total, causal=False) if film_raw is not None else None
+        # causal=True to match the training forward (transformer.py forward):
+        # for a streaming model the source→token alignment must be causal (no
+        # future leakage) and identical between train and inference. In the
+        # delay-pattern regime (T_src < T_total) both reduce to linspace
+        # upsampling, but this stays correct if content fps ever exceeds codec fps.
+        content_add = self.align_to_tokens(content_add_raw, T_total, causal=True)
+        film_feats = self.align_to_tokens(film_raw, T_total, causal=True) if film_raw is not None else None
         if self.use_prosody:
             pa = prosody_audio if prosody_audio is not None else content_audio
             prosody_raw = self.prosody_extractor(pa)
-            prosody_add = self.align_to_tokens(prosody_raw, T_total, causal=False)
+            prosody_add = self.align_to_tokens(prosody_raw, T_total, causal=True)
             content_add = content_add + prosody_add
 
         generated = [[] for _ in range(K)]
@@ -806,7 +880,7 @@ class LiveVoiceModel(nn.Module):
 
     def decode_to_audio(self, codes: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            return self.dac_model.decode(codes)
+            return self.codec_model.decode(codes)
 
 
 def _sample(logits, temperature, top_k, top_p):

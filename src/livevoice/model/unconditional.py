@@ -81,10 +81,10 @@ class UnconditionalModel(nn.Module):
             self.register_buffer(f"codebook_vectors_{k}", effective_emb)
 
         self.decoder_input_projs = nn.ModuleList([
-            nn.Linear(config.dac_latent_dim, config.hidden_dim) for _ in range(K)
+            nn.Linear(int(dac_model.latent_dim), config.hidden_dim) for _ in range(K)
         ])
         self.codebook_heads = nn.ModuleList([
-            nn.Linear(config.hidden_dim, config.dac_codebook_size) for _ in range(K)
+            nn.Linear(config.hidden_dim, int(dac_model.codebook_size)) for _ in range(K)
         ])
 
     # --------------------- delay pattern ---------------------

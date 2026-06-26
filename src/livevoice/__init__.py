@@ -1,6 +1,7 @@
 from .config import LiveVoiceConfig
 from .model import (
-    DACModel,
+    MimiCodec,
+    JHCodecModel,
     HuBERTContentExtractor,
     StreamVoiceAnonContentEncoder,
     ProsodyExtractor,
@@ -11,7 +12,8 @@ from .lightning import UnconditionalLightningModule, LiveVoiceLightningModule
 
 __all__ = [
     "LiveVoiceConfig",
-    "DACModel",
+    "MimiCodec",
+    "JHCodecModel",
     "HuBERTContentExtractor",
     "StreamVoiceAnonContentEncoder",
     "ProsodyExtractor",

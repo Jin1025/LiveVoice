@@ -104,8 +104,8 @@ def parse_args():
     p.add_argument("--wandb_project", type=str, default="LiveVoice")
     p.add_argument("--wandb_entity", type=str, default=None)
     # Codec
-    p.add_argument("--codec", type=str, default="mimi", choices=["dac", "mimi"])
-    p.add_argument("--mimi_cache_dir", type=str, default="/mnt/data/disk2/yejin/LiveVoice/mimi_precomputed")
+    # p.add_argument("--codec", type=str, default="mimi", choices=["mimi", "jhcodec"])
+    # p.add_argument("--mimi_cache_dir", type=str, default="/mnt/data/disk2/yejin/LiveVoice/mimi_precomputed")
     # Ablations
     p.add_argument("--zero_speaker", action="store_true")
     p.add_argument("--zero_content", action="store_true")
@@ -116,8 +116,6 @@ def parse_args():
 def main():
     args = parse_args()
     L.seed_everything(args.seed)
-    if args.codec != "mimi":
-        raise SystemExit("Requires --codec mimi")
 
     config = LiveVoiceConfig(
         exp_name=args.exp_name,
@@ -152,8 +150,9 @@ def main():
         zero_speaker=args.zero_speaker,
         zero_content=args.zero_content,
         ablate_cross_attn=args.ablate_cross_attn,
-        codec=args.codec
+        # codec=args.codec
     )
+
     if str(config.content_source).lower() != "hubert":
         config.features_dir = None
 
@@ -229,7 +228,7 @@ def main():
             enable_version_counter=False,
             save_last=False,
         ),
-        EveryNEpochCheckpoint(dirpath=ckpt_dir, every_n_epochs=5),
+        # EveryNEpochCheckpoint(dirpath=ckpt_dir, every_n_epochs=5),
         LearningRateMonitor(logging_interval="step"),
     ]
 

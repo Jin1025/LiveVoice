@@ -9,29 +9,11 @@ Usage examples:
         --n_samples 4 --max_steps 200 --out_dir output/samples
 
     # VC inference
-    CUDA_VISIBLE_DEVICES=3 python scripts/generate.py vc \
-        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/perturb_film/epoch=020-val/loss=3.9469.ckpt \
-        --reference /mnt/data/disk2/VCTK-Corpus/wav48/p275/p275_002.wav \
-        --content /mnt/data/disk2/VCTK-Corpus/wav48/p225/p225_001.wav \
-        --codec dac
-
-    CUDA_VISIBLE_DEVICES=3 python scripts/generate.py vc \
-        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/libritts_mimi_resume/step_latest.ckpt \
-        --reference /mnt/data/disk2/VCTK-Corpus/wav48/p275/p275_002.wav \
-        --content /mnt/data/disk2/VCTK-Corpus/wav48/p225/p225_001.wav \
-        --codec mimi
-
-    CUDA_VISIBLE_DEVICES=2 python scripts/generate.py vc \
-        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/mimi_semantic_new/step_latest.ckpt \
-        --reference /mnt/data/disk2/LibriTTS/test-clean/121/121726/121_121726_000020_000001.wav  \
-        --content /mnt/data/disk2/LibriTTS/test-clean/5105/28240/5105_28240_000013_000005.wav  \
-        --codec mimi
-
     CUDA_VISIBLE_DEVICES=5 python scripts/generate.py vc \
-        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/prefix_speechbrain/step_latest.ckpt \
+        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/prefix+jhcodec+hubert/step_latest.ckpt \
         --reference /mnt/data/disk2/LibriTTS/test-clean/121/121726/121_121726_000020_000001.wav  \
         --content /mnt/data/disk2/LibriTTS/test-clean/5105/28240/5105_28240_000013_000005.wav  \
-        --codec mimi
+        --codec jhcodec
 """
 import argparse
 import os
@@ -147,18 +129,13 @@ def _build_inference_config(args) -> LiveVoiceConfig:
     SR in cmd_vc/cmd_uncond, independent of config.sample_rate.
     """
     cfg_kwargs = dict(device=("cuda" if torch.cuda.is_available() else "cpu"))
-    codec_name = str(getattr(args, "codec", "dac")).lower()
+    codec_name = str(getattr(args, "codec", "mimi")).lower()
     cfg_kwargs["codec"] = codec_name
 
     # Force config.sample_rate to the codec's native rate. This makes any
-    # downstream consumer (e.g. MimiCodec.input_sr) see a consistent SR.
-    if codec_name == "mimi":
-        cfg_kwargs["sample_rate"] = 24000
-    else:  # dac
-        # DAC defaults: 16khz model is the trained one for the existing ckpts
-        cfg_kwargs["sample_rate"] = 16000
-        cfg_kwargs["dac_model_type"] = getattr(args, "dac_model_type", "16khz")
-        cfg_kwargs["dac_sample_rate"] = 16000
+    # downstream consumer (e.g. MimiCodec.input_sr / JHCodecModel.input_sr) see
+    # a consistent SR: mimi=24 kHz, jhcodec=16 kHz.
+    cfg_kwargs["sample_rate"] = {"mimi": 24000, "jhcodec": 16000}[codec_name]
 
     if getattr(args, "n_codebooks", None) is not None:
         cfg_kwargs["n_codebooks_predict"] = int(args.n_codebooks)
@@ -198,9 +175,6 @@ def _resolve_content_source(args, codec_name: str) -> str:
     if inferred is not None:
         print(f"[generate] content_source=auto → {inferred!r} (from checkpoint keys)")
         return inferred
-    fallback = "mimi_semantic" if codec_name == "mimi" else "hubert"
-    print(f"[generate] content_source=auto → {fallback!r} (fallback; ckpt keys ambiguous)")
-    return fallback
 
 
 def _resolve_speaker_conditioning(args) -> str:
@@ -236,7 +210,7 @@ def _resolve_speaker_encoder_type(args) -> str:
 def cmd_uncond(args):
     print(f"[generate/uncond] Loading checkpoint: {args.ckpt}")
     # Build config tied to the codec the ckpt was trained with.
-    # SR is forced to the codec's native rate (DAC=16k, Mimi=24k) so audio loaded
+    # SR is forced to the codec's native rate (JHCodec=16k, Mimi=24k) so audio loaded
     # in this script matches what the model saw during training, regardless of
     # what config.sample_rate happens to default to.
     config = _build_inference_config(args)
@@ -302,7 +276,7 @@ def cmd_vc(args):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     lit = lit.to(device)
 
-    # Load audio at the codec's native SR (NOT config.sample_rate). DAC ckpts
+    # Load audio at the codec's native SR 
     # were trained at 16 kHz; feeding 24 kHz now would silently corrupt encoding.
     sr = int(codec_model.sample_rate)
     ref = load_audio(args.reference, sr, duration=None).unsqueeze(0).to(device)
@@ -340,10 +314,9 @@ def main():
     # ── uncond ──────────────────────────────
     pu = sub.add_parser("uncond")
     pu.add_argument("--ckpt", required=True)
-    pu.add_argument("--codec", type=str, default="dac", choices=["dac", "mimi"])
+    pu.add_argument("--codec", type=str, default="mimi", choices=["mimi", "jhcodec"])
     pu.add_argument("--n_codebooks", type=int, default=None,
-                    help="Override config.n_codebooks_predict to match the ckpt (DAC ckpts often used 9).")
-    pu.add_argument("--dac_model_type", type=str, default="16khz", choices=["16khz", "24khz", "44khz"])
+                    help="Override config.n_codebooks_predict to match the ckpt.")
     pu.add_argument(
         "--out_dir",
         default=None,
@@ -358,10 +331,9 @@ def main():
     # ── vc ──────────────────────────────────
     pv = sub.add_parser("vc")
     pv.add_argument("--ckpt", required=True)
-    pv.add_argument("--codec", type=str, default="mimi", choices=["dac", "mimi"])
+    pv.add_argument("--codec", type=str, default="jhcodec", choices=["mimi", "jhcodec"])
     pv.add_argument("--n_codebooks", type=int, default=None,
-                    help="Override config.n_codebooks_predict to match the ckpt (DAC ckpts often used 9).")
-    pv.add_argument("--dac_model_type", type=str, default="16khz", choices=["16khz", "24khz", "44khz"])
+                    help="Override config.n_codebooks_predict to match the ckpt.")
     pv.add_argument("--reference", required=True, help="Reference speaker audio (.wav)")
     pv.add_argument("--content", required=True, help="Content/source audio (.wav)")
     pv.add_argument(
