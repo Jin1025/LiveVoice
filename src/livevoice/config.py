@@ -52,7 +52,7 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     jhcodec_repo: str = "/workspace/jhcodec"
     jhcodec_config: str = "/workspace/jhcodec/config/config_mimi_recon.json"
-    jhcodec_ckpt: str = "/workspace/jhcodec/ckpt/jhcodec_mimi_1000000.pt"
+    jhcodec_ckpt: str = "/mnt/data/disk3/yejin/jhcodec/jhcodec_mimi_1000000.pt"
     jhcodec_sample_rate: int = 16000
     jhcodec_n_codebooks: int = 8
     jhcodec_codebook_size: int = 1024
@@ -77,6 +77,10 @@ class LiveVoiceConfig:
     hubert_hidden_dim: int = 768   # HuBERT-base hidden size
     content_proj_dim: int = 256
     freeze_hubert: bool = True
+    # Center-align HuBERT content frames to the codec token grid via waveform padding
+    # (jhcodec only; stride==hop). Removes the sub-frame center offset and the
+    # count-mismatch resample. See HuBERTContentExtractor._extract_hidden.
+    content_center_align: bool = True
 
     # ------------------------------------------------------------------
     # Prosody features (optional, causal)
@@ -109,7 +113,7 @@ class LiveVoiceConfig:
     #   "prefix"     — prepend reference-derived speaker tokens to decoder self-attn
     #                  (decoder-only path; no cross-attention)
     speaker_conditioning: str = "prefix"
-    speaker_prefix_len: int = 8 
+    speaker_prefix_len: int = 4
 
     # Speaker encoder:
     #   "codec"             — codec continuous z (pre-quantization) from reference
@@ -210,9 +214,13 @@ class LiveVoiceConfig:
     num_audio_log_samples: int = 4
     log_val_wer: bool = True
     log_val_spk_sim: bool = True   # ECAPA cosine(gen, reference) — speaker-transfer metric
+    # Reference speaker for the epoch-end WER / spk_sim eval:
+    #   "same"  — same speaker as content (different utterance) → intelligibility UPPER BOUND
+    #   "cross" — a different speaker → speaker-transfer VC quality
+    val_wer_speaker: str = "same"
     wer_whisper_model: str = "base"
     wer_device: str = "cuda"
-    wer_epoch_samples: int = 100
+    wer_epoch_samples: int = 50
     wer_seed: int = 12345                     # fixed seed for sample selection (stable across epochs)
 
     # ------------------------------------------------------------------

@@ -744,17 +744,23 @@ class LiveVoiceLightningModule(L.LightningModule):
         self.model.eval()
         wers: list[float] = []
         spk_sims: list[float] = []
+        spk_sims_gt: list[float] = []
         try:
             for ix in idxs:
                 wav_path, utt_id, spk = ds.items[ix]
                 ref_txt = _read_libritts_normalized_text(wav_path)
                 if not ref_txt:
                     continue
-                # Cross-speaker VC: convert content to a DIFFERENT speaker. Same
-                # ref across epochs (seeded per item) so WER/spk_sim are comparable.
-                ref_rng = random.Random(wer_seed * 1_000_003 + ix)
-                ref_path = _libritts_pick_diff_speaker_ref_path(ds, spk, ref_rng) \
-                    or _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
+                # Reference speaker per config.val_wer_speaker. Fixed across epochs
+                # (val split → deterministic same-spk pick; seeded per item for cross)
+                # so WER/spk_sim trends are comparable epoch to epoch.
+                mode = str(getattr(self.config, "val_wer_speaker", "same")).lower()
+                if mode == "cross":
+                    ref_rng = random.Random(wer_seed * 1_000_003 + ix)
+                    ref_path = _libritts_pick_diff_speaker_ref_path(ds, spk, ref_rng) \
+                        or _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
+                else:  # "same" → intelligibility upper bound
+                    ref_path = _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
                 ctn = _load_full_mono_wav(wav_path, target_sr).unsqueeze(0).to(device)
                 ref = _load_full_mono_wav(ref_path, target_sr).unsqueeze(0).to(device)
                 # Greedy decoding (temperature=0 → argmax). Removes sampling
@@ -772,12 +778,19 @@ class LiveVoiceLightningModule(L.LightningModule):
                     wavs = torchaudio.functional.resample(wavs, target_sr, 16000)
                 hyp_txt = w.transcribe(wavs[0].numpy(), fp16=False)["text"]
                 wers.append(self._word_wer(hyp_txt, ref_txt))
-                # Speaker-transfer similarity on the SAME converted output.
+                # Speaker similarity of the converted output vs the reference.
                 if spk_enc is not None:
                     emb_gen = spk_enc(gen.detach().float())
                     emb_ref = spk_enc(ref.detach().float())
                     spk_sims.append(
                         F.cosine_similarity(emb_gen, emb_ref, dim=-1).mean().item()
+                    )
+                    # GT ceiling: real content audio vs the reference (logged separately,
+                    # not a ratio). For val_wer_speaker="same" this is the intra-speaker
+                    # ECAPA similarity — the max spk_sim the generator could reach.
+                    emb_ctn = spk_enc(ctn.detach().float())
+                    spk_sims_gt.append(
+                        F.cosine_similarity(emb_ctn, emb_ref, dim=-1).mean().item()
                     )
         finally:
             if was_training:
@@ -799,6 +812,11 @@ class LiveVoiceLightningModule(L.LightningModule):
             self.log("val/spk_sim", spk_sim_mean, on_epoch=True, sync_dist=True, prog_bar=True)
             if exp is not None and hasattr(exp, "log"):
                 exp.log({"val/spk_sim": spk_sim_mean}, step=step)
+        if spk_sims_gt:
+            spk_sim_gt_mean = float(sum(spk_sims_gt) / len(spk_sims_gt))
+            self.log("val/spk_sim_gt", spk_sim_gt_mean, on_epoch=True, sync_dist=True, prog_bar=False)
+            if exp is not None and hasattr(exp, "log"):
+                exp.log({"val/spk_sim_gt": spk_sim_gt_mean}, step=step)
 
     @torch.no_grad()
     def _log_vc_sample(

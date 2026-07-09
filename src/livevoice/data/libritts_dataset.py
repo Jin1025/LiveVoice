@@ -17,6 +17,7 @@ Each sample returns:
 """
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 
@@ -49,6 +50,12 @@ class LibriTTSDataset(Dataset):
 
         feats_base = getattr(config, "features_dir", None)
         self._feats_dir = Path(feats_base) / "libritts" if feats_base else None
+        if self._feats_dir is not None and not self._feats_dir.exists():
+            print(
+                f"[LibriTTSDataset] WARNING: features_dir set but {self._feats_dir} does not "
+                f"exist → falling back to ONLINE HuBERT every step (slow). Extract features "
+                f"there, or set features_dir=None to make the online path explicit."
+            )
 
         self.speaker_utts: dict[str, list[tuple[str, str]]] = {}
         for s in use_splits:
@@ -143,6 +150,11 @@ class LibriTTSDataset(Dataset):
         if n >= self.target_len:
             if self.split == "train" and n > self.target_len:
                 start = random.randint(0, n - self.target_len)
+                # Snap the window start to the HuBERT/codec frame grid (samples per
+                # frame = target_sr/50) so a sliced cached feature window lines up 1:1
+                # with the codec tokens of this window (no sub-frame content↔token drift).
+                hop = max(1, self.target_sr // 50)
+                start -= start % hop
             audio = audio[start : start + self.target_len]
         else:
             audio = torch.nn.functional.pad(audio, (0, self.target_len - n))
@@ -161,9 +173,12 @@ class LibriTTSDataset(Dataset):
         try:
             data = torch.load(feat_path, map_location="cpu", weights_only=True)
             feats = data["feats"].float()
-            # HuBERT is always 50 fps regardless of training SR — compute from target_sr directly
-            n_frames = int(round(self.target_len * 50 / self.target_sr))
-            start_frame = int(start_sample * 50 / self.target_sr)
+            # HuBERT is always 50 fps regardless of training SR. samples-per-frame = SR/50.
+            # ceil frame count + floor start_frame match the codec token grid; start_sample
+            # is snapped to `hop` in _load_window so start_frame is exact (no drift).
+            hop = max(1, self.target_sr // 50)
+            n_frames = int(math.ceil(self.target_len / hop))
+            start_frame = int(start_sample // hop)
             chunk = feats[start_frame : start_frame + n_frames]
             if chunk.shape[0] < n_frames:
                 chunk = torch.nn.functional.pad(chunk, (0, 0, 0, n_frames - chunk.shape[0]))

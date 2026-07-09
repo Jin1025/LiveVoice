@@ -31,6 +31,7 @@ Usage:
 """
 import argparse
 import glob
+import math
 import os
 import random
 import sys
@@ -88,23 +89,44 @@ class HuBERTBatchEncoder:
         self.layer = layer
         self.device = device
 
+        # Receptive field + stride of the HuBERT conv extractor (valid convs).
+        # hubert-base: RF=400, stride=320. front pad = (RF-hop)/2 = 40 aligns HuBERT
+        # frame centers onto the codec token grid (token t center = 320t+159.5); frame
+        # count is trimmed to ceil(L/hop) to match the codec's own tokenization.
+        # MUST mirror HuBERTContentExtractor._extract_hidden so cached feats == online.
+        ks = list(self.model.config.conv_kernel)
+        ss = list(self.model.config.conv_stride)
+        rf, jump = 1, 1
+        for k, s in zip(ks, ss):
+            rf += (k - 1) * jump
+            jump *= s
+        self.rf = int(rf)
+        self.stride = int(jump)
+        self.front = max(0, (self.rf - HUBERT_HOP) // 2)
+
     @torch.no_grad()
     def encode_batch(self, audios: list[torch.Tensor]) -> list[torch.Tensor]:
-        """audios: list of (T,) tensors at 16 kHz → list of (T_frames, 768) tensors."""
-        # Pad to same length for batched forward
-        max_len = max(a.shape[0] for a in audios)
+        """audios: list of (T,) tensors at 16 kHz → list of (ceil(T/hop), 768) tensors,
+        center-aligned to the codec token grid (front-pad + ceil-count truncate)."""
+        front = self.front
+        # per-item target frame count = codec grid = ceil(L/hop)
+        ns = [max(1, math.ceil(a.shape[0] / HUBERT_HOP)) for a in audios]
+        # required padded length so item i yields >= ns[i] valid-conv frames
+        needs = [front + self.stride * (n - 1) + self.rf for n in ns]
+        max_len = max(needs) + self.stride  # 1-frame margin against flooring
         padded = torch.zeros(len(audios), max_len, device=self.device)
         for i, a in enumerate(audios):
-            padded[i, : a.shape[0]] = a.to(self.device)
+            padded[i, front : front + a.shape[0]] = a.to(self.device)
 
         out = self.model(padded, output_hidden_states=True, return_dict=True)
         hidden = out.hidden_states[self.layer]  # (B, T_frames, 768)
 
-        # Return per-item, trimmed to actual frame count
         results = []
-        for i, a in enumerate(audios):
-            n_frames = a.shape[0] // HUBERT_HOP
-            results.append(hidden[i, :n_frames].cpu())
+        for i, n in enumerate(ns):
+            h = hidden[i]
+            if h.shape[0] < n:  # defensive; margin should prevent this
+                h = torch.cat([h, h[-1:].expand(n - h.shape[0], -1)], dim=0)
+            results.append(h[:n].cpu())
         return results
 
 
@@ -217,7 +239,7 @@ def main():
     pl.add_argument("--splits", default="train-clean-100,train-clean-360,dev-clean")
     pl.add_argument("--out_dir", default="/mnt/data/disk2/yejin/LiveVoice/features/libritts")
     pl.add_argument("--training_sr", type=int, default=16000,
-                    help="training sample rate — determines audio_stride (e.g. 16000 for DAC 16kHz)")
+                    help="training sample rate — determines audio_stride")
 
     for sp in [pv, pl]:
         sp.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

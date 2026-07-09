@@ -28,6 +28,8 @@ class SpeechBrainECAPASpeakerEncoder(nn.Module):
             )
         )
         device = str(getattr(config, "device", "cuda" if torch.cuda.is_available() else "cpu"))
+        if device == "cuda":
+            device = "cuda:0"
 
         try:
             from speechbrain.inference.speaker import EncoderClassifier

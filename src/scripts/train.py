@@ -68,7 +68,7 @@ def parse_args():
     p.add_argument("--use_prosody", action="store_true")
     # p.add_argument("--content_conditioning", type=str, default="film", choices=["additive", "film"])
     # p.add_argument("--speaker_conditioning", type=str, default="prefix", choices=["crossattn", "global_avg", "prefix"])
-    p.add_argument("--speaker_prefix_len", type=int, default=8)
+    # p.add_argument("--speaker_prefix_len", type=int, default=)
     # p.add_argument("--speaker_encoder_type", type=str, default="speechbrain_ecapa", choices=["codec", "speechbrain_ecapa"])
     # p.add_argument("--speechbrain_source", type=str, default="speechbrain/spkrec-ecapa-voxceleb")
     # p.add_argument(
@@ -91,6 +91,11 @@ def parse_args():
     #     type=str,
     #     default="/workspace/StreamVoiceAnon/ckpt/asr_s2s_bsq_8192_causal_down_whisper.pth",
     # )
+    # p.add_argument("--val_wer_speaker", type=str, default="same", choices=["same", "cross"],
+    #                help="Epoch-end WER/spk_sim reference: 'same' speaker (intelligibility "
+    #                     "upper bound) or 'cross' speaker (speaker-transfer quality).")
+    p.add_argument("--wer_epoch_samples", type=int, default=50,
+                   help="Fixed (seeded) #utterances for the epoch-end WER/spk_sim eval.")
     p.add_argument("--pairing", type=str, default="same_speaker",
                    choices=["same_speaker", "reconstruct"])
     p.add_argument("--max_windows", type=int, default=None)
@@ -132,7 +137,7 @@ def main():
         use_prosody=args.use_prosody,
         # content_conditioning=args.content_conditioning,
         # speaker_conditioning=args.speaker_conditioning,
-        speaker_prefix_len=args.speaker_prefix_len,
+        # speaker_prefix_len=args.speaker_prefix_len,
         # speaker_encoder_type=args.speaker_encoder_type,
         # speechbrain_source=args.speechbrain_source,
         # speechbrain_savedir=args.speechbrain_savedir,
@@ -143,6 +148,8 @@ def main():
         # streamvoiceanon_encoder_config=args.streamvoiceanon_encoder_config,
         # streamvoiceanon_encoder_ckpt=args.streamvoiceanon_encoder_ckpt,
         pairing=args.pairing,
+        # val_wer_speaker=args.val_wer_speaker,
+        wer_epoch_samples=args.wer_epoch_samples,
         max_windows=args.max_windows,
         seed=args.seed,
         precision=args.precision,

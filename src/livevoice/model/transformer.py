@@ -354,6 +354,31 @@ class LiveVoiceModel(nn.Module):
         idx = torch.linspace(0, T_src - 1, num_tokens, device=feats.device).long()
         return feats[:, idx, :]
 
+    def _align_content_delay(
+        self,
+        feats: torch.Tensor,
+        base_len: int,
+        use_delay: bool,
+        null_vec: torch.Tensor,
+    ) -> torch.Tensor:
+        """Align content/prosody to the codec codebook-0 timeline, then null-pad the delay tail.
+
+        In the MusicGen delay pattern, decoder position p has canonical time p
+        (codebook-0's time; codebook k targets time p-k). So content must sit 1:1 on
+        the codebook-0 timeline of length ``base_len`` (= T at train, max_steps at
+        inference) — NOT be linspace-stretched across the full T+K-1 axis. The stretch
+        made content[p] = content_raw[p·(T_src-1)/(T+K-2)], lagging up to K-1 frames by
+        the end of the utterance (progressive drift → WER worsens over time). The final
+        K-1 tail positions carry no codebook-0 token (only fine-codebook cleanup for
+        already-decoded times), so they receive a null content signal.
+        """
+        body = self.align_to_tokens(feats, base_len, causal=True)
+        K = self.n_codebooks_predict
+        if not use_delay or K <= 1:
+            return body
+        tail = null_vec.to(device=body.device, dtype=body.dtype).expand(feats.size(0), K - 1, -1)
+        return torch.cat([body, tail], dim=1)
+
     # --------------------- delay pattern ---------------------
     def _build_delay_input(self, codes: torch.Tensor) -> torch.Tensor:
         B, K, T = codes.shape
@@ -592,8 +617,13 @@ class LiveVoiceModel(nn.Module):
 
         # 3. content (precomputed feats take priority over online HuBERT)
         content_add_raw, film_raw = self.extract_content(content_audio, content_feats)
-        content_add = self.align_to_tokens(content_add_raw, T_seq, causal=True)
-        film_feats = self.align_to_tokens(film_raw, T_seq, causal=True) if film_raw is not None else None
+        # Align content 1:1 to the codebook-0 timeline (length T), null-pad the K-1
+        # delay tail. Avoids the linspace-stretch drift (see _align_content_delay).
+        content_add = self._align_content_delay(content_add_raw, T, use_delay, self.null_content_embedding)
+        film_feats = (
+            self._align_content_delay(film_raw, T, use_delay, self.null_film_feature)
+            if film_raw is not None else None
+        )
 
         drop_ctn_all = drop_ctn | drop_both
         if drop_ctn_all.any():
@@ -609,7 +639,7 @@ class LiveVoiceModel(nn.Module):
         if self.use_prosody:
             pa = prosody_audio if prosody_audio is not None else content_audio
             prosody_raw = self.prosody_extractor(pa)
-            prosody_add = self.align_to_tokens(prosody_raw, T_seq, causal=True)
+            prosody_add = self._align_content_delay(prosody_raw, T, use_delay, self.null_content_embedding)
             drop_pro_all = drop_pro | drop_both
             if drop_pro_all.any():
                 prosody_add = prosody_add.clone()
@@ -751,20 +781,26 @@ class LiveVoiceModel(nn.Module):
             if hop <= 0:
                 raise ValueError(f"codec hop_length must be positive, got {hop}")
             n_samples = int(content_audio.shape[-1])
-            max_steps = max(1, int(round(n_samples / float(hop))))
+            # ceil (not round) to match the codec's own tokenization (end-padded blocks →
+            # ceil(L/hop)) and the center-aligned HuBERT content count, so content aligns
+            # 1:1 to the generated tokens with no resample.
+            max_steps = max(1, -(-n_samples // hop))
         T_total = (max_steps + K - 1) if use_delay else max_steps
 
-        # causal=True to match the training forward (transformer.py forward):
-        # for a streaming model the source→token alignment must be causal (no
-        # future leakage) and identical between train and inference. In the
-        # delay-pattern regime (T_src < T_total) both reduce to linspace
-        # upsampling, but this stays correct if content fps ever exceeds codec fps.
-        content_add = self.align_to_tokens(content_add_raw, T_total, causal=True)
-        film_feats = self.align_to_tokens(film_raw, T_total, causal=True) if film_raw is not None else None
+        # Align content 1:1 to the codebook-0 timeline (length max_steps) and null-pad
+        # the K-1 delay tail — identical to the training forward. causal=True keeps the
+        # source→token mapping causal (no future leakage). See _align_content_delay:
+        # the old linspace-to-T_total stretch drifted content up to K-1 frames behind
+        # the token it conditions, worsening WER over the course of an utterance.
+        content_add = self._align_content_delay(content_add_raw, max_steps, use_delay, self.null_content_embedding)
+        film_feats = (
+            self._align_content_delay(film_raw, max_steps, use_delay, self.null_film_feature)
+            if film_raw is not None else None
+        )
         if self.use_prosody:
             pa = prosody_audio if prosody_audio is not None else content_audio
             prosody_raw = self.prosody_extractor(pa)
-            prosody_add = self.align_to_tokens(prosody_raw, T_total, causal=True)
+            prosody_add = self._align_content_delay(prosody_raw, max_steps, use_delay, self.null_content_embedding)
             content_add = content_add + prosody_add
 
         generated = [[] for _ in range(K)]
