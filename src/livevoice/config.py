@@ -75,7 +75,7 @@ class LiveVoiceConfig:
     hubert_layer: int = 9          # layer 9 is the standard "content" layer (FreeVC/SoVITS)
     hubert_sample_rate: int = 16000 # 16000
     hubert_hidden_dim: int = 768   # HuBERT-base hidden size
-    content_proj_dim: int = 256
+    content_proj_dim: int = 256 # 256, 768
     freeze_hubert: bool = True
     # Center-align HuBERT content frames to the codec token grid via waveform padding
     # (jhcodec only; stride==hop). Removes the sub-frame center offset and the
@@ -121,11 +121,23 @@ class LiveVoiceConfig:
     #                         projected (speaker_proj) and downsampled to
     #                         speaker_prefix_len tokens → decoder prefix.
     #   "speechbrain_ecapa" — SpeechBrain ECAPA-TDNN utterance embedding
-    speaker_encoder_type: str = "codec"
+    speaker_encoder_type: str = "speechbrain_ecapa"
     speechbrain_source: str = "speechbrain/spkrec-ecapa-voxceleb"
     speechbrain_savedir: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb"
     speechbrain_sample_rate: int = 16000
     speechbrain_embedding_dim: int = 192
+
+    # Which speaker encoder the *validation* spk_sim metric uses (does NOT affect
+    # the model's own speaker_encoder_type conditioning path):
+    #   "ecapa"      — SpeechBrain ECAPA-TDNN (source above). Same-spk cosine ~0.6.
+    #   "wavlm_tdnn" — UniSpeech WavLM-large + ECAPA-TDNN head (finetuned .pth).
+    #                  Exactly the encoder Vevo/Amphion report SIM with; higher
+    #                  absolute cosines (GT ~0.75), directly comparable to those tables.
+    #                  Requires s3prl in the env + the finetuned checkpoint below.
+    val_spk_encoder: str = "wavlm_tdnn"
+    wavlm_sv_ckpt: str = "/mnt/data/disk3/yejin/wavlm_large_finetune.pth"
+    wavlm_sv_variant: str = "wavlm_large"   # or "wavlm_base_plus"
+    wavlm_sv_sample_rate: int = 16000
 
     # Classifier-free guidance dropout (training)
     use_cfg_dropout: bool = True
@@ -196,7 +208,7 @@ class LiveVoiceConfig:
     # Source-side content perturbation (speaker de-identification)
     # ------------------------------------------------------------------
     use_content_perturbation: bool = True
-    perturb_pitch_semitones: float = .0    # ±N semitones pitch shift
+    perturb_pitch_semitones: float = 4.0    # ±N semitones pitch shift
     use_vtln: bool = False                  # VTLN formant warp
     perturb_vtln_alpha_range: float = 0.12  # ±12% VTLN warp range (only if use_vtln=True)
     perturb_eq_gain_db: float = 6.0         # ±dB per EQ band (4 bands)

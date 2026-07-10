@@ -399,19 +399,34 @@ class LiveVoiceLightningModule(L.LightningModule):
         return self._whisper_model
 
     def _get_spk_encoder(self):
-        """Independent SpeechBrain ECAPA encoder for val speaker-similarity (cached)."""
+        """Independent speaker encoder for val speaker-similarity (cached).
+
+        config.val_spk_encoder selects the ruler:
+          "ecapa"      → SpeechBrain ECAPA-TDNN  (GT SIM ~0.6)
+          "wavlm_tdnn" → WavLM + TDNN x-vector   (GT SIM ~0.75; matches Vevo/Amphion)
+        """
         if self._spk_encoder_loaded:
             return self._spk_encoder
         self._spk_encoder_loaded = True
+        which = str(getattr(self.config, "val_spk_encoder", "ecapa")).lower()
         try:
-            from livevoice.model.speechbrain_speaker_encoder import (
-                SpeechBrainECAPASpeakerEncoder,
-            )
-            enc = SpeechBrainECAPASpeakerEncoder(self.config)
+            if which == "wavlm_tdnn":
+                from livevoice.model.wavlm_speaker_encoder import (
+                    WavLMTDNNSpeakerEncoder,
+                )
+                enc = WavLMTDNNSpeakerEncoder(self.config)
+                print(f"[spk_sim] val speaker encoder = UniSpeech WavLM-TDNN "
+                      f"({self.config.wavlm_sv_variant}, ckpt={self.config.wavlm_sv_ckpt})")
+            else:
+                from livevoice.model.speechbrain_speaker_encoder import (
+                    SpeechBrainECAPASpeakerEncoder,
+                )
+                enc = SpeechBrainECAPASpeakerEncoder(self.config)
+                print(f"[spk_sim] val speaker encoder = SpeechBrain ECAPA ({self.config.speechbrain_source})")
             enc.eval()
             object.__setattr__(self, "_spk_encoder", enc)
         except Exception as e:
-            print(f"[spk_sim] SpeechBrain ECAPA unavailable, skipping val/spk_sim: {e}")
+            print(f"[spk_sim] speaker encoder ({which}) unavailable, skipping val/spk_sim: {e}")
             object.__setattr__(self, "_spk_encoder", None)
         return self._spk_encoder
 
@@ -745,6 +760,7 @@ class LiveVoiceLightningModule(L.LightningModule):
         wers: list[float] = []
         spk_sims: list[float] = []
         spk_sims_gt: list[float] = []
+        n_skipped_long = 0
         try:
             for ix in idxs:
                 wav_path, utt_id, spk = ds.items[ix]
@@ -762,7 +778,23 @@ class LiveVoiceLightningModule(L.LightningModule):
                 else:  # "same" → intelligibility upper bound
                     ref_path = _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
                 ctn = _load_full_mono_wav(wav_path, target_sr).unsqueeze(0).to(device)
+                # The model's context is max_seq_len tokens; total generation length =
+                # ref_prefix + ceil(content/hop) + (K-1) must fit. Content longer than
+                # val_max_content_sec (default 15s → ~750 tokens) can't be generated, so
+                # skip it (rare in LibriTTS) instead of overflowing the attention mask.
+                content_max_sec = float(getattr(self.config, "val_max_content_sec", 15.0))
+                if ctn.shape[-1] > int(content_max_sec * target_sr):
+                    n_skipped_long += 1
+                    continue
                 ref = _load_full_mono_wav(ref_path, target_sr).unsqueeze(0).to(device)
+                # Codec speaker encoder emits one prefix token per reference frame (~50 fps),
+                # so a full-length reference bloats the sequence (and is off-distribution:
+                # training used audio_duration windows). Trim it to the training window.
+                # ECAPA pools to a fixed speaker_prefix_len, so it keeps the full reference.
+                if str(getattr(self.config, "speaker_encoder_type", "codec")).lower() != "speechbrain_ecapa":
+                    ref_max_samples = int(float(getattr(self.config, "audio_duration", 4.0)) * target_sr)
+                    if ref.shape[-1] > ref_max_samples:
+                        ref = ref[..., :ref_max_samples]
                 # Greedy decoding (temperature=0 → argmax). Removes sampling
                 # variance so two runs at the same ckpt give the same WER.
                 codes = self.model.generate(
@@ -796,6 +828,10 @@ class LiveVoiceLightningModule(L.LightningModule):
             if was_training:
                 self.model.train()
 
+        if n_skipped_long:
+            print(f"[WER] skipped {n_skipped_long}/{n} val items longer than "
+                  f"{float(getattr(self.config, 'val_max_content_sec', 15.0)):g}s "
+                  f"(exceed model context {self.config.max_seq_len} tokens).")
         if not wers:
             raise RuntimeError(
                 "log_val_wer=True but no LibriTTS normalized transcripts found for sampled val items."

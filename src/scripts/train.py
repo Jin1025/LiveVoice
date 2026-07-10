@@ -96,6 +96,15 @@ def parse_args():
     #                     "upper bound) or 'cross' speaker (speaker-transfer quality).")
     p.add_argument("--wer_epoch_samples", type=int, default=50,
                    help="Fixed (seeded) #utterances for the epoch-end WER/spk_sim eval.")
+    # p.add_argument("--val_spk_encoder", type=str, default="ecapa",
+    #                choices=["ecapa", "wavlm_tdnn"],
+    #                help="Encoder for the val spk_sim metric: 'ecapa' (GT~0.6) or "
+    #                     "'wavlm_tdnn' (GT~0.75, comparable to Vevo/Amphion tables).")
+    # p.add_argument("--wavlm_sv_ckpt", type=str,
+    #                default="/mnt/data/disk3/yejin/wavlm_large_fintune.pth",
+    #                help="UniSpeech WavLM-large finetuned .pth (used when val_spk_encoder=wavlm_tdnn).")
+    p.add_argument("--wavlm_sv_variant", type=str, default="wavlm_large",
+                   choices=["wavlm_large", "wavlm_base_plus"])
     p.add_argument("--pairing", type=str, default="same_speaker",
                    choices=["same_speaker", "reconstruct"])
     p.add_argument("--max_windows", type=int, default=None)
@@ -150,6 +159,9 @@ def main():
         pairing=args.pairing,
         # val_wer_speaker=args.val_wer_speaker,
         wer_epoch_samples=args.wer_epoch_samples,
+        # val_spk_encoder=args.val_spk_encoder,
+        # wavlm_sv_ckpt=args.wavlm_sv_ckpt,
+        wavlm_sv_variant=args.wavlm_sv_variant,
         max_windows=args.max_windows,
         seed=args.seed,
         precision=args.precision,

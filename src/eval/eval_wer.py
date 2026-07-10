@@ -1,16 +1,5 @@
 """Same-speaker WER for LiveVoice checkpoints (content-preservation sanity check).
 
-Motivation
-----------
-Cross-speaker VC WER converged to ~0.3 during training. That number is ambiguous:
-it can mean either (a) the content encoder genuinely loses linguistic info, or
-(b) speaker↔content information leakage that only bites when the reference timbre
-differs from the content speaker. To disentangle the two we measure **same-speaker**
-WER: the reference (timbre) is another utterance from the *same* LibriTTS speaker as
-the content. If same-speaker WER is low (~GT level) but cross-speaker is 0.3, the
-content path is fine and the 0.3 is a leakage / speaker-invariance problem. If
-same-speaker WER is *also* ~0.3, the content encoder itself is lossy.
-
   * Ground-truth text = the content wav's ``*.normalized.txt``.
   * Whisper (default large-v3, matching the GT-WER upper bound of ~0.05) runs on the
     generated VC audio.
@@ -20,18 +9,20 @@ same-speaker WER is *also* ~0.3, the content encoder itself is lossy.
 Both target checkpoints are jhcodec + HuBERT-content + prefix speaker conditioning;
 they differ only in the speaker encoder (ecapa vs codec-z), auto-detected from the ckpt.
 
-Run (env with whisper/torch/speechbrain — e.g. `conda activate sound`):
+Run:
 
-    CUDA_VISIBLE_DEVICES=0 python src/eval/eval_same_speaker_wer.py
+    CUDA_VISIBLE_DEVICES=6 python src/eval/eval_wer.py --speaker_mode same --whisper_model medium --ckpt ecapa_prefix_jh_hubert/step_latest.ckpt
 
-Evaluates both checkpoints in sequence, writes one CSV each (columns: gt, hyp, wer),
-and prints the mean WER for each at the end.
+``--ckpt`` is relative to ``CKPT_ROOT`` (override with ``--ckpt_root``) unless absolute.
+Pass multiple ``--ckpt`` values to evaluate several checkpoints in sequence.
+Writes one CSV each (columns: gt, hyp, wer) and prints the mean WER at the end.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -65,14 +56,7 @@ from livevoice.utils.checkpoint import (
 #  Checkpoints to evaluate
 # ─────────────────────────────────────────────
 CKPT_ROOT = "/mnt/data/disk2/yejin/LiveVoice/checkpoints"
-# jhcodec codec weights (moved off the repo default /workspace/jhcodec/ckpt/...).
 JHCODEC_CKPT = "/mnt/data/disk3/yejin/jhcodec/jhcodec_mimi_1000000.pt"
-
-DEFAULT_TARGETS = [
-    "ecapa_prefix_jh_hubert",
-    "codecfull_prefix_jh_hubert",
-]
-
 
 # ─────────────────────────────────────────────
 #  WER + audio helpers (self-contained)
@@ -154,6 +138,16 @@ def _same_speaker_ref(ds: LibriTTSDataset, content_wav: str, utt_id: str, spk: s
     return ref_path
 
 
+def _cross_speaker_ref(ds: LibriTTSDataset, content_spk: str, rng: random.Random) -> str:
+    """Pick one utterance from a DIFFERENT speaker (seeded rng → reproducible)."""
+    others = [s for s in ds.speaker_utts if s != content_spk]
+    if not others:
+        raise RuntimeError(f"No speaker other than {content_spk} for cross-speaker ref.")
+    ref_spk = rng.choice(others)
+    ref_path, _ = rng.choice(ds.speaker_utts[ref_spk])
+    return ref_path
+
+
 # ─────────────────────────────────────────────
 #  Model loading
 # ─────────────────────────────────────────────
@@ -224,13 +218,23 @@ def eval_ckpt(name: str, ckpt: str, ds: LibriTTSDataset, w_model, args) -> float
         f"{'full utterance' if ref_max_seconds is None else f'{ref_max_seconds:g}s (~{int(ref_max_seconds*50)} prefix tokens)'}"
     )
 
-    work = [
-        (wav_path, _same_speaker_ref(ds, wav_path, utt_id, spk), utt_id, spk)
-        for wav_path, utt_id, spk in ds.items
-    ]
-    print(f"[eval] {name}: same-speaker pairs = {len(work)}")
+    speaker_mode = str(getattr(args, "speaker_mode", "same")).lower()
+    if speaker_mode == "cross":
+        # Different-speaker reference, seeded per item → same pairs every run.
+        ref_seed = int(getattr(args, "ref_seed", 12345))
+        work = [
+            (wav_path, _cross_speaker_ref(ds, spk, random.Random(ref_seed * 1_000_003 + i)),
+             utt_id, spk)
+            for i, (wav_path, utt_id, spk) in enumerate(ds.items)
+        ]
+    else:
+        work = [
+            (wav_path, _same_speaker_ref(ds, wav_path, utt_id, spk), utt_id, spk)
+            for wav_path, utt_id, spk in ds.items
+        ]
+    print(f"[eval] {name}: {speaker_mode}-speaker pairs = {len(work)}")
 
-    out_csv = args.out_csv_tmpl.format(name=name)
+    out_csv = args.out_csv_tmpl.format(name=name, mode=speaker_mode)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
 
     whisper_kw = {
@@ -278,7 +282,7 @@ def eval_ckpt(name: str, ckpt: str, ds: LibriTTSDataset, w_model, args) -> float
 
     mean_wer = float(np.mean(wers)) if wers else float("nan")
     print(f"[eval] {name}: wrote {out_csv}")
-    print(f"[eval] {name}: MEAN same-speaker WER = {mean_wer:.4f}  (n={len(wers)})")
+    print(f"[eval] {name}: MEAN {speaker_mode}-speaker WER = {mean_wer:.4f}  (n={len(wers)})")
 
     # Free GPU memory before the next checkpoint.
     del lit
@@ -287,16 +291,25 @@ def eval_ckpt(name: str, ckpt: str, ds: LibriTTSDataset, w_model, args) -> float
     return mean_wer
 
 
+def _resolve_ckpt(c: str, root: str) -> tuple[str, str]:
+    """Resolve ``--ckpt`` against ``CKPT_ROOT``; return (run_name, absolute_path)."""
+    path = c if os.path.isabs(c) or os.path.isfile(c) else os.path.join(root, c)
+    if not os.path.isfile(path):
+        raise SystemExit(f"[eval] checkpoint not found: {path}")
+    name = Path(path).parent.name
+    return name, path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--ckpts",
-        nargs="+",
-        default=DEFAULT_TARGETS,
-        help="Checkpoint experiment dir names under CKPT_ROOT (or absolute .ckpt paths).",
-    )
-    p.add_argument("--ckpt_file", type=str, default="last.ckpt",
-                   help="Which file inside each experiment dir (last/step_latest/epoch_latest).")
+    p.add_argument("--ckpt", type=str, nargs="+", default=["ecapa_prefix_jh_hubert/step_latest.ckpt"])
+    p.add_argument("--ckpt_root", type=str, default=CKPT_ROOT)
+    p.add_argument("--speaker_mode", type=str, default="same", choices=["same", "cross"],
+                   help="Reference speaker: 'same' (intelligibility upper bound — another "
+                        "utterance of the same speaker) or 'cross' (a different speaker → "
+                        "speaker-transfer VC, exposes content<->speaker leakage).")
+    p.add_argument("--ref_seed", type=int, default=12345,
+                   help="Seed for cross-speaker reference selection (fixed pairs across runs).")
     p.add_argument("--libritts_path", type=str, default="/mnt/data/disk2/LibriTTS")
     p.add_argument("--split_dir", type=str, default="dev-clean",
                    help="LibriTTS subdir for same-speaker eval (dev-clean matches training val).")
@@ -320,23 +333,12 @@ def main():
     p.add_argument("--cpu", action="store_true")
     p.add_argument(
         "--out_csv_tmpl", type=str,
-        default="/mnt/data/disk2/yejin/LiveVoice/wer_same_speaker_{name}.csv",
-        help="Output CSV path template; {name} is replaced per checkpoint.",
+        default="/mnt/data/disk2/yejin/LiveVoice/exp/wer_{mode}_speaker_{name}.csv",
+        help="Output CSV path template; {name}=checkpoint, {mode}=same/cross.",
     )
     args = p.parse_args()
 
-    # Resolve checkpoint paths.
-    targets: list[tuple[str, str]] = []
-    for c in args.ckpts:
-        if c.endswith(".ckpt"):
-            name = Path(c).parent.name
-            path = c
-        else:
-            name = c
-            path = os.path.join(CKPT_ROOT, c, args.ckpt_file)
-        if not os.path.isfile(path):
-            raise SystemExit(f"[eval] checkpoint not found: {path}")
-        targets.append((name, path))
+    targets = [_resolve_ckpt(c, args.ckpt_root) for c in args.ckpt]
 
     # Same-speaker val dataset on the chosen split (paths only; audio loaded full later).
     cfg_ds = LiveVoiceConfig(
@@ -361,7 +363,7 @@ def main():
         print(f"\n{'=' * 70}\n[eval] checkpoint: {name}\n       {path}\n{'=' * 70}")
         results[name] = eval_ckpt(name, path, ds, w_model, args)
 
-    print(f"\n{'=' * 70}\n[eval] SUMMARY — same-speaker mean WER\n{'=' * 70}")
+    print(f"\n{'=' * 70}\n[eval] SUMMARY — {str(args.speaker_mode).lower()}-speaker mean WER\n{'=' * 70}")
     for name, wer in results.items():
         print(f"  {name:35s} : {wer:.4f}")
 
