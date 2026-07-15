@@ -23,6 +23,7 @@ from livevoice.model import (
     build_codec,
     HuBERTContentExtractor,
     StreamVoiceAnonContentEncoder,
+    Sw2vContentEncoder,
     ProsodyExtractor,
     LiveVoiceModel,
 )
@@ -56,13 +57,16 @@ def parse_args():
                    help="Which dataset to use. libritts automatically sets 24 kHz config.")
     p.add_argument("--vctk_path", type=str, default="/mnt/data/disk2/VCTK-Corpus")
     p.add_argument("--libritts_path", type=str, default="/mnt/data/disk2/LibriTTS")
-    p.add_argument("--features_dir", type=str, default="/mnt/data/disk2/yejin/LiveVoice/features",
+    p.add_argument("--features_dir", type=str, default="/mnt/data/disk2/yejin/LiveVoice/features/perturbed",
                    help="Path to precomputed HuBERT features (from extract_features.py). "
                         "E.g. /mnt/data/disk2/yejin/LiveVoice/features")
-    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--val_batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--max_epochs", type=int, default=100)
+    p.add_argument("--max_steps", type=int, default=400000,
+                   help="Stop after this many optimizer steps (e.g. 400000). "
+                        "Training ends when max_steps or max_epochs is hit first.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--audio_duration", type=float, default=4.0)
     p.add_argument("--use_prosody", action="store_true")
@@ -172,7 +176,9 @@ def main():
         # codec=args.codec
     )
 
-    if str(config.content_source).lower() != "hubert":
+    # HuBERT and SW2V both support a precomputed feature cache (features_dir); other
+    # content sources are online-only, so drop the cache path for them.
+    if str(config.content_source).lower() not in ("hubert", "sw2v"):
         config.features_dir = None
 
     print(f"[train] Dataset: {args.dataset}  SR: {config.sample_rate} Hz  "
@@ -191,6 +197,9 @@ def main():
     elif content_source == "streamvoiceanon":
         print("[train] Building StreamVoiceAnon causal content encoder...")
         content_extractor = StreamVoiceAnonContentEncoder(config)
+    elif content_source == "sw2v":
+        print(f"[train] Building SW2V content encoder ({config.sw2v_ckpt})...")
+        content_extractor = Sw2vContentEncoder(config)
     else:
         print(f"[train] content_source={content_source} → skipping HuBERT build")
         content_extractor = None
@@ -247,11 +256,23 @@ def main():
             enable_version_counter=False,
             save_last=False,
         ),
+        # Best WER (logged in on_train_epoch_end as val/wer_full_epoch_mean)
+        ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="wer_best",
+            monitor="val/wer_full_epoch_mean",
+            mode="min",
+            save_top_k=1,
+            enable_version_counter=False,
+            save_last=False,
+            every_n_epochs=1,
+            save_on_train_epoch_end=True,
+        ),
         # EveryNEpochCheckpoint(dirpath=ckpt_dir, every_n_epochs=5),
         LearningRateMonitor(logging_interval="step"),
     ]
 
-    trainer = L.Trainer(
+    trainer_kwargs = dict(
         max_epochs=config.max_epochs,
         precision=config.precision,
         logger=logger,
@@ -261,6 +282,11 @@ def main():
         gradient_clip_val=config.max_grad_norm,
         deterministic=False,
     )
+    if args.max_steps is not None:
+        trainer_kwargs["max_steps"] = int(args.max_steps)
+        print(f"[train] max_steps={args.max_steps}")
+
+    trainer = L.Trainer(**trainer_kwargs)
 
     trainer.fit(lit_model, dm, ckpt_path=args.resume_from)
     print("[train] Done.")

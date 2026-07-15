@@ -175,11 +175,15 @@ class LiveVoiceConfig:
 
     # Content source: how linguistic features are extracted from content audio.
     #   "hubert"        — HuBERT layer-9 hidden states (heavy, bidirectional)
-    #   "mimi_semantic"   — Mimi encoder z, 12.5 fps. Lightweight but not very
-    #                       speaker-invariant in practice.
-    #   "streamvoiceanon" — StreamVoiceAnon causal content tokenizer, 21.5 fps,
-    #                       discrete 8192 semantic tokens.
-    content_source: str = "hubert" 
+    #   "sw2v"            — jhcodec streaming-wav2vec AudioEncoder, 16 kHz, 50 fps,
+    #                       continuous 1024-d (same grid as jhcodec codec tokens).
+    content_source: str = "hubert"
+
+    # SW2V (jhcodec streaming-wav2vec content encoder).
+    sw2v_repo: str = "/workspace/jhcodec"
+    sw2v_config: str = "/workspace/jhcodec/config/config_w2vcossim.json"
+    sw2v_ckpt: str = "/mnt/data/disk3/yejin/jhcodec/sw2v_120000.pt"
+    sw2v_sample_rate: int = 16000
 
     # StreamVoiceAnon causal content tokenizer.
     streamvoiceanon_repo: str = "/workspace/StreamVoiceAnon"
@@ -265,7 +269,10 @@ class LiveVoiceConfig:
 
     # Precomputed HuBERT features (from extract_features.py)
     # Layout: features_dir/{vctk,libritts}/{speaker_id}/{utt_id}.pt
-    features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features"
+    features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/perturbed"
+    # Precomputed SW2V features (from extract_sw2v_features.py). Used instead of
+    # features_dir when content_source=="sw2v". Layout: sw2v_features_dir/libritts/...
+    sw2v_features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/sw2v"
 
     # Debug cap
     max_windows: int | None = None

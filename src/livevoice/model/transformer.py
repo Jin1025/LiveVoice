@@ -278,7 +278,7 @@ class LiveVoiceModel(nn.Module):
         codec_name = str(getattr(config, "codec", "mimi")).lower()
         default_src = "mimi_semantic" if codec_name == "mimi" else "hubert"
         self.content_source = str(getattr(config, "content_source", default_src)).lower()
-        valid_content_sources = {"hubert", "mimi_semantic", "streamvoiceanon"}
+        valid_content_sources = {"hubert", "mimi_semantic", "streamvoiceanon", "sw2v"}
         if self.content_source not in valid_content_sources:
             raise ValueError(
                 f"content_source must be one of {sorted(valid_content_sources)}; "
@@ -297,6 +297,11 @@ class LiveVoiceModel(nn.Module):
             raise ValueError(
                 "content_source='streamvoiceanon' but content_extractor was not provided. "
                 "Pass StreamVoiceAnonContentEncoder."
+            )
+        if self.content_source == "sw2v" and self.content_extractor is None:
+            raise ValueError(
+                "content_source='sw2v' but content_extractor was not provided. "
+                "Pass Sw2vContentEncoder."
             )
         print(
             f"[LiveVoiceModel] content_source={self.content_source}  codec={codec_name}  "
@@ -319,6 +324,13 @@ class LiveVoiceModel(nn.Module):
                 "[LiveVoiceModel] streamvoiceanon = causal semantic tokenizer "
                 f"(content_dim={config.content_proj_dim})"
             )
+        elif self.content_source == "sw2v":
+            # jhcodec streaming-wav2vec: continuous out_dim → content_proj_dim → hidden.
+            sw2v_dim = int(getattr(self.content_extractor, "out_dim", 1024))
+            self.sw2v_proj = nn.Linear(sw2v_dim, config.content_proj_dim)
+            self.sw2v_to_hidden = nn.Linear(config.content_proj_dim, config.hidden_dim)
+            print(f"[LiveVoiceModel] sw2v = jhcodec AudioEncoder (out_dim={sw2v_dim} → "
+                  f"content_proj_dim={config.content_proj_dim})")
 
         # ── Auxiliary CTC head for content alignment ───────────────
         # Predicts character-level text from decoder hidden states. Forces the
@@ -520,6 +532,19 @@ class LiveVoiceModel(nn.Module):
                 return zeros_add, film_raw
             return self.content_extractor.from_precomputed(content_feats), None
 
+        if content_feats is not None and self.content_source == "sw2v":
+            # Fast path: precomputed sw2v features (perturbation already baked into cache).
+            feats = content_feats.to(device=self.sw2v_proj.weight.device,
+                                     dtype=self.sw2v_proj.weight.dtype)
+            sw2v_emb = self.sw2v_proj(feats)                    # (B, T, content_proj_dim)
+            if use_film:
+                zeros_add = torch.zeros(
+                    sw2v_emb.shape[0], sw2v_emb.shape[1], self.config.hidden_dim,
+                    device=sw2v_emb.device, dtype=sw2v_emb.dtype,
+                )
+                return zeros_add, sw2v_emb
+            return self.sw2v_to_hidden(sw2v_emb), None
+
         # Apply perturbation to source audio first (used by both paths below)
         if self.use_content_perturbation and self.training:
             content_audio = self.content_perturbation(content_audio)
@@ -547,6 +572,18 @@ class LiveVoiceModel(nn.Module):
                 )
                 return zeros_add, sva_emb
             return self.streamvoiceanon_to_hidden(sva_emb), None
+
+        # ── SW2V path: jhcodec AudioEncoder → continuous 1024-d → content_proj_dim ──
+        if self.content_source == "sw2v":
+            feat = self.content_extractor(content_audio)      # (B, T_frames, out_dim)
+            sw2v_emb = self.sw2v_proj(feat)                   # (B, T_frames, content_proj_dim)
+            if use_film:
+                zeros_add = torch.zeros(
+                    sw2v_emb.shape[0], sw2v_emb.shape[1], self.config.hidden_dim,
+                    device=sw2v_emb.device, dtype=sw2v_emb.dtype,
+                )
+                return zeros_add, sw2v_emb
+            return self.sw2v_to_hidden(sw2v_emb), None
 
         # ── HuBERT path (legacy) ───────────────────────────────────────────
         if use_film:

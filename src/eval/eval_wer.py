@@ -6,9 +6,6 @@
   * Reference audio = a different utterance from the SAME speaker (LibriTTS val rule).
   * Greedy decoding (temperature=0) — sampling makes VC output stochastic and inflates WER.
 
-Both target checkpoints are jhcodec + HuBERT-content + prefix speaker conditioning;
-they differ only in the speaker encoder (ecapa vs codec-z), auto-detected from the ckpt.
-
 Run:
 
     CUDA_VISIBLE_DEVICES=6 python src/eval/eval_wer.py --speaker_mode same --whisper_model medium --ckpt ecapa_prefix_jh_hubert/step_latest.ckpt
@@ -320,7 +317,7 @@ def main():
     p.add_argument("--n_codebooks", type=int, default=8)
     p.add_argument("--hidden_dim", type=int, default=768)
     p.add_argument("--num_decoder_layers", type=int, default=12)
-    p.add_argument("--speaker_prefix_len", type=int, default=8)
+    p.add_argument("--speaker_prefix_len", type=int, default=4)
     p.add_argument("--cfg_scale", type=float, default=1.0)
     p.add_argument("--whisper_model", type=str, default="medium",
                    help="Whisper model for hyp transcription (GT upper bound used large-v3).")

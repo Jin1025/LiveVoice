@@ -343,6 +343,20 @@ class LiveVoiceLightningModule(L.LightningModule):
         self._spk_encoder = None
         self._spk_encoder_loaded = False
 
+        # Announce the configured val spk_sim encoder at construction so it is visible
+        # immediately at startup (the actual load stays lazy — first on_train_epoch_end —
+        # to avoid holding WavLM-large on the GPU during training). The load-time line
+        # ("[spk_sim] val speaker encoder = ...") still confirms success/failure later.
+        if bool(getattr(config, "log_val_spk_sim", False)):
+            _which = str(getattr(config, "val_spk_encoder", "ecapa")).lower()
+            if _which == "wavlm_tdnn":
+                print(f"[spk_sim] configured val_spk_encoder = wavlm_tdnn "
+                      f"({getattr(config, 'wavlm_sv_variant', 'wavlm_large')}, "
+                      f"ckpt={getattr(config, 'wavlm_sv_ckpt', '?')}) — loads at first epoch end")
+            else:
+                print(f"[spk_sim] configured val_spk_encoder = ecapa "
+                      f"({getattr(config, 'speechbrain_source', '?')}) — loads at first epoch end")
+
         if bool(getattr(config, "use_ctc_loss", False)):
             print(f"[CTC] char-level  vocab_size={getattr(config, 'ctc_vocab_size', '?')}")
 

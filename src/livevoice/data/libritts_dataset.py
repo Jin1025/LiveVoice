@@ -48,13 +48,19 @@ class LibriTTSDataset(Dataset):
         else:
             use_splits = tuple(getattr(config, "libritts_val_splits", default_val))
 
-        feats_base = getattr(config, "features_dir", None)
+        # Pick the feature-cache base by content_source: SW2V and HuBERT have separate
+        # caches (different encoders / dims), so they must not share a directory.
+        content_source = str(getattr(config, "content_source", "hubert")).lower()
+        if content_source == "sw2v":
+            feats_base = getattr(config, "sw2v_features_dir", None)
+        else:
+            feats_base = getattr(config, "features_dir", None)
         self._feats_dir = Path(feats_base) / "libritts" if feats_base else None
         if self._feats_dir is not None and not self._feats_dir.exists():
             print(
-                f"[LibriTTSDataset] WARNING: features_dir set but {self._feats_dir} does not "
-                f"exist → falling back to ONLINE HuBERT every step (slow). Extract features "
-                f"there, or set features_dir=None to make the online path explicit."
+                f"[LibriTTSDataset] WARNING: {content_source} features dir set but {self._feats_dir} "
+                f"does not exist → falling back to ONLINE extraction every step (slow). Extract "
+                f"features there, or set the dir to None to make the online path explicit."
             )
 
         self.speaker_utts: dict[str, list[tuple[str, str]]] = {}

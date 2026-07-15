@@ -37,13 +37,18 @@ class VCTKDataset(Dataset):
         self.target_len = int(round(self.duration * self.target_sr))
         self.pairing = str(getattr(config, "pairing", "same_speaker"))
 
-        feats_base = getattr(config, "features_dir", None)
+        # SW2V and HuBERT use separate caches; pick the base by content_source.
+        content_source = str(getattr(config, "content_source", "hubert")).lower()
+        if content_source == "sw2v":
+            feats_base = getattr(config, "sw2v_features_dir", None)
+        else:
+            feats_base = getattr(config, "features_dir", None)
         self._feats_dir = Path(feats_base) / "vctk" if feats_base else None
         if self._feats_dir is not None and not self._feats_dir.exists():
             print(
-                f"[VCTKDataset] WARNING: features_dir set but {self._feats_dir} does not exist "
-                f"→ falling back to ONLINE HuBERT every step (slow). Extract features there, "
-                f"or set features_dir=None to make the online path explicit."
+                f"[VCTKDataset] WARNING: {content_source} features dir set but {self._feats_dir} "
+                f"does not exist → falling back to ONLINE extraction every step (slow). Extract "
+                f"features there, or set the dir to None to make the online path explicit."
             )
 
         root = Path(config.vctk_path)
