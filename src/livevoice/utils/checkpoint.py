@@ -7,12 +7,17 @@ import torch
 def infer_content_source_from_ckpt(ckpt_path: str) -> str | None:
     """Guess content path from ``state_dict`` keys.
 
-    Returns ``"streamvoiceanon"`` if the StreamVoiceAnon token path exists,
+    Returns ``"sw2v"`` if the SW2V projection weights exist,
+    ``"streamvoiceanon"`` if the StreamVoiceAnon token path exists,
     ``"mimi_semantic"`` if ``model.semantic_proj`` weights exist,
     ``"hubert"`` if HuBERT ``model.content_extractor`` exists, else ``None``.
     """
     obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = obj.get("state_dict", obj)
+    has_sw2v = any(
+        k.startswith("model.sw2v_proj.") or k.startswith("model.sw2v_to_hidden.")
+        for k in sd
+    )
     has_streamvoiceanon = any(
         k.startswith("model.streamvoiceanon_to_hidden.")
         or k.startswith("model.content_extractor.code_embedding.")
@@ -21,6 +26,8 @@ def infer_content_source_from_ckpt(ckpt_path: str) -> str | None:
     )
     has_mimi = any(k.startswith("model.semantic_proj.") for k in sd)
     has_hubert = any(k.startswith("model.content_extractor.") for k in sd)
+    if has_sw2v:
+        return "sw2v"
     if has_streamvoiceanon:
         return "streamvoiceanon"
     if has_mimi:

@@ -40,6 +40,7 @@ from livevoice.lightning import LiveVoiceLightningModule
 from livevoice.model import (
     HuBERTContentExtractor,
     StreamVoiceAnonContentEncoder,
+    Sw2vContentEncoder,
     LiveVoiceModel,
     build_codec,
 )
@@ -181,6 +182,8 @@ def _load_model(cfg: LiveVoiceConfig, ckpt: str, device: torch.device):
         content_extractor = HuBERTContentExtractor(cfg)
     elif cfg.content_source == "streamvoiceanon":
         content_extractor = StreamVoiceAnonContentEncoder(cfg)
+    elif cfg.content_source == "sw2v":
+        content_extractor = Sw2vContentEncoder(cfg)
     else:
         content_extractor = None
     core = LiveVoiceModel(cfg, codec_model, content_extractor, prosody_extractor=None)

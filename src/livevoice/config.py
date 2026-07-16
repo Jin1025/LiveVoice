@@ -177,7 +177,7 @@ class LiveVoiceConfig:
     #   "hubert"        — HuBERT layer-9 hidden states (heavy, bidirectional)
     #   "sw2v"            — jhcodec streaming-wav2vec AudioEncoder, 16 kHz, 50 fps,
     #                       continuous 1024-d (same grid as jhcodec codec tokens).
-    content_source: str = "hubert"
+    content_source: str = "sw2v"
 
     # SW2V (jhcodec streaming-wav2vec content encoder).
     sw2v_repo: str = "/workspace/jhcodec"
