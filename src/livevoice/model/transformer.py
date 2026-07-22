@@ -14,7 +14,9 @@ import torch.nn.functional as F
 
 from livevoice.nn.layer import TransformerBlock, init_kv_cache_ext
 from livevoice.model.content_perturbation import ContentPerturbation
+from livevoice.model.fsq import FSQBottleneck
 from livevoice.model.speechbrain_speaker_encoder import SpeechBrainECAPASpeakerEncoder
+from livevoice.model.spark_speaker_encoder import SparkGlobalSpeakerEncoder
 
 try:
     from tqdm.auto import tqdm
@@ -255,9 +257,9 @@ class LiveVoiceModel(nn.Module):
         if self.speaker_conditioning == "prefix" and int(getattr(config, "speaker_prefix_len", 8)) <= 0:
             raise ValueError("speaker_conditioning='prefix' requires speaker_prefix_len > 0.")
         self.speaker_encoder_type = str(getattr(config, "speaker_encoder_type", "codec")).lower()
-        if self.speaker_encoder_type not in {"codec", "speechbrain_ecapa"}:
+        if self.speaker_encoder_type not in {"codec", "speechbrain_ecapa", "spark_global"}:
             raise ValueError(
-                "speaker_encoder_type must be one of: codec, speechbrain_ecapa; "
+                "speaker_encoder_type must be one of: codec, speechbrain_ecapa, spark_global; "
                 f"got {self.speaker_encoder_type!r}"
             )
         if self.speaker_encoder_type == "speechbrain_ecapa":
@@ -267,6 +269,15 @@ class LiveVoiceModel(nn.Module):
             if self.speaker_conditioning == "prefix":
                 prefix_len = int(getattr(config, "speaker_prefix_len", 8))
                 self.speaker_prefix_proj = nn.Linear(spk_dim, prefix_len * config.hidden_dim)
+        elif self.speaker_encoder_type == "spark_global":
+            # Spark-TTS BiCodec global tokens: a fixed token_num-length sequence of
+            # FSQ-quantized speaker latents. Each token → one decoder prefix token,
+            # so the prefix length is token_num (32), independent of speaker_prefix_len.
+            self.speaker_encoder = SparkGlobalSpeakerEncoder(config)
+            spk_dim = int(self.speaker_encoder.out_dim)
+            self.spark_speaker_proj = nn.Linear(spk_dim, config.hidden_dim)
+            print(f"[LiveVoiceModel] spark_global speaker: token_num={self.speaker_encoder.token_num} "
+                  f"latent={spk_dim} → prefix of {self.speaker_encoder.token_num} tokens")
         else:
             self.speaker_encoder = None
             self.speaker_proj = nn.Linear(latent_dim, config.hidden_dim)
@@ -331,6 +342,15 @@ class LiveVoiceModel(nn.Module):
             self.sw2v_to_hidden = nn.Linear(config.content_proj_dim, config.hidden_dim)
             print(f"[LiveVoiceModel] sw2v = jhcodec AudioEncoder (out_dim={sw2v_dim} → "
                   f"content_proj_dim={config.content_proj_dim})")
+            # Optional FSQ information bottleneck after sw2v_proj (see config.py).
+            if bool(getattr(config, "use_content_fsq", False)):
+                self.content_fsq = FSQBottleneck(
+                    config.content_proj_dim, tuple(getattr(config, "fsq_levels", (8, 5, 5, 5)))
+                )
+                print(f"[LiveVoiceModel] content FSQ bottleneck: levels={self.content_fsq.levels} "
+                      f"→ codebook={self.content_fsq.codebook_size}")
+            else:
+                self.content_fsq = None
 
         # ── Auxiliary CTC head for content alignment ───────────────
         # Predicts character-level text from decoder hidden states. Forces the
@@ -456,6 +476,17 @@ class LiveVoiceModel(nn.Module):
                 spk = self.speaker_proj(emb).unsqueeze(1)
             return spk
 
+        if self.speaker_encoder_type == "spark_global":
+            if reference_audio is None:
+                raise ValueError("reference_audio is required for Spark global speaker encoder.")
+            assert self.speaker_encoder is not None
+            with torch.no_grad():
+                g = self.speaker_encoder(reference_audio)   # (B, token_num, latent)
+            spk = self.spark_speaker_proj(g)                # (B, token_num, hidden)
+            if self.speaker_conditioning == "global_avg":
+                spk = spk.mean(dim=1, keepdim=True)
+            return spk
+
         if reference_z is None:
             if reference_audio is None:
                 raise ValueError("Either reference_audio or reference_z must be provided.")
@@ -537,6 +568,8 @@ class LiveVoiceModel(nn.Module):
             feats = content_feats.to(device=self.sw2v_proj.weight.device,
                                      dtype=self.sw2v_proj.weight.dtype)
             sw2v_emb = self.sw2v_proj(feats)                    # (B, T, content_proj_dim)
+            if self.content_fsq is not None:
+                sw2v_emb = self.content_fsq(sw2v_emb)           # FSQ bottleneck (STE)
             if use_film:
                 zeros_add = torch.zeros(
                     sw2v_emb.shape[0], sw2v_emb.shape[1], self.config.hidden_dim,
@@ -577,6 +610,8 @@ class LiveVoiceModel(nn.Module):
         if self.content_source == "sw2v":
             feat = self.content_extractor(content_audio)      # (B, T_frames, out_dim)
             sw2v_emb = self.sw2v_proj(feat)                   # (B, T_frames, content_proj_dim)
+            if self.content_fsq is not None:
+                sw2v_emb = self.content_fsq(sw2v_emb)         # FSQ bottleneck (STE)
             if use_film:
                 zeros_add = torch.zeros(
                     sw2v_emb.shape[0], sw2v_emb.shape[1], self.config.hidden_dim,

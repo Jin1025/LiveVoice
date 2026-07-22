@@ -113,27 +113,29 @@ class LiveVoiceConfig:
     #   "prefix"     — prepend reference-derived speaker tokens to decoder self-attn
     #                  (decoder-only path; no cross-attention)
     speaker_conditioning: str = "prefix"
-    speaker_prefix_len: int = 4
+    speaker_prefix_len: int = 4 # 4
 
     # Speaker encoder:
     #   "codec"             — codec continuous z (pre-quantization) from reference
     #                         audio. With speaker_conditioning="prefix" this z is
-    #                         projected (speaker_proj) and downsampled to
-    #                         speaker_prefix_len tokens → decoder prefix.
+    #                         projected (speaker_proj) → decoder prefix.
     #   "speechbrain_ecapa" — SpeechBrain ECAPA-TDNN utterance embedding
+    #   "spark_global"      — Spark-TTS BiCodec global tokens: a fixed 32-token
     speaker_encoder_type: str = "speechbrain_ecapa"
     speechbrain_source: str = "speechbrain/spkrec-ecapa-voxceleb"
     speechbrain_savedir: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb"
     speechbrain_sample_rate: int = 16000
     speechbrain_embedding_dim: int = 192
 
-    # Which speaker encoder the *validation* spk_sim metric uses (does NOT affect
-    # the model's own speaker_encoder_type conditioning path):
-    #   "ecapa"      — SpeechBrain ECAPA-TDNN (source above). Same-spk cosine ~0.6.
+    # Spark-TTS BiCodec global-token speaker encoder (speaker_encoder_type="spark_global").
+    # Loads ONLY the global tokenizer (ECAPA→perceiver→FSQ) + mel; Reference is encoded once per utterance.
+    spark_repo: str = "/workspace/Spark-TTS"
+    spark_bicodec_dir: str = "/workspace/Spark-TTS/pretrained_models/Spark-TTS-0.5B/BiCodec"
+    spark_sample_rate: int = 16000
+
+    # Which speaker encoder the *validation* spk_sim metric uses 
+    #   "ecapa"      — SpeechBrain ECAPA-TDNN (source above).
     #   "wavlm_tdnn" — UniSpeech WavLM-large + ECAPA-TDNN head (finetuned .pth).
-    #                  Exactly the encoder Vevo/Amphion report SIM with; higher
-    #                  absolute cosines (GT ~0.75), directly comparable to those tables.
-    #                  Requires s3prl in the env + the finetuned checkpoint below.
     val_spk_encoder: str = "wavlm_tdnn"
     wavlm_sv_ckpt: str = "/mnt/data/disk3/yejin/wavlm_large_finetune.pth"
     wavlm_sv_variant: str = "wavlm_large"   # or "wavlm_base_plus"
@@ -185,6 +187,12 @@ class LiveVoiceConfig:
     sw2v_ckpt: str = "/mnt/data/disk3/yejin/jhcodec/sw2v_120000.pt"
     sw2v_sample_rate: int = 16000
 
+    # FSQ information bottleneck on the content path (StyleStream-style, arXiv:2602.20113).
+    # Applied AFTER sw2v_proj (content_proj_dim), per-frame:
+    #   content_proj_dim → len(fsq_levels) dims → tanh-bound round (STE) → content_proj_dim.
+    use_content_fsq: bool = False
+    fsq_levels: tuple = (5,3,3) # (8,5,5,5)=1000 → (8,6,5)=240 → (5,3,3)=45.
+
     # StreamVoiceAnon causal content tokenizer.
     streamvoiceanon_repo: str = "/workspace/StreamVoiceAnon"
     streamvoiceanon_encoder_config: str = (
@@ -213,27 +221,26 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     use_content_perturbation: bool = True
     perturb_pitch_semitones: float = 4.0    # ±N semitones pitch shift
-    use_vtln: bool = False                  # VTLN formant warp
-    perturb_vtln_alpha_range: float = 0.12  # ±12% VTLN warp range (only if use_vtln=True)
+    use_vtln: bool = True              # Praat formant (VTLN) shift; pitch & timing preserved
+    perturb_formant_ratio_range: float = 0.4  # formant ratio = 1 ± this, FIXED magnitude / random direction (Praat 'Change gender')
     perturb_eq_gain_db: float = 6.0         # ±dB per EQ band (4 bands)
     perturb_prob: float = 1.0               # fraction of batch items to perturb
-
-    # ------------------------------------------------------------------
-    # Training-time Mimi cache
-    # ------------------------------------------------------------------
-    use_mimi_cache: bool = True
-    mimi_cache_dir: str = "/mnt/data/disk2/yejin/LiveVoice/mimi_precomputed"
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     num_audio_log_samples: int = 4
     log_val_wer: bool = True
-    log_val_spk_sim: bool = True   # ECAPA cosine(gen, reference) — speaker-transfer metric
+    log_val_spk_sim: bool = True   # cosine(generated, reference) 
     # Reference speaker for the epoch-end WER / spk_sim eval:
     #   "same"  — same speaker as content (different utterance) → intelligibility UPPER BOUND
     #   "cross" — a different speaker → speaker-transfer VC quality
+    # NOTE: same-speaker is ALWAYS measured (val/wer_full_epoch_mean, val/spk_sim,
+    # val/spk_sim_gt). When val_eval_cross_spk=True, a cross-speaker pass is ALSO
+    # run per item → val/wer_cross + val/spk_sim_cross (the real conversion metric:
+    # does the output adopt a NEW speaker?). This ~doubles generation cost per epoch.
     val_wer_speaker: str = "same"
+    val_eval_cross_spk: bool = True
     wer_whisper_model: str = "base"
     wer_device: str = "cuda"
     wer_epoch_samples: int = 50
@@ -268,10 +275,8 @@ class LiveVoiceConfig:
     libritts_val_splits: tuple[str, ...] = ("dev-clean",) # "dev-other")
 
     # Precomputed HuBERT features (from extract_features.py)
-    # Layout: features_dir/{vctk,libritts}/{speaker_id}/{utt_id}.pt
     features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/perturbed"
-    # Precomputed SW2V features (from extract_sw2v_features.py). Used instead of
-    # features_dir when content_source=="sw2v". Layout: sw2v_features_dir/libritts/...
+    # Precomputed SW2V features (from extract_sw2v_features.py)
     sw2v_features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/sw2v"
 
     # Debug cap

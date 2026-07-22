@@ -771,26 +771,50 @@ class LiveVoiceLightningModule(L.LightningModule):
 
         was_training = self.model.training
         self.model.eval()
-        wers: list[float] = []
-        spk_sims: list[float] = []
+        eval_cross = bool(getattr(self.config, "val_eval_cross_spk", True))
+        # same-speaker: intelligibility upper bound + spk_sim ceiling
+        wers_same: list[float] = []
+        spk_sims_same: list[float] = []
         spk_sims_gt: list[float] = []
+        # cross-speaker: the real conversion metric (does output adopt a new speaker?)
+        wers_cross: list[float] = []
+        spk_sims_cross: list[float] = []          # gen vs TARGET ref — want HIGH
+        spk_sims_cross_src: list[float] = []      # gen vs SOURCE (content) — want LOW
         n_skipped_long = 0
+
+        def _score(ctn: torch.Tensor, ref_path: str, ref_txt: str):
+            """Generate with ref_path as the speaker reference; return (wer, gen, ref)."""
+            ref = _load_full_mono_wav(ref_path, target_sr).unsqueeze(0).to(device)
+            # Codec speaker encoder emits one prefix token per reference frame (~50 fps),
+            # so a full-length reference bloats the sequence (and is off-distribution:
+            # training used audio_duration windows). Trim it to the training window.
+            # ECAPA pools to a fixed speaker_prefix_len, so it keeps the full reference.
+            if str(getattr(self.config, "speaker_encoder_type", "codec")).lower() not in ("speechbrain_ecapa", "spark_global"):
+                ref_max_samples = int(float(getattr(self.config, "audio_duration", 4.0)) * target_sr)
+                if ref.shape[-1] > ref_max_samples:
+                    ref = ref[..., :ref_max_samples]
+            # Greedy decoding (temperature=0 → argmax). Removes sampling
+            # variance so two runs at the same ckpt give the same WER.
+            codes = self.model.generate(
+                reference_audio=ref,
+                content_audio=ctn,
+                temperature=0.0,
+                top_p=None,
+                top_k=None,
+            )
+            gen = self.model.decode_to_audio(codes)
+            wavs = gen.detach().float().cpu()
+            if target_sr != 16000:
+                wavs = torchaudio.functional.resample(wavs, target_sr, 16000)
+            hyp_txt = w.transcribe(wavs[0].numpy(), fp16=False)["text"]
+            return self._word_wer(hyp_txt, ref_txt), gen, ref
+
         try:
             for ix in idxs:
                 wav_path, utt_id, spk = ds.items[ix]
                 ref_txt = _read_libritts_normalized_text(wav_path)
                 if not ref_txt:
                     continue
-                # Reference speaker per config.val_wer_speaker. Fixed across epochs
-                # (val split → deterministic same-spk pick; seeded per item for cross)
-                # so WER/spk_sim trends are comparable epoch to epoch.
-                mode = str(getattr(self.config, "val_wer_speaker", "same")).lower()
-                if mode == "cross":
-                    ref_rng = random.Random(wer_seed * 1_000_003 + ix)
-                    ref_path = _libritts_pick_diff_speaker_ref_path(ds, spk, ref_rng) \
-                        or _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
-                else:  # "same" → intelligibility upper bound
-                    ref_path = _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
                 ctn = _load_full_mono_wav(wav_path, target_sr).unsqueeze(0).to(device)
                 # The model's context is max_seq_len tokens; total generation length =
                 # ref_prefix + ceil(content/hop) + (K-1) must fit. Content longer than
@@ -800,44 +824,49 @@ class LiveVoiceLightningModule(L.LightningModule):
                 if ctn.shape[-1] > int(content_max_sec * target_sr):
                     n_skipped_long += 1
                     continue
-                ref = _load_full_mono_wav(ref_path, target_sr).unsqueeze(0).to(device)
-                # Codec speaker encoder emits one prefix token per reference frame (~50 fps),
-                # so a full-length reference bloats the sequence (and is off-distribution:
-                # training used audio_duration windows). Trim it to the training window.
-                # ECAPA pools to a fixed speaker_prefix_len, so it keeps the full reference.
-                if str(getattr(self.config, "speaker_encoder_type", "codec")).lower() != "speechbrain_ecapa":
-                    ref_max_samples = int(float(getattr(self.config, "audio_duration", 4.0)) * target_sr)
-                    if ref.shape[-1] > ref_max_samples:
-                        ref = ref[..., :ref_max_samples]
-                # Greedy decoding (temperature=0 → argmax). Removes sampling
-                # variance so two runs at the same ckpt give the same WER.
-                codes = self.model.generate(
-                    reference_audio=ref,
-                    content_audio=ctn,
-                    temperature=0.0,
-                    top_p=None,
-                    top_k=None,
-                )
-                gen = self.model.decode_to_audio(codes)
-                wavs = gen.detach().float().cpu()
-                if target_sr != 16000:
-                    wavs = torchaudio.functional.resample(wavs, target_sr, 16000)
-                hyp_txt = w.transcribe(wavs[0].numpy(), fp16=False)["text"]
-                wers.append(self._word_wer(hyp_txt, ref_txt))
-                # Speaker similarity of the converted output vs the reference.
+
+                # Source-speaker embedding (real content audio) — computed once per
+                # item, reused as the same-mode GT ceiling and the cross-mode source
+                # baseline (a good conversion moves AWAY from this).
+                emb_ctn = spk_enc(ctn.detach().float()) if spk_enc is not None else None
+
+                # ── SAME-speaker: intelligibility + spk_sim ceiling. Fixed across
+                # epochs (val split → deterministic same-spk pick) so trends compare. ──
+                same_ref_path = _libritts_pick_ref_path(ds, wav_path, utt_id, spk)
+                wer_s, gen_s, same_ref = _score(ctn, same_ref_path, ref_txt)
+                wers_same.append(wer_s)
                 if spk_enc is not None:
-                    emb_gen = spk_enc(gen.detach().float())
-                    emb_ref = spk_enc(ref.detach().float())
-                    spk_sims.append(
+                    emb_gen = spk_enc(gen_s.detach().float())
+                    emb_ref = spk_enc(same_ref.detach().float())
+                    spk_sims_same.append(
                         F.cosine_similarity(emb_gen, emb_ref, dim=-1).mean().item()
                     )
-                    # GT ceiling: real content audio vs the reference (logged separately,
-                    # not a ratio). For val_wer_speaker="same" this is the intra-speaker
-                    # ECAPA similarity — the max spk_sim the generator could reach.
-                    emb_ctn = spk_enc(ctn.detach().float())
+                    # GT ceiling: real content audio vs the same-speaker reference —
+                    # the intra-speaker similarity, i.e. the max spk_sim reachable.
                     spk_sims_gt.append(
                         F.cosine_similarity(emb_ctn, emb_ref, dim=-1).mean().item()
                     )
+
+                # ── CROSS-speaker: does the output ADOPT a new speaker? Seeded per
+                # item so the same target speaker is used every epoch (comparable). ──
+                if eval_cross:
+                    cross_rng = random.Random(wer_seed * 1_000_003 + ix)
+                    cross_ref_path = _libritts_pick_diff_speaker_ref_path(ds, spk, cross_rng)
+                    if cross_ref_path is not None:
+                        wer_c, gen_c, cross_ref = _score(ctn, cross_ref_path, ref_txt)
+                        wers_cross.append(wer_c)
+                        if spk_enc is not None:
+                            emb_gen_c = spk_enc(gen_c.detach().float())
+                            emb_ref_c = spk_enc(cross_ref.detach().float())
+                            spk_sims_cross.append(
+                                F.cosine_similarity(emb_gen_c, emb_ref_c, dim=-1).mean().item()
+                            )
+                            # Source leakage: converted output vs the SOURCE speaker.
+                            # Want LOW — the output should move away from the content
+                            # speaker toward the target reference.
+                            spk_sims_cross_src.append(
+                                F.cosine_similarity(emb_gen_c, emb_ctn, dim=-1).mean().item()
+                            )
         finally:
             if was_training:
                 self.model.train()
@@ -846,27 +875,29 @@ class LiveVoiceLightningModule(L.LightningModule):
             print(f"[WER] skipped {n_skipped_long}/{n} val items longer than "
                   f"{float(getattr(self.config, 'val_max_content_sec', 15.0)):g}s "
                   f"(exceed model context {self.config.max_seq_len} tokens).")
-        if not wers:
+        if not wers_same:
             raise RuntimeError(
                 "log_val_wer=True but no LibriTTS normalized transcripts found for sampled val items."
             )
-        wer_mean = float(sum(wers) / len(wers))
         step = int(getattr(self.trainer, "global_step", self.global_step))
-        self.log("val/wer_full_epoch_mean", wer_mean, on_epoch=True, sync_dist=True, prog_bar=False)
         exp = getattr(self.logger, "experiment", None)
-        if exp is not None and hasattr(exp, "log"):
-            exp.log({"val/wer_full_epoch_mean": wer_mean}, step=step)
 
-        if spk_sims:
-            spk_sim_mean = float(sum(spk_sims) / len(spk_sims))
-            self.log("val/spk_sim", spk_sim_mean, on_epoch=True, sync_dist=True, prog_bar=True)
+        def _log(key: str, values: list[float], prog_bar: bool = False):
+            if not values:
+                return
+            mean = float(sum(values) / len(values))
+            self.log(key, mean, on_epoch=True, sync_dist=True, prog_bar=prog_bar)
             if exp is not None and hasattr(exp, "log"):
-                exp.log({"val/spk_sim": spk_sim_mean}, step=step)
-        if spk_sims_gt:
-            spk_sim_gt_mean = float(sum(spk_sims_gt) / len(spk_sims_gt))
-            self.log("val/spk_sim_gt", spk_sim_gt_mean, on_epoch=True, sync_dist=True, prog_bar=False)
-            if exp is not None and hasattr(exp, "log"):
-                exp.log({"val/spk_sim_gt": spk_sim_gt_mean}, step=step)
+                exp.log({key: mean}, step=step)
+
+        # same-speaker (keep val/wer_full_epoch_mean + val/spk_sim names for continuity)
+        _log("val/wer_full_epoch_mean", wers_same)
+        _log("val/spk_sim", spk_sims_same, prog_bar=True)
+        _log("val/spk_sim_gt", spk_sims_gt)
+        # cross-speaker (the actual conversion quality)
+        _log("val/wer_cross", wers_cross)
+        _log("val/spk_sim_cross", spk_sims_cross, prog_bar=True)       # → target (HIGH)
+        _log("val/spk_sim_cross_src", spk_sims_cross_src)              # → source (LOW)
 
     @torch.no_grad()
     def _log_vc_sample(

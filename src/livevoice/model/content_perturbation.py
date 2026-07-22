@@ -6,7 +6,9 @@ the model is forced to pull speaker info from the reference path rather than fro
 
 Three transforms applied in sequence during training only:
   1. Pitch shift  ±pitch_shift_semitones  (torchaudio phase vocoder, GPU-compatible)
-  2. VTLN formant shift via resample trick  ±vtln_alpha_range  (approximates vocal tract warp)
+  2. Formant (VTLN) shift via Praat 'Change gender'  formant ratio 1±formant_ratio_range
+     — warps the vocal-tract/gender while PRESERVING pitch and duration (so content
+     stays frame-aligned). Replaces the old resample round-trip, which was a no-op.
   3. 4-band random EQ  ±eq_gain_db  (spectral tilt scramble)
 
 All operations are applied per-sample (different random draw per item in the batch),
@@ -15,10 +17,23 @@ using a simple Python loop to allow per-sample random parameters.
 from __future__ import annotations
 
 import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+
+# Lazy Praat/parselmouth handle (CPU formant shifter; imported on first use).
+_PARSELMOUTH = None
+
+
+def _get_parselmouth():
+    global _PARSELMOUTH
+    if _PARSELMOUTH is None:
+        import parselmouth
+        from parselmouth.praat import call
+        _PARSELMOUTH = (parselmouth, call)
+    return _PARSELMOUTH
 
 
 class ContentPerturbation(nn.Module):
@@ -29,7 +44,10 @@ class ContentPerturbation(nn.Module):
         self.sr = int(config.sample_rate)
         self.pitch_max = float(getattr(config, "perturb_pitch_semitones", 4.0))
         self.use_vtln = bool(getattr(config, "use_vtln", False))
-        self.vtln_range = float(getattr(config, "perturb_vtln_alpha_range", 0.12))
+        self.formant_range = float(
+            getattr(config, "perturb_formant_ratio_range",
+                    getattr(config, "perturb_vtln_alpha_range", 0.25))
+        )
         self.eq_gain_db = float(getattr(config, "perturb_eq_gain_db", 6.0))
         self.p = float(getattr(config, "perturb_prob", 1.0))
 
@@ -63,22 +81,32 @@ class ContentPerturbation(nn.Module):
                     except Exception:
                         pass
 
-            # 2. VTLN-style formant shift via resample trick
-            #    Done on CPU: arbitrary int(sr*alpha) ratios have huge LCM with sr,
-            #    causing torchaudio to allocate enormous sinc filter tensors on GPU.
-            if self.use_vtln and self.vtln_range > 0:
-                alpha = 1.0 + random.uniform(-self.vtln_range, self.vtln_range)
-                if abs(alpha - 1.0) > 0.02:
+            # 2. Formant (VTLN) shift via Praat 'Change gender' (CPU).
+            #    ratio > 1 → formants up (more feminine/child), < 1 → down (more
+            #    masculine). new_pitch_median=0 keeps pitch, duration_factor=1 keeps
+            #    timing, so the perturbed content stays aligned with the codec grid.
+            #    FIXED magnitude (formant_range), random direction → every sample
+            #    gets a real warp (no near-zero no-ops), matching the pitch shift.
+            if self.use_vtln and self.formant_range > 0:
+                sign = -1.0 if random.random() < 0.5 else 1.0
+                ratio = 1.0 + sign * self.formant_range   # e.g. 0.25 → 0.75 or 1.25
+                if abs(ratio - 1.0) > 0.02:
                     orig_len = x.shape[-1]
-                    shifted_sr = max(8000, int(self.sr * alpha))
-                    x_cpu = x.cpu()
-                    x_cpu = torchaudio.functional.resample(x_cpu, self.sr, shifted_sr)
-                    x_cpu = torchaudio.functional.resample(x_cpu, shifted_sr, self.sr)
-                    if x_cpu.shape[-1] > orig_len:
-                        x_cpu = x_cpu[..., :orig_len]
-                    elif x_cpu.shape[-1] < orig_len:
-                        x_cpu = F.pad(x_cpu, (0, orig_len - x_cpu.shape[-1]))
-                    x = x_cpu.to(device)
+                    try:
+                        parselmouth, call = _get_parselmouth()
+                        x_np = x.squeeze(0).detach().cpu().numpy().astype("float64")
+                        snd = parselmouth.Sound(x_np, sampling_frequency=float(self.sr))
+                        out = call(snd, "Change gender", 75, 600, float(ratio), 0.0, 1.0, 1.0)
+                        y = torch.from_numpy(
+                            np.asarray(out.values).squeeze().astype("float32")
+                        )
+                        if y.shape[-1] > orig_len:
+                            y = y[..., :orig_len]
+                        elif y.shape[-1] < orig_len:
+                            y = F.pad(y, (0, orig_len - y.shape[-1]))
+                        x = y.unsqueeze(0).to(device)
+                    except Exception:
+                        pass  # short/silent segment — leave pitch-shifted audio as-is
 
             # 3. 4-band random EQ
             if self.eq_gain_db > 0:

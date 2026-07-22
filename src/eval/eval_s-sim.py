@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Speaker similarity: cosine(ref_emb, gen_emb) with one or two embedders.
+"""Speaker similarity (WavLM-TDNN) — GT ceiling/floor and/or your VC model.
 
-Embedders:
-  - **ecapa** (default): SpeechBrain ``speechbrain/spkrec-ecapa-voxceleb``
-  - **wavlm**: UniSpeech-style frozen WavLM + finetuned ECAPA-TDNN head
-    ([microsoft/UniSpeech speaker_verification](https://github.com/microsoft/UniSpeech/tree/main/downstreams/speaker_verification))
+Embedder is ALWAYS UniSpeech WavLM-large + finetuned ECAPA-TDNN head
+(github.com/microsoft/UniSpeech/tree/main/downstreams/speaker_verification),
+loaded as ``--model_name wavlm_large`` (feat_dim=1024, WavLM upstream).
 
-Modes:
-  1) **Pairwise**: --ref_wav/--gen_wav, --pairs_csv, or --ref_dir/--gen_dir
-  2) **LibriTTS test-clean VC** (--libritts_test_clean): cross-speaker ref, VC from ckpt
+Two axes:
+  --mode  {same, cross}     which speaker the reference comes from
+  --gt                      measure GROUND-TRUTH s-sim only (no model): cos(real
+                            content utt, ref utt). same→intra-spk ceiling (~0.66),
+                            cross→inter-spk floor (~0.10). Verify this is sane
+                            BEFORE trusting model numbers.
+  (default, no --gt)        run your VC ckpt: cos(gen, ref) AND the GT ceiling
+                            cos(content, ref) side by side.
 
-LibriTTS VC example (both metrics):
-    CUDA_VISIBLE_DEVICES=0 python scripts/eval_s-sim.py --libritts_test_clean \\
-        --embedder both \\
-        --wavlm_ckpt /path/to/WavLM_large_finetune.pth \\
-        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/mimi_semantic_new/step_latest.ckpt \\
-        --out_csv /mnt/data/disk2/yejin/LiveVoice/ssim_mimi_semantic_new_test_clean.csv
+Datasets (same speaker/chapter/utt layout):
+  --dataset libritts    (default)  root/<split>/<spk>/<chap>/*.wav
+  --dataset librispeech            root/<split>/<spk>/<chap>/*.flac
 
-Dependencies:
-    pip install speechbrain>=1.1.0 "huggingface-hub>=0.23,<1.0"
-    # WavLM-TDNN (--embedder wavlm|both):
-    pip install s3prl --no-deps   # or UniSpeech README pin
-    # Download finetuned head: WavLM large (No fix pre-train) from UniSpeech README table
+Examples:
+  # 1) GT sanity first (no model), WavLM-TDNN, LibriSpeech/LibriTTS test-clean:
+  python eval/eval_s-sim.py --gt --mode same  --dataset librispeech  --root /mnt/data/disk2/LibriSpeech --split test-clean 
+  python eval/eval_s-sim.py --gt --mode same --dataset libritts --root /mnt/data/disk2/LibriTTS --split test-clean
+
+  # 2) Your model (cross-speaker VC), GT ceiling logged alongside:
+  CUDA_VISIBLE_DEVICES=0 python eval/eval_s-sim.py --mode cross --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/<run>/step_latest.ckpt --out_csv /mnt/data/disk2/yejin/LiveVoice/ssim_<run>_cross.csv
 """
 from __future__ import annotations
 
@@ -30,7 +33,6 @@ import csv
 import os
 import random
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -43,22 +45,14 @@ import soundfile as sf
 from tqdm import tqdm
 
 from livevoice.config import LiveVoiceConfig
-from livevoice.data.libritts_dataset import LibriTTSDataset
-from livevoice.lightning import LiveVoiceLightningModule
-from livevoice.model import (
-    HuBERTContentExtractor,
-    StreamVoiceAnonContentEncoder,
-    LiveVoiceModel,
-    build_codec,
-)
-from livevoice.utils.checkpoint import (
-    infer_content_source_from_ckpt,
-    infer_speaker_conditioning_from_ckpt,
-    infer_speaker_encoder_from_ckpt,
-    load_model_weights_from_ckpt,
-)
+from livevoice.evaluation.unispeech_sv import UniSpeechWavLMTDNNEmbedder
+
+EMBED_SR = 16000  # WavLM upstream is 16 kHz
 
 
+# ──────────────────────────────────────────────────────────────────────
+#  Audio
+# ──────────────────────────────────────────────────────────────────────
 def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
     try:
         with sf.SoundFile(path) as f:
@@ -74,651 +68,277 @@ def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
     return audio / (audio.abs().max() + 1e-8)
 
 
-def _pick_cross_speaker_ref(
-    speaker_utts: dict[str, list[tuple[str, str]]],
-    content_spk: str,
-    rng: random.Random,
-) -> tuple[str, str]:
-    """Ref = one arbitrary utterance from a speaker id != content_spk."""
-    other = [s for s in speaker_utts if s != content_spk]
-    if not other:
-        raise RuntimeError(f"No other speaker for content speaker {content_spk}")
-    ref_spk = rng.choice(other)
-    ref_path, _ = rng.choice(speaker_utts[ref_spk])
-    return ref_path, ref_spk
-
-
-def _build_vc_config(args: argparse.Namespace) -> LiveVoiceConfig:
-    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-    codec = str(args.codec).lower()
-    sample_rate = 24000 if codec == "mimi" else 16000
-    dac_model_type = getattr(args, "dac_model_type", "16khz")
-    dac_sample_rate = 16000 if dac_model_type == "16khz" else sample_rate
-    return LiveVoiceConfig(
-        device=device,
-        codec=codec,
-        sample_rate=sample_rate,
-        dac_model_type=dac_model_type,
-        dac_sample_rate=dac_sample_rate,
-        hidden_dim=int(args.hidden_dim),
-        num_decoder_layers=int(args.num_decoder_layers),
-        ffn_dim=4 * int(args.hidden_dim),
-        n_codebooks_predict=int(args.n_codebooks),
-        content_source=str(args.content_source).lower(),
-        speaker_conditioning=str(args.speaker_conditioning).lower(),
-        speaker_prefix_len=int(args.speaker_prefix_len),
-        speaker_encoder_type=str(args.speaker_encoder_type).lower(),
-        speechbrain_source=args.speechbrain_source,
-        speechbrain_savedir=args.speechbrain_savedir,
-        speechbrain_sample_rate=int(args.speechbrain_sample_rate),
-        speechbrain_embedding_dim=int(args.speechbrain_embedding_dim),
-        streamvoiceanon_repo=args.streamvoiceanon_repo,
-        streamvoiceanon_encoder_config=args.streamvoiceanon_encoder_config,
-        streamvoiceanon_encoder_ckpt=args.streamvoiceanon_encoder_ckpt,
-        features_dir=None,
-        output_dir=args.output_dir,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Speaker embedders: SpeechBrain ECAPA + UniSpeech WavLM-TDNN
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _try_encoder_classifier():
-    try:
-        from speechbrain.inference.classifiers import EncoderClassifier
-
-        return EncoderClassifier
-    except ImportError:
-        pass
-    try:
-        from speechbrain.pretrained import EncoderClassifier  # type: ignore
-
-        return EncoderClassifier
-    except ImportError as e:
-        raise ImportError(
-            "Install SpeechBrain in the active env, e.g.\n"
-            "  pip install 'speechbrain>=1.1.0' 'huggingface-hub>=0.23,<1.0'\n"
-            f"Original error: {e}"
-        ) from e
-
-
-def _load_mono(path: str, target_sr: int, max_sec: float | None) -> torch.Tensor:
-    """Load mono wav without torchaudio.load (2.9+ may require torchcodec)."""
-    wav = _load_full_mono_wav(path, target_sr)
-    if max_sec is not None and max_sec > 0:
-        n = int(max_sec * target_sr)
-        if wav.numel() > n:
-            wav = wav[:n]
-    return wav
-
-
-def _waveform_for_embedder(wav: torch.Tensor, src_sr: int, target_sr: int) -> torch.Tensor:
-    """Mono (T,) float, peak-normalized at embedder sample rate."""
-    w = wav.detach().float().cpu().reshape(-1)
-    if src_sr != target_sr:
-        w = torchaudio.functional.resample(w.unsqueeze(0), src_sr, target_sr).squeeze(0)
-    peak = w.abs().max().clamp(min=1e-8)
-    return w / peak
-
-
-class ECAPASpeakerEmbedder:
-    """SpeechBrain ECAPA-TDNN (VoxCeleb)."""
-
-    def __init__(self, source: str, device: str, savedir: str | None = None):
-        EncoderClassifier = _try_encoder_classifier()
-        self.device = device
-        self.savedir = savedir or os.path.join(
-            tempfile.gettempdir(), "speechbrain_spkrec_cache", source.replace("/", "__")
-        )
-        os.makedirs(self.savedir, exist_ok=True)
-        self.model = EncoderClassifier.from_hparams(
-            source=source,
-            savedir=self.savedir,
-            run_opts={"device": device},
-        )
-        self.sample_rate = int(getattr(self.model.hparams, "sample_rate", 16000))
-
-    @torch.no_grad()
-    def embed(self, waveform: torch.Tensor) -> torch.Tensor:
-        wav = waveform.unsqueeze(0).to(self.device)
-        emb = self.model.encode_batch(wav)
-        if emb.dim() > 1:
-            emb = emb.squeeze(0)
-        return emb.reshape(-1).float()
-
-
-def _parse_embedder(s: str) -> set[str]:
-    s = s.lower().strip()
-    if s == "both":
-        return {"ecapa", "wavlm"}
-    if s in ("ecapa", "wavlm"):
-        return {s}
-    raise ValueError(f"--embedder must be ecapa, wavlm, or both; got {s!r}")
-
-
-def _build_embedders(args: argparse.Namespace) -> dict:
-    kinds = _parse_embedder(args.embedder)
-    out: dict = {}
-    if "ecapa" in kinds:
-        print(f"[s-sim] Loading ECAPA embedder {args.speechbrain_source!r} ...")
-        out["ecapa"] = ECAPASpeakerEmbedder(
-            source=args.speechbrain_source,
-            device=args.device,
-            savedir=args.speechbrain_savedir,
-        )
-    if "wavlm" in kinds:
-        if not args.wavlm_ckpt:
-            raise SystemExit("--embedder wavlm|both requires --wavlm_ckpt (UniSpeech finetuned .pth)")
-        from livevoice.evaluation.unispeech_sv import UniSpeechWavLMTDNNEmbedder
-
-        print(
-            f"[s-sim] Loading UniSpeech WavLM-TDNN ({args.wavlm_variant}) "
-            f"from {args.wavlm_ckpt!r} ..."
-        )
-        out["wavlm"] = UniSpeechWavLMTDNNEmbedder(
-            checkpoint=args.wavlm_ckpt,
-            device=args.device,
-            variant=args.wavlm_variant,
-        )
-    return out
-
-
-def _embed_pair(
-    embedders: dict,
-    ref_w: torch.Tensor,
-    gen_w: torch.Tensor,
-    ref_sr: int,
-    gen_sr: int,
-) -> dict[str, float]:
-    """Return cosine per embedder key; values may be nan on failure."""
-    sims: dict[str, float] = {}
-    for name, emb in embedders.items():
-        sr = emb.sample_rate
-        rw = _waveform_for_embedder(ref_w, ref_sr, sr)
-        gw = _waveform_for_embedder(gen_w, gen_sr, sr)
-        er = emb.embed(rw)
-        eg = emb.embed(gw)
-        sims[name] = _cosine(er, eg)
-    return sims
-
-
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item())
 
 
-def _load_pairs_csv(path: Path) -> list[tuple[str, str]]:
-    rows: list[tuple[str, str]] = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        if not r.fieldnames:
-            raise ValueError("empty CSV or no header")
-        fn = {h.lower().strip(): h for h in r.fieldnames}
-        rk = fn.get("ref_wav") or fn.get("reference") or fn.get("ref")
-        gk = fn.get("gen_wav") or fn.get("generated") or fn.get("gen")
-        if not rk or not gk:
-            raise ValueError(
-                f"CSV needs columns ref_wav,gen_wav (or reference,generated). Got: {r.fieldnames}"
-            )
-        for row in r:
-            ra = (row.get(rk) or "").strip()
-            gb = (row.get(gk) or "").strip()
-            if ra and gb:
-                rows.append((ra, gb))
-    return rows
+# ──────────────────────────────────────────────────────────────────────
+#  Dataset: LibriTTS (.wav) / LibriSpeech (.flac), speaker/chapter/utt layout
+# ──────────────────────────────────────────────────────────────────────
+def _duration_sec(path: str) -> float:
+    """Utterance length in seconds from the header only (no decode)."""
+    try:
+        info = sf.info(path)
+        return info.frames / float(info.samplerate)
+    except Exception:
+        return -1.0
 
 
-def _pairs_from_dirs(ref_dir: Path, gen_dir: Path) -> list[tuple[str, str]]:
-    refs = {p.name: p for p in ref_dir.glob("*.wav")}
-    gens = {p.name: p for p in gen_dir.glob("*.wav")}
-    names = sorted(set(refs) & set(gens))
-    if not names:
-        raise FileNotFoundError(f"No matching *.wav names under {ref_dir} and {gen_dir}")
-    return [(str(refs[n]), str(gens[n])) for n in names]
+def _build_speaker_utts(dataset, root, split, seed, max_items, min_dur=None, max_dur=None):
+    base = Path(root) / split
+    if not base.exists():
+        raise SystemExit(f"dataset split not found: {base}")
+    ext = "flac" if dataset == "librispeech" else "wav"
+    files = sorted(base.glob(f"**/*.{ext}"))
+    if not files:
+        raise SystemExit(f"no *.{ext} under {base}")
+
+    lo = float(min_dur) if min_dur else None
+    hi = float(max_dur) if max_dur else None
+    do_filter = lo is not None or hi is not None
+
+    speaker_utts: dict[str, list[tuple[str, str]]] = {}
+    n_kept = total_sec = 0
+    for wav in tqdm(files, desc="scan durations") if do_filter else [(w) for w in files]:
+        if do_filter:
+            d = _duration_sec(str(wav))
+            if d < 0 or (lo is not None and d < lo) or (hi is not None and d > hi):
+                continue
+            n_kept += 1
+            total_sec += d
+        speaker_utts.setdefault(wav.parts[-3], []).append((str(wav), wav.stem))
+    if not speaker_utts:
+        raise SystemExit(f"no *.{ext} left after duration filter [{lo}, {hi}]s under {base}")
+    if do_filter:
+        print(f"[s-sim] duration filter [{lo}, {hi}]s → kept {n_kept}/{len(files)} "
+              f"utts ({total_sec/3600:.2f} h)")
+
+    items = [(p, u, s) for s, us in speaker_utts.items() for (p, u) in us]
+    random.Random(seed).shuffle(items)
+    if max_items:
+        items = items[: int(max_items)]
+    return items, speaker_utts
 
 
-def _done_key(row: dict) -> str:
-    c = (row.get("content_wav") or row.get("wav_path") or "").strip()
-    r = (row.get("ref_wav") or row.get("ref_path") or "").strip()
-    if c and r:
-        return f"{c}\t{r}"
-    return c or r
-
-
-def _load_done(csv_path: str) -> set[str]:
-    if not os.path.isfile(csv_path):
-        return set()
-    out: set[str] = set()
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            k = _done_key(row)
-            if k:
-                out.add(k)
-    return out
+def _pick_ref(speaker_utts, content_spk, content_path, mode, rng):
+    """same → different utt of the SAME speaker; cross → any utt of ANOTHER speaker."""
+    if mode == "same":
+        cands = [(p, u) for (p, u) in speaker_utts[content_spk] if p != content_path]
+        if not cands:
+            return None, None
+        p, _ = rng.choice(cands)
+        return p, content_spk
+    others = [s for s in speaker_utts if s != content_spk]
+    if not others:
+        return None, None
+    rs = rng.choice(others)
+    p, _ = rng.choice(speaker_utts[rs])
+    return p, rs
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  LibriTTS test-clean: cross-speaker VC + speaker similarity
+#  VC model (jhcodec + sw2v/hubert + ecapa/spark_global), auto from ckpt
 # ──────────────────────────────────────────────────────────────────────
+def _build_vc_model(ckpt: str, device: torch.device, args):
+    from livevoice.model import (
+        HuBERTContentExtractor,
+        StreamVoiceAnonContentEncoder,
+        Sw2vContentEncoder,
+        LiveVoiceModel,
+        build_codec,
+    )
+    from livevoice.lightning import LiveVoiceLightningModule
+    from livevoice.utils.checkpoint import (
+        infer_content_source_from_ckpt,
+        infer_speaker_conditioning_from_ckpt,
+        infer_speaker_encoder_from_ckpt,
+        infer_content_fsq_from_ckpt,
+    )
 
+    content_source = infer_content_source_from_ckpt(ckpt) or "hubert"
+    speaker_conditioning = infer_speaker_conditioning_from_ckpt(ckpt) or "prefix"
+    speaker_encoder_type = infer_speaker_encoder_from_ckpt(ckpt) or "codec"
+    fsq_levels = infer_content_fsq_from_ckpt(ckpt)
+    print(
+        f"[s-sim] ckpt inferred: content_source={content_source} "
+        f"speaker_conditioning={speaker_conditioning} speaker_encoder_type={speaker_encoder_type} "
+        f"content_fsq={fsq_levels if fsq_levels else 'off'}"
+    )
 
-def run_libritts_test_clean(args: argparse.Namespace) -> None:
-    if not args.ckpt:
-        raise SystemExit("--libritts_test_clean requires --ckpt")
-
-    content_source = str(args.content_source).lower()
-    if content_source == "auto":
-        inferred = infer_content_source_from_ckpt(args.ckpt)
-        if inferred is None:
-            raise SystemExit(
-                "Could not infer content_source from ckpt. "
-                "Pass --content_source hubert, mimi_semantic, or streamvoiceanon."
-            )
-        content_source = inferred
-        print(f"[s-sim] content_source=auto → {content_source!r}")
-    args.content_source = content_source
-
-    speaker_conditioning = str(args.speaker_conditioning).lower()
-    if speaker_conditioning == "auto":
-        inferred_spk = infer_speaker_conditioning_from_ckpt(args.ckpt)
-        if inferred_spk is None:
-            inferred_spk = "prefix"
-            print("[s-sim] speaker_conditioning=auto → 'prefix' (fallback; ckpt keys ambiguous)")
-        else:
-            print(f"[s-sim] speaker_conditioning=auto → {inferred_spk!r}")
-        speaker_conditioning = inferred_spk
-    args.speaker_conditioning = speaker_conditioning
-
-    speaker_encoder_type = str(args.speaker_encoder_type).lower()
-    if speaker_encoder_type == "auto":
-        inferred_enc = infer_speaker_encoder_from_ckpt(args.ckpt)
-        if inferred_enc is None:
-            inferred_enc = "codec"
-            print("[s-sim] speaker_encoder_type=auto → 'codec' (fallback; ckpt keys ambiguous)")
-        else:
-            print(f"[s-sim] speaker_encoder_type=auto → {inferred_enc!r}")
-        speaker_encoder_type = inferred_enc
-    args.speaker_encoder_type = speaker_encoder_type
-
-    cfg_model = _build_vc_config(args)
-    if cfg_model.content_source == "mimi_semantic" and cfg_model.codec != "mimi":
-        raise SystemExit("content_source=mimi_semantic requires --codec mimi")
-
-    cfg_ds = LiveVoiceConfig(
-        libritts_path=args.libritts_path,
-        libritts_val_splits=(args.split_dir,),
-        sample_rate=cfg_model.sample_rate,
-        max_windows=args.max_items,
-        seed=int(args.seed),
-        pairing="same_speaker",
-        audio_duration=4.0,
+    cfg = LiveVoiceConfig(
+        device=str(device),
+        codec="jhcodec",
+        sample_rate=16000,
+        hidden_dim=int(args.hidden_dim),
+        num_decoder_layers=int(args.num_decoder_layers),
+        ffn_dim=4 * int(args.hidden_dim),
+        n_codebooks_predict=int(args.n_codebooks),
+        content_source=content_source,
+        speaker_conditioning=speaker_conditioning,
+        speaker_prefix_len=int(args.speaker_prefix_len),
+        speaker_encoder_type=speaker_encoder_type,
+        use_content_fsq=fsq_levels is not None,
+        fsq_levels=fsq_levels if fsq_levels is not None else (8, 5, 5, 5),
         features_dir=None,
     )
-    ds = LibriTTSDataset(cfg_ds, split="val")
-    speaker_utts = ds.speaker_utts
-    rng = random.Random(int(args.ref_seed))
-
-    print(
-        f"[s-sim] mode=libritts_cross_speaker_vc  split={args.split_dir}  "
-        f"utterances={len(ds.items)}  speakers={len(speaker_utts)}"
-    )
-    print(
-        f"[s-sim] ckpt={args.ckpt}  codec={cfg_model.codec}  "
-        f"content_source={cfg_model.content_source}  "
-        f"speaker_conditioning={cfg_model.speaker_conditioning}  "
-        f"speaker_encoder_type={cfg_model.speaker_encoder_type}"
-    )
-
-    target_sr = int(cfg_model.sample_rate)
-    dev = torch.device(cfg_model.device if torch.cuda.is_available() and not args.cpu else "cpu")
-
-    print("[s-sim] Building VC model...")
-    codec_model = build_codec(cfg_model)
-    if cfg_model.content_source == "hubert":
-        content_extractor = HuBERTContentExtractor(cfg_model)
-    elif cfg_model.content_source == "streamvoiceanon":
-        content_extractor = StreamVoiceAnonContentEncoder(cfg_model)
+    codec_model = build_codec(cfg)
+    if cfg.content_source == "hubert":
+        content_extractor = HuBERTContentExtractor(cfg)
+    elif cfg.content_source == "streamvoiceanon":
+        content_extractor = StreamVoiceAnonContentEncoder(cfg)
+    elif cfg.content_source == "sw2v":
+        content_extractor = Sw2vContentEncoder(cfg)
     else:
         content_extractor = None
-    core = LiveVoiceModel(cfg_model, codec_model, content_extractor, prosody_extractor=None)
-    missing, unexpected = load_model_weights_from_ckpt(
-        core, args.ckpt, log_prefix="[s-sim]"
-    )
-    if missing:
-        print(f"[s-sim] warn: {len(missing)} missing keys (first 3): {missing[:3]}")
-    if unexpected:
-        print(f"[s-sim] warn: {len(unexpected)} unexpected keys (first 3): {unexpected[:3]}")
-    lit = LiveVoiceLightningModule(cfg_model, core)
+    core = LiveVoiceModel(cfg, codec_model, content_extractor, prosody_extractor=None)
+    lit = LiveVoiceLightningModule.load_from_checkpoint(ckpt, config=cfg, model=core, strict=False)
     lit.eval()
-    lit = lit.to(dev)
+    return lit.to(device), cfg
 
-    embedders = _build_embedders(args)
-    ecapa_sr = embedders["ecapa"].sample_rate if "ecapa" in embedders else 16000
+
+# ──────────────────────────────────────────────────────────────────────
+#  Main dataset run
+# ──────────────────────────────────────────────────────────────────────
+def run(args) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"[s-sim] Loading WavLM-TDNN ({args.wavlm_variant}) from {args.wavlm_ckpt!r} ...")
+    embedder = UniSpeechWavLMTDNNEmbedder(
+        checkpoint=args.wavlm_ckpt, device=str(device), variant=args.wavlm_variant
+    )
+
+    items, speaker_utts = _build_speaker_utts(
+        args.dataset, args.root, args.split, int(args.seed), args.max_items,
+        min_dur=args.min_dur, max_dur=args.max_dur,
+    )
+    rng = random.Random(int(args.ref_seed))
+    print(
+        f"[s-sim] dataset={args.dataset} split={args.split} mode={args.mode} "
+        f"gt_only={bool(args.gt)} utts={len(items)} speakers={len(speaker_utts)}"
+    )
+
+    lit = model_sr = None
+    if not args.gt:
+        if not args.ckpt:
+            raise SystemExit("model mode requires --ckpt (or pass --gt for GT-only).")
+        print("[s-sim] Building VC model ...")
+        lit, cfg = _build_vc_model(args.ckpt, device, args)
+        model_sr = int(cfg.sample_rate)
+        content_max_sec = float(args.max_content_sec)
+        keep_full_ref = str(cfg.speaker_encoder_type).lower() in ("speechbrain_ecapa", "spark_global")
 
     out_csv = args.out_csv
-    out_parent = os.path.dirname(out_csv)
-    if out_parent:
-        os.makedirs(out_parent, exist_ok=True)
-    done = _load_done(out_csv) if args.resume else set()
-    csv_mode = "a" if args.resume else "w"
-    write_header = csv_mode == "w" or not (
-        os.path.isfile(out_csv) and os.path.getsize(out_csv) > 0
-    )
-
+    if os.path.dirname(out_csv):
+        os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     fieldnames = [
-        "content_wav",
-        "ref_wav",
-        "content_speaker",
-        "ref_speaker",
-        "utt_id",
-        "cosine_similarity_ecapa",
-        "cosine_similarity_wavlm",
-        "cosine_similarity",
-        "error",
+        "content_wav", "ref_wav", "content_speaker", "ref_speaker", "mode",
+        "cosine_similarity", "cosine_similarity_gt", "cosine_similarity_src", "error",
     ]
-    sims_ecapa: list[float] = []
-    sims_wavlm: list[float] = []
-    temp = float(args.temperature)
+    sims_model: list[float] = []   # gen vs ref  (toward TARGET — want high)
+    sims_gt: list[float] = []      # content vs ref (GT ceiling/floor)
+    sims_src: list[float] = []     # gen vs content (toward SOURCE — want low)
 
-    with open(out_csv, csv_mode, newline="", encoding="utf-8") as fcsv:
+    with open(out_csv, "w", newline="", encoding="utf-8") as fcsv:
         writer = csv.DictWriter(fcsv, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
+        writer.writeheader()
+        for content_wav, utt_id, content_spk in tqdm(items, desc=f"s-sim {args.mode}"):
+            ref_wav, ref_spk = _pick_ref(speaker_utts, content_spk, content_wav, args.mode, rng)
+            row = {
+                "content_wav": content_wav, "ref_wav": ref_wav or "",
+                "content_speaker": content_spk, "ref_speaker": ref_spk or "",
+                "mode": args.mode, "cosine_similarity": "", "cosine_similarity_gt": "",
+                "cosine_similarity_src": "",
+                "error": "" if ref_wav else "no_ref",
+            }
+            if not ref_wav:
+                writer.writerow(row); fcsv.flush(); continue
 
-        for content_wav, utt_id, content_spk in tqdm(ds.items, desc="s-sim VC"):
             try:
-                ref_wav, ref_spk = _pick_cross_speaker_ref(speaker_utts, content_spk, rng)
+                ref16 = _load_full_mono_wav(ref_wav, EMBED_SR)
+                ctn16 = _load_full_mono_wav(content_wav, EMBED_SR)
+                e_ref = embedder.embed(ref16)
+                e_ctn = embedder.embed(ctn16)      # source-speaker embedding
+                sim_gt = _cosine(e_ctn, e_ref)
+                sims_gt.append(sim_gt)
+                row["cosine_similarity_gt"] = f"{sim_gt:.6f}"
+
+                if not args.gt:
+                    ctn = _load_full_mono_wav(content_wav, model_sr)
+                    if ctn.numel() > int(content_max_sec * model_sr):
+                        row["error"] = "content_too_long_skipped"
+                        writer.writerow(row); fcsv.flush(); continue
+                    ctn = ctn.unsqueeze(0).to(device)
+                    ref = _load_full_mono_wav(ref_wav, model_sr).unsqueeze(0).to(device)
+                    if not keep_full_ref:
+                        rmax = int(4.0 * model_sr)
+                        if ref.shape[-1] > rmax:
+                            ref = ref[..., :rmax]
+                    with torch.no_grad():
+                        codes = lit.model.generate(
+                            reference_audio=ref, content_audio=ctn,
+                            temperature=0.0, top_p=None, top_k=None,
+                        )
+                        gen = lit.model.decode_to_audio(codes)
+                    gen16 = gen.squeeze(0).detach().float().cpu()
+                    if model_sr != EMBED_SR:
+                        gen16 = torchaudio.functional.resample(gen16, model_sr, EMBED_SR)
+                    e_gen = embedder.embed(gen16)
+                    sim_model = _cosine(e_gen, e_ref)      # gen → TARGET ref
+                    sim_src = _cosine(e_gen, e_ctn)        # gen → SOURCE content
+                    sims_model.append(sim_model)
+                    sims_src.append(sim_src)
+                    row["cosine_similarity"] = f"{sim_model:.6f}"
+                    row["cosine_similarity_src"] = f"{sim_src:.6f}"
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
             except Exception as e:
-                writer.writerow(
-                    {
-                        "content_wav": content_wav,
-                        "ref_wav": "",
-                        "content_speaker": content_spk,
-                        "ref_speaker": "",
-                        "utt_id": utt_id,
-                        "cosine_similarity_ecapa": "",
-                        "cosine_similarity_wavlm": "",
-                        "cosine_similarity": "",
-                        "error": f"ref_pick: {e}"[:500],
-                    }
-                )
-                fcsv.flush()
-                continue
+                row["error"] = str(e)[:500]
+            writer.writerow(row); fcsv.flush()
 
-            row_key = _done_key({"content_wav": content_wav, "ref_wav": ref_wav})
-            if row_key in done:
-                continue
-
-            err = ""
-            sim_ecapa = float("nan")
-            sim_wavlm = float("nan")
-            try:
-                ctn = _load_full_mono_wav(content_wav, target_sr).unsqueeze(0).to(dev)
-                ref = _load_full_mono_wav(ref_wav, target_sr).unsqueeze(0).to(dev)
-                with torch.no_grad():
-                    codes = lit.model.generate(
-                        reference_audio=ref,
-                        content_audio=ctn,
-                        temperature=temp,
-                        top_p=float(args.top_p) if temp > 0 and args.top_p > 0 else None,
-                        top_k=int(args.top_k) if temp > 0 and args.top_k > 0 else None,
-                        cfg_scale=float(args.cfg_scale),
-                    )
-                    gen = lit.model.decode_to_audio(codes)
-
-                ref_w = _load_mono(ref_wav, ecapa_sr, args.max_audio_sec)
-                gen_w = gen.squeeze(0)
-                if args.max_audio_sec is not None and args.max_audio_sec > 0:
-                    n = int(args.max_audio_sec * target_sr)
-                    if gen_w.numel() > n:
-                        gen_w = gen_w[:n]
-
-                scores = _embed_pair(embedders, ref_w, gen_w, ecapa_sr, target_sr)
-                if "ecapa" in scores:
-                    sim_ecapa = scores["ecapa"]
-                    if sim_ecapa == sim_ecapa:
-                        sims_ecapa.append(sim_ecapa)
-                if "wavlm" in scores:
-                    sim_wavlm = scores["wavlm"]
-                    if sim_wavlm == sim_wavlm:
-                        sims_wavlm.append(sim_wavlm)
-
-                del ctn, ref, codes, gen
-                if dev.type == "cuda":
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                err = str(e)[:800]
-                if dev.type == "cuda":
-                    torch.cuda.empty_cache()
-
-            writer.writerow(
-                {
-                    "content_wav": content_wav,
-                    "ref_wav": ref_wav,
-                    "content_speaker": content_spk,
-                    "ref_speaker": ref_spk,
-                    "utt_id": utt_id,
-                    "cosine_similarity_ecapa": f"{sim_ecapa:.6f}" if sim_ecapa == sim_ecapa else "",
-                    "cosine_similarity_wavlm": f"{sim_wavlm:.6f}" if sim_wavlm == sim_wavlm else "",
-                    "cosine_similarity": f"{sim_ecapa:.6f}" if sim_ecapa == sim_ecapa else "",
-                    "error": err,
-                }
-            )
-            fcsv.flush()
-
-    if sims_ecapa:
-        print(f"[s-sim] mean cosine (ECAPA): {sum(sims_ecapa) / len(sims_ecapa):.4f} (n={len(sims_ecapa)})")
-    if sims_wavlm:
-        print(f"[s-sim] mean cosine (WavLM-TDNN): {sum(sims_wavlm) / len(sims_wavlm):.4f} (n={len(sims_wavlm)})")
+    print(f"\n[s-sim] dataset={args.dataset} mode={args.mode}  (WavLM-TDNN)")
+    if sims_model:
+        print(f"[s-sim]   MODEL  cos(gen, TARGET ref):  {sum(sims_model)/len(sims_model):.4f}  (n={len(sims_model)})  ↑ want high")
+    if sims_src:
+        print(f"[s-sim]   MODEL  cos(gen, SOURCE ctn):  {sum(sims_src)/len(sims_src):.4f}  (n={len(sims_src)})  ↓ want low")
+    if sims_gt:
+        tag = "intra-spk ceiling" if args.mode == "same" else "inter-spk floor"
+        print(f"[s-sim]   GT     cos(content, ref):     {sum(sims_gt)/len(sims_gt):.4f}  (n={len(sims_gt)})  = {tag}")
+    if sims_model and sims_src:
+        gap = sum(sims_model)/len(sims_model) - sum(sims_src)/len(sims_src)
+        verdict = "adopts TARGET" if gap > 0 else "stuck on SOURCE"
+        print(f"[s-sim]   → target−source gap = {gap:+.4f}  ({verdict})")
     print(f"[s-sim] wrote: {out_csv}")
 
 
-def run_pairwise(args: argparse.Namespace) -> None:
-    pairs: list[tuple[str, str]] = []
-    if args.ref_wav and args.gen_wav:
-        pairs = [(args.ref_wav, args.gen_wav)]
-    elif args.pairs_csv:
-        pairs = _load_pairs_csv(Path(args.pairs_csv))
-    elif args.ref_dir and args.gen_dir:
-        pairs = _pairs_from_dirs(Path(args.ref_dir), Path(args.gen_dir))
-    else:
-        raise SystemExit(
-            "Pairwise mode: provide (--ref_wav and --gen_wav) OR --pairs_csv OR "
-            "(--ref_dir and --gen_dir), or use --libritts_test_clean."
-        )
-
-    for ra, gb in pairs:
-        if not os.path.isfile(ra):
-            raise FileNotFoundError(f"missing ref: {ra}")
-        if not os.path.isfile(gb):
-            raise FileNotFoundError(f"missing gen: {gb}")
-
-    print(f"[s-sim] pairs={len(pairs)}  embedder={args.embedder!r}  device={args.device!r}")
-
-    embedders = _build_embedders(args)
-    sr = embedders["ecapa"].sample_rate if "ecapa" in embedders else 16000
-
-    out_dir = os.path.dirname(args.out_csv)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    done = _load_done(args.out_csv) if args.resume else set()
-    mode = "a" if args.resume else "w"
-    write_header = mode == "w" or not (
-        os.path.isfile(args.out_csv) and os.path.getsize(args.out_csv) > 0
-    )
-
-    sims_ecapa: list[float] = []
-    sims_wavlm: list[float] = []
-    fieldnames = [
-        "ref_wav",
-        "gen_wav",
-        "cosine_similarity_ecapa",
-        "cosine_similarity_wavlm",
-        "cosine_similarity",
-        "error",
-    ]
-
-    with open(args.out_csv, mode, newline="", encoding="utf-8") as fcsv:
-        w = csv.DictWriter(fcsv, fieldnames=fieldnames)
-        if write_header:
-            w.writeheader()
-
-        for ref_path, gen_path in pairs:
-            if ref_path in done:
-                continue
-            err = ""
-            sim_ecapa = float("nan")
-            sim_wavlm = float("nan")
-            try:
-                ref_w = _load_mono(ref_path, sr, args.max_audio_sec)
-                gen_w = _load_mono(gen_path, sr, args.max_audio_sec)
-                scores = _embed_pair(embedders, ref_w, gen_w, sr, sr)
-                if "ecapa" in scores:
-                    sim_ecapa = scores["ecapa"]
-                    if sim_ecapa == sim_ecapa:
-                        sims_ecapa.append(sim_ecapa)
-                if "wavlm" in scores:
-                    sim_wavlm = scores["wavlm"]
-                    if sim_wavlm == sim_wavlm:
-                        sims_wavlm.append(sim_wavlm)
-            except Exception as e:
-                err = str(e)[:800]
-
-            w.writerow(
-                {
-                    "ref_wav": ref_path,
-                    "gen_wav": gen_path,
-                    "cosine_similarity_ecapa": f"{sim_ecapa:.6f}" if sim_ecapa == sim_ecapa else "",
-                    "cosine_similarity_wavlm": f"{sim_wavlm:.6f}" if sim_wavlm == sim_wavlm else "",
-                    "cosine_similarity": f"{sim_ecapa:.6f}" if sim_ecapa == sim_ecapa else "",
-                    "error": err,
-                }
-            )
-            fcsv.flush()
-
-    if sims_ecapa:
-        print(f"[s-sim] mean cosine (ECAPA): {sum(sims_ecapa) / len(sims_ecapa):.4f} (n={len(sims_ecapa)})")
-    if sims_wavlm:
-        print(f"[s-sim] mean cosine (WavLM-TDNN): {sum(sims_wavlm) / len(sims_wavlm):.4f} (n={len(sims_wavlm)})")
-    print(f"[s-sim] wrote: {args.out_csv}")
-
-
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Speaker cosine similarity (ECAPA / UniSpeech WavLM-TDNN) — pairwise or LibriTTS VC."
-    )
-    p.add_argument(
-        "--libritts_test_clean",
-        action="store_true",
-        help="Run VC on LibriTTS test-clean with cross-speaker ref; write content/ref paths + sim.",
-    )
-    p.add_argument(
-        "--ckpt",
-        type=str,
-        default="/mnt/data/disk2/yejin/LiveVoice/checkpoints/mimi_semantic_new/step_latest.ckpt",
-    )
-    p.add_argument("--libritts_path", type=str, default="/mnt/data/disk2/LibriTTS")
-    p.add_argument("--split_dir", type=str, default="test-clean")
-    p.add_argument("--output_dir", type=str, default="/mnt/data/disk2/yejin/LiveVoice")
-    p.add_argument(
-        "--out_csv",
-        type=str,
-        default="/mnt/data/disk2/yejin/LiveVoice/s-sim_mimi_semantic_new.csv",
-    )
-    p.add_argument("--resume", action="store_true")
+    p = argparse.ArgumentParser(description="Speaker cosine similarity (WavLM-TDNN) — GT and/or VC model.")
+    # what to measure
+    p.add_argument("--mode", type=str, default="cross", choices=["same", "cross"])
+    p.add_argument("--gt", action="store_true", help="GT s-sim only (no model): cos(content, ref).")
+    p.add_argument("--ckpt", type=str, default=None, help="VC checkpoint (required unless --gt).")
+    # dataset
+    p.add_argument("--dataset", type=str, default="libritts", choices=["libritts", "librispeech"])
+    p.add_argument("--root", type=str, default="/mnt/data/disk2/LibriTTS",
+                   help="Dataset root (LibriSpeech: /mnt/data/disk2/LibriSpeech).")
+    p.add_argument("--split", type=str, default="test-clean")
     p.add_argument("--max_items", type=int, default=None)
-    p.add_argument("--seed", type=int, default=42, help="LibriTTS dataset shuffle seed.")
-    p.add_argument(
-        "--ref_seed",
-        type=int,
-        default=12345,
-        help="Seed for cross-speaker ref selection (fixed across runs if same).",
-    )
-    # VC model
-    p.add_argument("--codec", type=str, default="mimi", choices=["dac", "mimi"])
-    p.add_argument("--n_codebooks", type=int, default=8)
-    p.add_argument("--dac_model_type", type=str, default="16khz", choices=["16khz", "24khz", "44khz"])
+    p.add_argument("--min_dur", type=float, default=None, help="Keep utts >= this many seconds (e.g. 4).")
+    p.add_argument("--max_dur", type=float, default=None, help="Keep utts <= this many seconds (e.g. 10).")
+    p.add_argument("--seed", type=int, default=42, help="Item shuffle seed.")
+    p.add_argument("--ref_seed", type=int, default=12345, help="Reference-pick seed (stable across runs).")
+    # WavLM-TDNN embedder
+    p.add_argument("--wavlm_ckpt", type=str, default="/mnt/data/disk3/yejin/wavlm_large_finetune.pth")
+    p.add_argument("--wavlm_variant", type=str, default="wavlm_large", choices=["wavlm_large", "wavlm_base_plus"])
+    # VC model shape (only used with a ckpt)
     p.add_argument("--hidden_dim", type=int, default=768)
     p.add_argument("--num_decoder_layers", type=int, default=12)
-    p.add_argument(
-        "--content_source",
-        type=str,
-        default="auto",
-        choices=["auto", "hubert", "mimi_semantic", "streamvoiceanon"],
-    )
-    p.add_argument(
-        "--speaker_conditioning",
-        type=str,
-        default="auto",
-        choices=["auto", "crossattn", "global_avg", "prefix"],
-    )
-    p.add_argument("--speaker_prefix_len", type=int, default=8)
-    p.add_argument(
-        "--speaker_encoder_type",
-        type=str,
-        default="auto",
-        choices=["auto", "codec", "speechbrain_ecapa"],
-    )
-    p.add_argument("--speechbrain_source", type=str, default="speechbrain/spkrec-ecapa-voxceleb")
-    p.add_argument(
-        "--speechbrain_savedir",
-        type=str,
-        default="/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb",
-    )
-    p.add_argument("--speechbrain_sample_rate", type=int, default=16000)
-    p.add_argument("--speechbrain_embedding_dim", type=int, default=192)
-    p.add_argument("--streamvoiceanon_repo", type=str, default="/home/yejin/StreamVoiceAnon")
-    p.add_argument(
-        "--streamvoiceanon_encoder_config",
-        type=str,
-        default="/home/yejin/StreamVoiceAnon/configs/hydra_arcs/speech_tokenizers/causal-encoder-lfq-8192.yaml",
-    )
-    p.add_argument(
-        "--streamvoiceanon_encoder_ckpt",
-        type=str,
-        default="/home/yejin/StreamVoiceAnon/ckpt/asr_s2s_bsq_8192_causal_down_whisper.pth",
-    )
-    p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--top_p", type=float, default=0.9)
-    p.add_argument("--top_k", type=int, default=0)
-    p.add_argument("--cfg_scale", type=float, default=1.0)
-    p.add_argument("--cpu", action="store_true", help="VC model on CPU (slow).")
-    # Speaker embedder
-    p.add_argument(
-        "--embedder",
-        type=str,
-        default="both",
-        choices=["ecapa", "wavlm", "both"],
-        help="ecapa=SpeechBrain ECAPA; wavlm=UniSpeech WavLM+TDNN; both=record both columns.",
-    )
-    p.add_argument(
-        "--wavlm_ckpt",
-        type=str,
-        default='/workspace/LiveVoice/src/eval/ckpt/wavlm_large_finetune.pth',
-        help="Required for wavlm|both.",
-    )
-    p.add_argument(
-        "--wavlm_variant",
-        type=str,
-        default="wavlm_large",
-        choices=["wavlm_large", "wavlm_base_plus"],
-    )
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--max_audio_sec", type=float, default=None)
-    # Pairwise inputs
-    p.add_argument("--ref_wav", type=str, default=None)
-    p.add_argument("--gen_wav", type=str, default=None)
-    p.add_argument("--pairs_csv", type=str, default=None)
-    p.add_argument("--ref_dir", type=str, default=None)
-    p.add_argument("--gen_dir", type=str, default=None)
-
+    p.add_argument("--n_codebooks", type=int, default=8)
+    p.add_argument("--speaker_prefix_len", type=int, default=4)
+    p.add_argument("--max_content_sec", type=float, default=15.0, help="Skip content longer than this (context limit).")
+    # output
+    p.add_argument("--out_csv", type=str, default="/mnt/data/disk2/yejin/LiveVoice/ssim.csv")
+    p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
-
-    if args.libritts_test_clean:
-        run_libritts_test_clean(args)
-    else:
-        run_pairwise(args)
+    run(args)
 
 
 if __name__ == "__main__":

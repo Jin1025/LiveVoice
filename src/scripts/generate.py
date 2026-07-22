@@ -10,10 +10,9 @@ Usage examples:
 
     # VC inference
     CUDA_VISIBLE_DEVICES=5 python scripts/generate.py vc \
-        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/prefix+jhcodec+hubert/step_latest.ckpt \
+        --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/ecapa_sw2v/step_latest.ckpt \
         --reference /mnt/data/disk2/LibriTTS/test-clean/121/121726/121_121726_000020_000001.wav  \
-        --content /mnt/data/disk2/LibriTTS/test-clean/5105/28240/5105_28240_000013_000005.wav  \
-        --codec jhcodec
+        --content /mnt/data/disk2/LibriTTS/test-clean/5105/28240/5105_28240_000013_000005.wav
 """
 import argparse
 import os
@@ -349,7 +348,7 @@ def main():
         "--content_source",
         type=str,
         default="auto",
-        choices=["auto", "hubert", "mimi_semantic", "streamvoiceanon"],
+        choices=["auto", "hubert", "mimi_semantic", "streamvoiceanon", "sw2v"],
         help="Content path. 'auto' inspects ckpt (same as eval_libritts_test_clean_wer.py).",
     )
     pv.add_argument(

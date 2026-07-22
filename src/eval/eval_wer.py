@@ -45,6 +45,7 @@ from livevoice.model import (
     build_codec,
 )
 from livevoice.utils.checkpoint import (
+    infer_content_fsq_from_ckpt,
     infer_content_source_from_ckpt,
     infer_speaker_conditioning_from_ckpt,
     infer_speaker_encoder_from_ckpt,
@@ -153,9 +154,11 @@ def _build_config(args, ckpt: str, device: str) -> LiveVoiceConfig:
     content_source = infer_content_source_from_ckpt(ckpt) or "hubert"
     speaker_conditioning = infer_speaker_conditioning_from_ckpt(ckpt) or "prefix"
     speaker_encoder_type = infer_speaker_encoder_from_ckpt(ckpt) or "codec"
+    fsq_levels = infer_content_fsq_from_ckpt(ckpt)
     print(
         f"[eval] {Path(ckpt).parent.name}: content_source={content_source} "
-        f"speaker_conditioning={speaker_conditioning} speaker_encoder_type={speaker_encoder_type}"
+        f"speaker_conditioning={speaker_conditioning} speaker_encoder_type={speaker_encoder_type} "
+        f"content_fsq={fsq_levels if fsq_levels else 'off'}"
     )
     return LiveVoiceConfig(
         device=device,
@@ -172,6 +175,8 @@ def _build_config(args, ckpt: str, device: str) -> LiveVoiceConfig:
         speaker_conditioning=speaker_conditioning,
         speaker_prefix_len=int(args.speaker_prefix_len),
         speaker_encoder_type=speaker_encoder_type,
+        use_content_fsq=fsq_levels is not None,
+        fsq_levels=fsq_levels if fsq_levels is not None else (8, 5, 5, 5),
         features_dir=None,
     )
 

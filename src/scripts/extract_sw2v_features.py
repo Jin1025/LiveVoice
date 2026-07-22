@@ -21,7 +21,7 @@ Usage (conda `sound`):
     python scripts/extract_sw2v_features.py libritts \
         --libritts_path /mnt/data/disk2/LibriTTS \
         --splits train-clean-100,train-clean-360,dev-clean \
-        --out_dir /mnt/data/disk2/yejin/LiveVoice/features/sw2v/libritts \
+        --out_dir /mnt/data/disk2/yejin/LiveVoice/features/perturbed/sw2v/libritts \
         --device cuda --batch_size 16
 """
 import argparse

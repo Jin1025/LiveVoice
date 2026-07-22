@@ -80,10 +80,26 @@ def load_model_weights_from_ckpt(
     return model.load_state_dict(model_sd, strict=False)
 
 
+def infer_content_fsq_from_ckpt(ckpt_path: str) -> tuple[int, ...] | None:
+    """Return FSQ levels if the checkpoint has a content FSQ bottleneck, else None.
+
+    The exact levels are stored as the ``model.content_fsq._levels`` buffer,
+    so eval can rebuild the identical bottleneck without any CLI/config input.
+    """
+    obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = obj.get("state_dict", obj)
+    levels = sd.get("model.content_fsq._levels")
+    if isinstance(levels, torch.Tensor):
+        return tuple(int(l) for l in levels.tolist())
+    return None
+
+
 def infer_speaker_encoder_from_ckpt(ckpt_path: str) -> str | None:
     """Guess speaker encoder type from checkpoint parameter topology."""
     obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = obj.get("state_dict", obj)
+    if any(k.startswith("model.spark_speaker_proj.") for k in sd):
+        return "spark_global"
     if any(k.startswith("model.speaker_prefix_proj.") for k in sd):
         return "speechbrain_ecapa"
     w = sd.get("model.speaker_proj.weight")
