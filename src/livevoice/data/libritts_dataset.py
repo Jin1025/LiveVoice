@@ -28,6 +28,7 @@ import librosa
 from torch.utils.data import Dataset
 
 from .vctk_dataset import collate_fn  # shared — re-exported for datamodule
+from livevoice.model.phoneme_vocab import PAD_ID
 
 
 class LibriTTSDataset(Dataset):
@@ -62,6 +63,32 @@ class LibriTTSDataset(Dataset):
                 f"does not exist → falling back to ONLINE extraction every step (slow). Extract "
                 f"features there, or set the dir to None to make the online path explicit."
             )
+
+        # Seq2seq ASR supervision (config.use_asr_supervision): needs the FULL (un-cropped)
+        # sw2v feature cache — reuses self._feats_dir, only valid for content_source=="sw2v"
+        # — plus a precomputed phoneme-id cache (scripts/extract_phonemes.py). Both are
+        # no-ops (None) when disabled, so the default path has zero extra I/O.
+        self.use_asr_supervision = bool(getattr(config, "use_asr_supervision", False))
+        self.asr_max_content_frames = int(getattr(config, "asr_max_content_frames", 750))
+        self.asr_max_phoneme_len = int(getattr(config, "asr_max_phoneme_len", 300))
+        self._phoneme_dir = None
+        if self.use_asr_supervision:
+            if content_source != "sw2v":
+                print(
+                    "[LibriTTSDataset] WARNING: use_asr_supervision=True but "
+                    f"content_source={content_source!r} != 'sw2v' — ASR supervision needs "
+                    "the sw2v cache; disabling for this dataset instance."
+                )
+                self.use_asr_supervision = False
+            else:
+                phon_base = getattr(config, "phoneme_cache_dir", None)
+                self._phoneme_dir = Path(phon_base) / "libritts" if phon_base else None
+                if self._phoneme_dir is not None and not self._phoneme_dir.exists():
+                    print(
+                        f"[LibriTTSDataset] WARNING: phoneme_cache_dir set but "
+                        f"{self._phoneme_dir} does not exist → run scripts/extract_phonemes.py "
+                        f"first. ASR supervision will silently skip items with no cache."
+                    )
 
         self.speaker_utts: dict[str, list[tuple[str, str]]] = {}
         for s in use_splits:
@@ -122,20 +149,32 @@ class LibriTTSDataset(Dataset):
             return self.__getitem__(random.randint(0, len(self.items) - 1))
 
         content_hubert = self._load_feats(spk, utt_id, start_sample)
-        content_text = self._load_text(wav_path)
 
-        return {
+        item = {
             "reference_audio": ref_wave,
             "content_audio": ctn_wave,
             "target_audio": ctn_wave,
             "speaker_id": spk,
             "content_hubert": content_hubert,
-            "content_text": content_text,
             "content_path": wav_path,
             "content_start_sample": start_sample,
             "ref_path": ref_path,
             "ref_start_sample": ref_start_sample,
         }
+
+        if self.use_asr_supervision:
+            feats_full, feats_len = self._load_feats_full(spk, utt_id)
+            phoneme_ids = self._load_phonemes(spk, utt_id)
+            # Keep the pair consistent: an ASR loss needs BOTH content and its label —
+            # if either is missing, drop both (collate_fn treats any-None as whole-batch
+            # None for that key, so a partial item would silently corrupt the batch mask).
+            if feats_full is None or phoneme_ids is None:
+                feats_full = feats_len = phoneme_ids = None
+            item["content_feats_full"] = feats_full
+            item["content_feats_full_len"] = feats_len
+            item["phoneme_ids"] = phoneme_ids
+
+        return item
 
     def _load_window(self, path: str) -> tuple[torch.Tensor, int]:
         try:
@@ -192,13 +231,50 @@ class LibriTTSDataset(Dataset):
         except Exception:
             return None
 
-    def _load_text(self, wav_path: str) -> str | None:
-        """Load LibriTTS normalized transcript if available."""
+    def _load_feats_full(self, spk: str, utt_id: str) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Full (un-cropped) sw2v feature cache for ASR supervision — unlike `_load_feats`,
+        this does NOT slice to the training window: text labels are utterance-level with
+        no timestamps, so the ASR loss must see everything the label describes.
+        Zero-padded/truncated to asr_max_content_frames; returns (feats, true_len)."""
+        if self._feats_dir is None:
+            return None, None
+        feat_path = self._feats_dir / spk / f"{utt_id}.pt"
+        if not feat_path.exists():
+            return None, None
         try:
-            txt_path = Path(wav_path).with_suffix(".normalized.txt")
-            if not txt_path.exists():
-                return None
-            text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
-            return text if text else None
+            data = torch.load(feat_path, map_location="cpu", weights_only=True)
+            feats = data["feats"].float()
+            n = feats.shape[0]
+            cap = self.asr_max_content_frames
+            if n > cap:
+                feats = feats[:cap]
+                n = cap
+            elif n < cap:
+                feats = torch.nn.functional.pad(feats, (0, 0, 0, cap - n))
+            return feats, torch.tensor(n, dtype=torch.long)
+        except Exception:
+            return None, None
+
+    def _load_phonemes(self, spk: str, utt_id: str) -> torch.Tensor | None:
+        """Precomputed phoneme-id sequence (scripts/extract_phonemes.py): [BOS, ph..., EOS].
+        Pads with PAD_ID to asr_max_phoneme_len (truncates, keeping the trailing EOS)."""
+        if self._phoneme_dir is None:
+            return None
+        ph_path = self._phoneme_dir / spk / f"{utt_id}.pt"
+        if not ph_path.exists():
+            return None
+        try:
+            ids = torch.load(ph_path, map_location="cpu", weights_only=True)
+            if not torch.is_tensor(ids):
+                ids = torch.tensor(ids, dtype=torch.long)
+            ids = ids.to(torch.long)
+            cap = self.asr_max_phoneme_len
+            n = ids.shape[0]
+            if n > cap:
+                ids = torch.cat([ids[: cap - 1], ids[-1:]])  # keep trailing EOS
+            elif n < cap:
+                ids = torch.nn.functional.pad(ids, (0, cap - n), value=PAD_ID)
+            return ids
         except Exception:
             return None
+

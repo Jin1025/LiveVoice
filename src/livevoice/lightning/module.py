@@ -26,22 +26,6 @@ except Exception:  # pragma: no cover
 
 
 # ─────────────────────────────────────────────
-#  CTC vocab (character-level, ASR standard)
-# ─────────────────────────────────────────────
-# Index 0 = blank, indices 1..33 = chars below.
-# Standard for ASR CTC (DeepSpeech 2: 29, wav2vec2 ASR: 32, ours: 34).
-_CTC_BLANK = 0
-_CTC_CHARS = " abcdefghijklmnopqrstuvwxyz',.!?-"
-_CTC_C2I = {c: i + 1 for i, c in enumerate(_CTC_CHARS)}
-CTC_VOCAB_SIZE = len(_CTC_CHARS) + 1  # 34
-
-
-def _ctc_tokenize(text: str) -> list[int]:
-    """Lowercase + map to CTC vocab; drops chars not in the vocab."""
-    return [_CTC_C2I[c] for c in text.lower() if c in _CTC_C2I]
-
-
-# ─────────────────────────────────────────────
 #  Shared helpers
 # ─────────────────────────────────────────────
 
@@ -357,8 +341,11 @@ class LiveVoiceLightningModule(L.LightningModule):
                 print(f"[spk_sim] configured val_spk_encoder = ecapa "
                       f"({getattr(config, 'speechbrain_source', '?')}) — loads at first epoch end")
 
-        if bool(getattr(config, "use_ctc_loss", False)):
-            print(f"[CTC] char-level  vocab_size={getattr(config, 'ctc_vocab_size', '?')}")
+        if bool(getattr(config, "use_asr_supervision", False)):
+            print(
+                f"[ASR-supervision] seq2seq phoneme-level  weight={getattr(config, 'asr_loss_weight', '?')}  "
+                f"phoneme_cache_dir={getattr(config, 'phoneme_cache_dir', '?')}"
+            )
 
     @staticmethod
     def _normalize_text_for_wer(s: str) -> str:
@@ -618,7 +605,6 @@ class LiveVoiceLightningModule(L.LightningModule):
         # ── auxiliary losses ────────────────────────────────────────
         z_w = float(getattr(self.config, "z_loss_weight", 0.0))
         lat_w = float(getattr(self.config, "latent_loss_weight", 0.0))
-        ctc_w = float(getattr(self.config, "ctc_loss_weight", 0.0))
 
         z_l = torch.tensor(0.0, device=ce_loss.device)
         if z_w > 0:
@@ -630,11 +616,29 @@ class LiveVoiceLightningModule(L.LightningModule):
             cb_list = [getattr(self.model, f"codebook_vectors_{k}") for k in range(K)]
             lat_l = _latent_regression_loss(out["all_logits"], out["delayed_targets"], cb_list)
 
-        ctc_l = torch.tensor(0.0, device=ce_loss.device)
-        if ctc_w > 0 and getattr(self.model, "use_ctc_loss", False):
-            ctc_l = self._compute_ctc_loss(out["decoder_output"], batch.get("content_text", None))
+        # Seq2seq ASR supervision on the sw2v content bottleneck (StyleStream-style; see
+        # asr_supervision.py). Shapes the content embedding itself, not the decoder —
+        # runs on the FULL un-cropped utterance since the phoneme labels have no per-crop
+        # timestamps. Silently 0 if the batch has no cached feats/phonemes (collate_fn →
+        # None whenever any item in the batch lacks either — see
+        # LibriTTSDataset._load_feats_full/_load_phonemes).
+        asr_w = float(getattr(self.config, "asr_loss_weight", 0.0))
+        asr_l = torch.tensor(0.0, device=ce_loss.device)
+        feats_full = batch.get("content_feats_full", None)
+        phoneme_ids = batch.get("phoneme_ids", None)
+        if (
+            asr_w > 0
+            and getattr(self.model, "use_asr_supervision", False)
+            and feats_full is not None
+            and phoneme_ids is not None
+        ):
+            asr_l = self.model.compute_asr_supervision_loss(
+                feats_full.to(self.device),
+                batch["content_feats_full_len"].to(self.device),
+                phoneme_ids.to(self.device),
+            )
 
-        loss = ce_loss + z_w * z_l + lat_w * lat_l + ctc_w * ctc_l
+        loss = ce_loss + z_w * z_l + lat_w * lat_l + asr_w * asr_l
 
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         self.log("train/ce_loss", ce_loss.detach(), on_step=True, on_epoch=False, sync_dist=True)
@@ -642,56 +646,11 @@ class LiveVoiceLightningModule(L.LightningModule):
             self.log("train/z_loss", z_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
         if lat_w > 0:
             self.log("train/latent_loss", lat_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
-        if ctc_w > 0:
-            self.log("train/ctc_loss", ctc_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
+        if asr_w > 0:
+            self.log("train/asr_loss", asr_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
         for k, v in per_book.items():
             self.log(f"train/{k}", v, on_step=True, on_epoch=False, sync_dist=True)
         return loss
-
-    def _compute_ctc_loss(self, decoder_output: torch.Tensor, texts) -> torch.Tensor:
-        """CTC loss on decoder hidden states vs character-level transcripts.
-
-        Works with any content_source — operates on decoder output, not the
-        content path itself. Drops samples where target is too long for
-        T_input (CTC alignment requirement).
-
-        decoder_output: (B, T_seq, hidden_dim)
-        texts:          list[str | None] (from batch["content_text"])
-        """
-        if not isinstance(texts, list) or len(texts) == 0:
-            return torch.tensor(0.0, device=decoder_output.device)
-
-        device = decoder_output.device
-        T_seq = decoder_output.size(1)
-
-        valid_idxs: list[int] = []
-        flat_targets: list[int] = []
-        target_lengths: list[int] = []
-        for i, t in enumerate(texts):
-            if not t:
-                continue
-            tok = _ctc_tokenize(t)
-            if not tok or len(tok) > T_seq:    # CTC needs T_in >= T_target
-                continue
-            valid_idxs.append(i)
-            flat_targets.extend(tok)
-            target_lengths.append(len(tok))
-
-        if not valid_idxs:
-            return torch.tensor(0.0, device=device)
-
-        idx_t = torch.tensor(valid_idxs, device=device, dtype=torch.long)
-        sub = decoder_output.index_select(0, idx_t)               # (B', T_seq, H)
-        logits = self.model.ctc_head(sub)                          # (B', T_seq, V)
-        log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T, B', V) for CTC
-        targets_t = torch.tensor(flat_targets, device=device, dtype=torch.long)
-        target_lengths_t = torch.tensor(target_lengths, device=device, dtype=torch.long)
-        input_lengths_t = torch.full((len(valid_idxs),), T_seq, device=device, dtype=torch.long)
-
-        return F.ctc_loss(
-            log_probs, targets_t, input_lengths_t, target_lengths_t,
-            blank=_CTC_BLANK, zero_infinity=True, reduction="mean",
-        )
 
     def validation_step(self, batch, batch_idx):
         ref = batch["reference_audio"]

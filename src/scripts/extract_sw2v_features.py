@@ -126,6 +126,25 @@ def extract(items, out_dir, encoder, perturber, training_sr, batch_size, skip_ex
                 print(f"  [warn] failed {wav_path}: {e}")
                 audios.append(None)
 
+        # ─── DEBUG: verify source-side perturbation (pitch+formant) — REMOVE LATER ───
+        # The sw2v cache stores ENCODER features (T,1024), which cannot be inverted to
+        # audio. So dump the perturbed WAVEFORM here (`a`, produced just above) before it
+        # is encoded. origin.wav = pre-perturb, perturbed.wav = exactly what gets encoded.
+        # Only fires on the first batch so it writes a handful of files / breaks once.
+        # if batch_start == 0:
+        #     import soundfile as _sf
+        #     _dbg = Path("/workspace/LiveVoice/src/output/sw2v_perturb_debug")
+        #     _dbg.mkdir(parents=True, exist_ok=True)
+        #     for _i, (_wp, _spk, _uid, _sp) in enumerate(batch):
+        #         if audios[_i] is None:
+        #             continue
+        #         _orig = load_mono(_wp, SW2V_SR)
+        #         _sf.write(str(_dbg / f"{_uid}_origin.wav"), _orig.cpu().numpy(), SW2V_SR)
+        #         _sf.write(str(_dbg / f"{_uid}_perturbed.wav"), audios[_i].cpu().numpy(), SW2V_SR)
+        #     print(f"  [DEBUG] wrote origin/perturbed wavs → {_dbg}")
+        #     breakpoint()  # inspect `audios` (perturbed) / `batch`; listen to the wavs above
+        # ─── END DEBUG ───
+
         valid_idx = [i for i, a in enumerate(audios) if a is not None]
         valid = [audios[i] for i in valid_idx]
         if not valid:

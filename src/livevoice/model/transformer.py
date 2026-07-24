@@ -17,6 +17,7 @@ from livevoice.model.content_perturbation import ContentPerturbation
 from livevoice.model.fsq import FSQBottleneck
 from livevoice.model.speechbrain_speaker_encoder import SpeechBrainECAPASpeakerEncoder
 from livevoice.model.spark_speaker_encoder import SparkGlobalSpeakerEncoder
+from livevoice.model.asr_supervision import AsrSupervisionHead
 
 try:
     from tqdm.auto import tqdm
@@ -352,16 +353,14 @@ class LiveVoiceModel(nn.Module):
             else:
                 self.content_fsq = None
 
-        # ── Auxiliary CTC head for content alignment ───────────────
-        # Predicts character-level text from decoder hidden states. Forces the
-        # decoder to encode linguistic content (phoneme-level alignment),
-        # directly improving WER. Works with any content_source — operates on
-        # the decoder output, not the content path itself.
-        self.use_ctc_loss = bool(getattr(config, "use_ctc_loss", False))
-        if self.use_ctc_loss:
-            self.ctc_vocab_size = int(getattr(config, "ctc_vocab_size", 34))
-            self.ctc_head = nn.Linear(config.hidden_dim, self.ctc_vocab_size)
-            print(f"[LiveVoiceModel] CTC head: hidden_dim={config.hidden_dim} → vocab={self.ctc_vocab_size}")
+            # Optional seq2seq ASR (StyleStream-style) supervision on this content
+            # embedding: hangs off sw2v_proj[+content_fsq] output only, never touches
+            # the main decoder, discarded at inference (see asr_supervision.py).
+            self.use_asr_supervision = bool(getattr(config, "use_asr_supervision", False))
+            if self.use_asr_supervision:
+                self.asr_head = AsrSupervisionHead(config)
+            else:
+                self.asr_head = None
 
     # --------------------- helpers ---------------------
     def align_to_tokens(self, feats: torch.Tensor, num_tokens: int, causal: bool = True) -> torch.Tensor:
@@ -629,6 +628,40 @@ class LiveVoiceModel(nn.Module):
             )
             return zeros_add, film_raw
         return self.content_extractor(content_audio), None
+
+    def compute_asr_supervision_loss(
+        self,
+        content_feats_full: torch.Tensor,
+        content_feats_full_len: torch.Tensor,
+        phoneme_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Seq2seq ASR loss on the FULL (un-cropped) sw2v content embedding.
+
+        Runs a SEPARATE forward through sw2v_proj[+content_fsq] on the full-utterance
+        cached features (not the training window) — text labels are utterance-level with
+        no timestamps, so this only makes sense on the whole utterance. sw2v_to_hidden is
+        reused (not duplicated) so the loss shapes the exact representation the main
+        decoder consumes elsewhere.
+
+        content_feats_full:     (B, T_full, sw2v_dim) zero-padded
+        content_feats_full_len: (B,) true (unpadded) frame counts
+        phoneme_ids:             (B, T_ph) = [BOS, ph..., EOS, PAD...]
+        """
+        if self.asr_head is None:
+            return torch.tensor(0.0, device=content_feats_full.device)
+        feats = content_feats_full.to(
+            device=self.sw2v_proj.weight.device, dtype=self.sw2v_proj.weight.dtype
+        )
+        sw2v_emb = self.sw2v_proj(feats)                # (B, T_full, content_proj_dim)
+        if self.content_fsq is not None:
+            sw2v_emb = self.content_fsq(sw2v_emb)        # same FSQ bottleneck as the VC path
+        memory = self.sw2v_to_hidden(sw2v_emb)            # (B, T_full, hidden_dim)
+
+        T_full = memory.size(1)
+        arange = torch.arange(T_full, device=memory.device).unsqueeze(0)  # (1, T_full)
+        memory_key_padding_mask = arange >= content_feats_full_len.unsqueeze(1)  # True = pad
+
+        return self.asr_head.compute_loss(memory, memory_key_padding_mask, phoneme_ids)
 
     # --------------------- forward ---------------------
     def forward(

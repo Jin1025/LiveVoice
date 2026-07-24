@@ -147,7 +147,7 @@ class LiveVoiceConfig:
     cfg_drop_speaker_p: float = 0.1
     cfg_drop_content_p: float = 0.1
     cfg_drop_prosody_p: float = 0.2
-    prev_emb_dropout_p: float = 0.1
+    prev_emb_dropout_p: float = 0.5
 
     # ------------------------------------------------------------------
     # Training
@@ -169,11 +169,22 @@ class LiveVoiceConfig:
     z_loss_weight: float = 1e-4               # PaLM-style logsumexp regularizer
     latent_loss_weight: float = 0.5           # MSE on expected latent vs target latent
 
-    # CTC loss: forces decoder hidden states to be linguistically transcribable.
-    # Directly improves WER. Char-level vocab (ASR standard, no extra deps).
-    use_ctc_loss: bool = False
-    ctc_loss_weight: float = 0.3
-    ctc_vocab_size: int = 34                  # 33 chars + 1 blank
+    # Seq2seq ASR supervision on the sw2v content embedding (StyleStream-style;
+    # arXiv:2602.20113 confirmed: seq2seq, NOT CTC, char-level, joint end-to-end,
+    # discarded at inference). This hangs off sw2v_proj[+content_fsq] ALONE — never
+    # touches the main decoder — so it gives the FSQ bottleneck a supervised reason to
+    # keep phonetic info and drop speaker info, instead of competing with the
+    # codec-token cross-entropy (an earlier CTC-on-decoder attempt did compete, and hurt;
+    # it was removed). Label unit is phoneme
+    # (CMU ARPAbet, phoneme_vocab.py) rather than StyleStream's character — more
+    # standard for disentanglement (PPG-VC lineage), coarser/less speaker-specific.
+    # Runs on the FULL (un-cropped) cached sw2v features, since text labels are
+    # utterance-level with no timestamps (see libritts_dataset.py / extract_phonemes.py).
+    use_asr_supervision: bool = False
+    asr_loss_weight: float = 0.3
+    asr_decoder_layers: int = 4               # StyleStream: 4 transformer decoder layers
+    asr_max_content_frames: int = 750         # ~15s @ 50fps cap on the full-utterance forward
+    asr_max_phoneme_len: int = 300            # BOS + phones + EOS cap
 
     # Content source: how linguistic features are extracted from content audio.
     #   "hubert"        — HuBERT layer-9 hidden states (heavy, bidirectional)
@@ -191,7 +202,7 @@ class LiveVoiceConfig:
     # Applied AFTER sw2v_proj (content_proj_dim), per-frame:
     #   content_proj_dim → len(fsq_levels) dims → tanh-bound round (STE) → content_proj_dim.
     use_content_fsq: bool = False
-    fsq_levels: tuple = (5,3,3) # (8,5,5,5)=1000 → (8,6,5)=240 → (5,3,3)=45.
+    fsq_levels: tuple = (8,5,5,5) # (8,5,5,5)=1000 → (8,6,5)=240 → (5,3,3)=45.
 
     # StreamVoiceAnon causal content tokenizer.
     streamvoiceanon_repo: str = "/workspace/StreamVoiceAnon"
@@ -275,9 +286,11 @@ class LiveVoiceConfig:
     libritts_val_splits: tuple[str, ...] = ("dev-clean",) # "dev-other")
 
     # Precomputed HuBERT features (from extract_features.py)
-    features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/perturbed"
+    features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/perturbed/hubert"
     # Precomputed SW2V features (from extract_sw2v_features.py)
-    sw2v_features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/sw2v"
+    sw2v_features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/perturbed/sw2v"
+    # Precomputed phoneme-id caches (scripts/extract_phonemes.py); mirrors sw2v_features_dir.
+    phoneme_cache_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/phonemes"
 
     # Debug cap
     max_windows: int | None = None

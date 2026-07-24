@@ -24,7 +24,7 @@ Examples:
   python eval/eval_s-sim.py --gt --mode same --dataset libritts --root /mnt/data/disk2/LibriTTS --split test-clean
 
   # 2) Your model (cross-speaker VC), GT ceiling logged alongside:
-  CUDA_VISIBLE_DEVICES=0 python eval/eval_s-sim.py --mode cross --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/<run>/step_latest.ckpt --out_csv /mnt/data/disk2/yejin/LiveVoice/ssim_<run>_cross.csv
+  CUDA_VISIBLE_DEVICES=0 python eval/eval_s-sim.py --mode cross --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/perturbed_prefix_ecapa_hubert/step_latest.ckpt --out_csv /mnt/data/disk2/yejin/LiveVoice/exp/ssim_<run>_cross.csv
 """
 from __future__ import annotations
 
@@ -237,11 +237,37 @@ def run(args) -> None:
     sims_gt: list[float] = []      # content vs ref (GT ceiling/floor)
     sims_src: list[float] = []     # gen vs content (toward SOURCE — want low)
 
-    with open(out_csv, "w", newline="", encoding="utf-8") as fcsv:
+    done: set[str] = set()
+    resume = bool(getattr(args, "resume", False)) and os.path.isfile(out_csv)
+    if resume:
+        with open(out_csv, newline="", encoding="utf-8") as fprev:
+            for r in csv.DictReader(fprev):
+                cw = (r.get("content_wav") or "").strip()
+                if cw:
+                    done.add(cw)
+                    # keep running means for final summary
+                    try:
+                        if r.get("cosine_similarity"):
+                            sims_model.append(float(r["cosine_similarity"]))
+                        if r.get("cosine_similarity_gt"):
+                            sims_gt.append(float(r["cosine_similarity_gt"]))
+                        if r.get("cosine_similarity_src"):
+                            sims_src.append(float(r["cosine_similarity_src"]))
+                    except ValueError:
+                        pass
+        print(f"[s-sim] resume: {len(done)}/{len(items)} already in {out_csv} "
+              f"→ {len(items) - len(done)} remaining")
+
+    mode = "a" if resume else "w"
+    with open(out_csv, mode, newline="", encoding="utf-8") as fcsv:
         writer = csv.DictWriter(fcsv, fieldnames=fieldnames)
-        writer.writeheader()
+        if not resume:
+            writer.writeheader()
         for content_wav, utt_id, content_spk in tqdm(items, desc=f"s-sim {args.mode}"):
+            # Always pick ref first so RNG advances identically on resume.
             ref_wav, ref_spk = _pick_ref(speaker_utts, content_spk, content_wav, args.mode, rng)
+            if content_wav in done:
+                continue
             row = {
                 "content_wav": content_wav, "ref_wav": ref_wav or "",
                 "content_speaker": content_spk, "ref_speaker": ref_spk or "",
@@ -336,6 +362,9 @@ def main() -> None:
     p.add_argument("--max_content_sec", type=float, default=15.0, help="Skip content longer than this (context limit).")
     # output
     p.add_argument("--out_csv", type=str, default="/mnt/data/disk2/yejin/LiveVoice/ssim.csv")
+    p.add_argument("--resume", action="store_true",
+                   help="Append missing rows to existing --out_csv (skip done content_wav). "
+                        "Keeps ref RNG in sync with a full run.")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
     run(args)

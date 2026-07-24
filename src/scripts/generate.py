@@ -31,12 +31,14 @@ from livevoice.config import LiveVoiceConfig
 from livevoice.model import (
     HuBERTContentExtractor,
     StreamVoiceAnonContentEncoder,
+    Sw2vContentEncoder,
     LiveVoiceModel,
     UnconditionalModel,
 )
 from livevoice.model import build_codec
 from livevoice.lightning import UnconditionalLightningModule, LiveVoiceLightningModule
 from livevoice.utils.checkpoint import (
+    infer_content_fsq_from_ckpt,
     infer_content_source_from_ckpt,
     infer_speaker_conditioning_from_ckpt,
     infer_speaker_encoder_from_ckpt,
@@ -139,6 +141,16 @@ def _build_inference_config(args) -> LiveVoiceConfig:
     if getattr(args, "n_codebooks", None) is not None:
         cfg_kwargs["n_codebooks_predict"] = int(args.n_codebooks)
 
+    # FSQ content bottleneck: inferred from the ckpt's `model.content_fsq._levels`
+    # buffer. Must match training or the sw2v content path won't load / align.
+    ckpt_path = getattr(args, "ckpt", None)
+    if ckpt_path:
+        fsq_levels = infer_content_fsq_from_ckpt(ckpt_path)
+        if fsq_levels is not None:
+            cfg_kwargs["use_content_fsq"] = True
+            cfg_kwargs["fsq_levels"] = fsq_levels
+            print(f"[generate] content_fsq=auto → {fsq_levels} (from checkpoint keys)")
+
     src = str(getattr(args, "content_source", "auto")).lower()
     if src != "auto":
         cfg_kwargs["content_source"] = src
@@ -174,6 +186,9 @@ def _resolve_content_source(args, codec_name: str) -> str:
     if inferred is not None:
         print(f"[generate] content_source=auto → {inferred!r} (from checkpoint keys)")
         return inferred
+    fallback = "hubert"
+    print(f"[generate] content_source=auto → {fallback!r} (fallback; ckpt keys ambiguous)")
+    return fallback
 
 
 def _resolve_speaker_conditioning(args) -> str:
@@ -264,6 +279,8 @@ def cmd_vc(args):
         content_extractor = HuBERTContentExtractor(config)
     elif config.content_source == "streamvoiceanon":
         content_extractor = StreamVoiceAnonContentEncoder(config)
+    elif config.content_source == "sw2v":
+        content_extractor = Sw2vContentEncoder(config)
     else:
         content_extractor = None
     model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor=None)
@@ -275,10 +292,24 @@ def cmd_vc(args):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     lit = lit.to(device)
 
-    # Load audio at the codec's native SR 
+    # Load audio at the codec's native SR
     # were trained at 16 kHz; feeding 24 kHz now would silently corrupt encoding.
     sr = int(codec_model.sample_rate)
-    ref = load_audio(args.reference, sr, duration=None).unsqueeze(0).to(device)
+
+    # For the codec speaker encoder, the reference length directly sets the prefix
+    # length (~50 fps → one prefix token per jhcodec frame). Training used ~4s
+    # windows; a full-length reference both mismatches training and can overflow
+    # the KV-cache budget. So trim for the codec path. ECAPA / spark_global pool the
+    # whole utterance to a fixed token count, so they keep the full reference.
+    ref_max_seconds = (
+        None if config.speaker_encoder_type in ("speechbrain_ecapa", "spark_global")
+        else float(args.ref_max_seconds)
+    )
+    print(
+        f"  reference trim = "
+        f"{'full utterance' if ref_max_seconds is None else f'{ref_max_seconds:g}s (~{int(ref_max_seconds*50)} prefix tokens)'}"
+    )
+    ref = load_audio(args.reference, sr, duration=ref_max_seconds).unsqueeze(0).to(device)
     ctn = load_audio(args.content, sr, duration=None).unsqueeze(0).to(device)
 
     print("  Running VC generation...")
@@ -335,11 +366,11 @@ def main():
                     help="Override config.n_codebooks_predict to match the ckpt.")
     pv.add_argument("--reference", required=True, help="Reference speaker audio (.wav)")
     pv.add_argument("--content", required=True, help="Content/source audio (.wav)")
-    pv.add_argument(
-        "--out_dir",
-        default=None,
-        help="Output index only (e.g. 0,1,2). If omitted, next available index is used.",
-    )
+    pv.add_argument("--ref_max_seconds", type=float, default=4.0,
+                    help="Trim reference to this many seconds for the codec speaker encoder "
+                         "(prefix length = ref_seconds*50fps; training used ~4s). Ignored for "
+                         "ECAPA / spark_global (fixed token count). Set very large to disable.")
+    pv.add_argument("--out_dir",        default=None,        help="Output index only (e.g. 0,1,2). If omitted, next available index is used.",    )
     pv.add_argument("--temperature", type=float, default=1.0)
     pv.add_argument("--top_p", type=float, default=0.9)
     pv.add_argument("--top_k", type=int, default=0)
@@ -357,12 +388,12 @@ def main():
         default="auto",
         choices=["auto", "crossattn", "global_avg", "prefix"],
     )
-    pv.add_argument("--speaker_prefix_len", type=int, default=8)
+    pv.add_argument("--speaker_prefix_len", type=int, default=4)
     pv.add_argument(
         "--speaker_encoder_type",
         type=str,
         default="auto",
-        choices=["auto", "codec", "speechbrain_ecapa"],
+        choices=["auto", "codec", "speechbrain_ecapa", "spark_global"],
     )
     pv.add_argument("--speechbrain_source", type=str, default="speechbrain/spkrec-ecapa-voxceleb")
     pv.add_argument(
