@@ -153,19 +153,22 @@ def _build_vc_model(ckpt: str, device: torch.device, args):
         infer_speaker_conditioning_from_ckpt,
         infer_speaker_encoder_from_ckpt,
         infer_content_fsq_from_ckpt,
+        infer_codec_prompt_flags_from_ckpt,
     )
 
     content_source = infer_content_source_from_ckpt(ckpt) or "hubert"
     speaker_conditioning = infer_speaker_conditioning_from_ckpt(ckpt) or "prefix"
     speaker_encoder_type = infer_speaker_encoder_from_ckpt(ckpt) or "codec"
     fsq_levels = infer_content_fsq_from_ckpt(ckpt)
+    cp_flags = infer_codec_prompt_flags_from_ckpt(ckpt)
     print(
         f"[s-sim] ckpt inferred: content_source={content_source} "
         f"speaker_conditioning={speaker_conditioning} speaker_encoder_type={speaker_encoder_type} "
-        f"content_fsq={fsq_levels if fsq_levels else 'off'}"
+        f"content_fsq={fsq_levels if fsq_levels else 'off'} codec_prompt={cp_flags}"
     )
 
     cfg = LiveVoiceConfig(
+        **cp_flags,
         device=str(device),
         codec="jhcodec",
         sample_rate=16000,
@@ -302,6 +305,7 @@ def run(args) -> None:
                         codes = lit.model.generate(
                             reference_audio=ref, content_audio=ctn,
                             temperature=0.0, top_p=None, top_k=None,
+                            cfg_scale=float(getattr(args, "cfg_scale", 1.0)),
                         )
                         gen = lit.model.decode_to_audio(codes)
                     gen16 = gen.squeeze(0).detach().float().cpu()
@@ -359,6 +363,8 @@ def main() -> None:
     p.add_argument("--num_decoder_layers", type=int, default=12)
     p.add_argument("--n_codebooks", type=int, default=8)
     p.add_argument("--speaker_prefix_len", type=int, default=4)
+    # Default follows config.val_cfg_scale so eval matches what validation reports.
+    p.add_argument("--cfg_scale", type=float, default=LiveVoiceConfig.val_cfg_scale)
     p.add_argument("--max_content_sec", type=float, default=15.0, help="Skip content longer than this (context limit).")
     # output
     p.add_argument("--out_csv", type=str, default="/mnt/data/disk2/yejin/LiveVoice/ssim.csv")

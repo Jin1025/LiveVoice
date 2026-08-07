@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 import lightning as L
 
+from livevoice.utils.checkpoint import CONFIG_CKPT_KEY, config_to_ckpt_dict
+
 try:
     import wandb
 except Exception:  # pragma: no cover
@@ -29,21 +31,29 @@ except Exception:  # pragma: no cover
 #  Shared helpers
 # ─────────────────────────────────────────────
 
-def _cross_entropy_loss(all_logits, delayed_targets, weights):
+def _cross_entropy_loss(all_logits, delayed_targets, weights, pos_weights=None):
     """Per-codebook cross-entropy averaged over time, then weighted across codebooks.
 
     all_logits:      (B, T, K, V)
     delayed_targets: (B, T, K) with -100 for padding
     weights:         tuple/list of K floats
+    pos_weights:     optional (B, T) per-position weight. Used by codec_prompt continuation
+                     to down-weight the prompt region (config.codec_prompt_loss_weight).
     """
     B, T, K, V = all_logits.shape
     total_loss = 0.0
     total_weight = 0.0
     per_book = {}
+    pw = None if pos_weights is None else pos_weights.reshape(B * T)
     for k in range(K):
         lg = all_logits[:, :, k, :].reshape(B * T, V)
         tg = delayed_targets[:, :, k].reshape(B * T)
-        lk = F.cross_entropy(lg, tg, ignore_index=-100)
+        if pw is None:
+            lk = F.cross_entropy(lg, tg, ignore_index=-100)
+        else:
+            ce = F.cross_entropy(lg, tg, ignore_index=-100, reduction="none")
+            m = (tg != -100).to(ce.dtype) * pw.to(ce.dtype)
+            lk = (ce * m).sum() / m.sum().clamp_min(1e-8)
         w = float(weights[k]) if k < len(weights) else 1.0
         total_loss = total_loss + w * lk
         total_weight += w
@@ -302,6 +312,10 @@ class LiveVoiceLightningModule(L.LightningModule):
         sd = checkpoint.get("state_dict")
         if isinstance(sd, dict):
             checkpoint["state_dict"] = self._strip_eval_only_modules_from_state_dict(sd)
+        # Persist the config so eval/debug scripts don't have to guess settings that leave
+        # no distinctive parameters (speaker_encoder_type="codec_prompt" is invisible to
+        # topology inference). See utils/checkpoint.CONFIG_CKPT_KEY.
+        checkpoint[CONFIG_CKPT_KEY] = config_to_ckpt_dict(self.config)
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         sd = checkpoint.get("state_dict")
@@ -345,6 +359,12 @@ class LiveVoiceLightningModule(L.LightningModule):
             print(
                 f"[ASR-supervision] seq2seq phoneme-level  weight={getattr(config, 'asr_loss_weight', '?')}  "
                 f"phoneme_cache_dir={getattr(config, 'phoneme_cache_dir', '?')}"
+            )
+        if bool(getattr(config, "use_speaker_grl", False)):
+            print(
+                f"[speaker-GRL] adversary weight={getattr(config, 'grl_loss_weight', '?')}  "
+                f"lambda_max={getattr(config, 'grl_lambda_max', '?')} warmup={getattr(config, 'grl_warmup_steps', '?')}  "
+                f"num_speakers={getattr(config, 'grl_num_speakers', '?')}"
             )
 
     @staticmethod
@@ -595,11 +615,13 @@ class LiveVoiceLightningModule(L.LightningModule):
         ref_z = self._load_reference_z_or_fallback(ref, ref_paths, ref_starts)
 
         out = self.model(
-            ref, ctn, codes, prosody_audio=None, content_feats=content_feats, reference_z=ref_z
+            ref, ctn, codes, prosody_audio=None, content_feats=content_feats, reference_z=ref_z,
+            reference_feats=batch.get("reference_feats"),
         )
         ce_loss, per_book = _cross_entropy_loss(
             out["all_logits"], out["delayed_targets"],
             self.config.codebook_loss_weights,
+            pos_weights=out.get("loss_pos_weights"),
         )
 
         # ── auxiliary losses ────────────────────────────────────────
@@ -625,20 +647,71 @@ class LiveVoiceLightningModule(L.LightningModule):
         asr_w = float(getattr(self.config, "asr_loss_weight", 0.0))
         asr_l = torch.tensor(0.0, device=ce_loss.device)
         feats_full = batch.get("content_feats_full", None)
+        full_audio = batch.get("content_full_audio", None)          # online mode
         phoneme_ids = batch.get("phoneme_ids", None)
+        have_full = feats_full is not None or full_audio is not None
         if (
             asr_w > 0
             and getattr(self.model, "use_asr_supervision", False)
-            and feats_full is not None
+            and have_full
             and phoneme_ids is not None
         ):
             asr_l = self.model.compute_asr_supervision_loss(
-                feats_full.to(self.device),
+                feats_full.to(self.device) if feats_full is not None else None,
                 batch["content_feats_full_len"].to(self.device),
                 phoneme_ids.to(self.device),
+                content_full_audio=full_audio.to(self.device) if full_audio is not None else None,
             )
 
-        loss = ce_loss + z_w * z_l + lat_w * lat_l + asr_w * asr_l
+        # Speaker adversary via Gradient Reversal (removes speaker from the content
+        # embedding; counterpart to ASR which keeps content). λ ramps 0→max (Ganin) so
+        # the classifier learns before the encoder is pushed to fool it. Runs on the same
+        # FULL cached feats as ASR; silently 0 if the batch lacks them. See speaker_grl.py.
+        grl_w = float(getattr(self.config, "grl_loss_weight", 0.0))
+        grl_l = torch.tensor(0.0, device=ce_loss.device)
+        grl_lambda = 0.0
+        grl_acc = None
+        speaker_labels = batch.get("speaker_label", None)
+        if (
+            grl_w > 0
+            and getattr(self.model, "use_speaker_grl", False)
+            and have_full
+            and speaker_labels is not None
+        ):
+            from livevoice.model.speaker_grl import grl_lambda_schedule
+            grl_lambda = grl_lambda_schedule(
+                int(self.global_step),
+                int(getattr(self.config, "grl_warmup_steps", 10000)),
+                float(getattr(self.config, "grl_lambda_max", 1.0)),
+                float(getattr(self.config, "grl_gamma", 10.0)),
+                int(getattr(self.config, "grl_start_step", 0)),
+            )
+            grl_l, grl_acc = self.model.compute_speaker_grl_loss(
+                feats_full.to(self.device) if feats_full is not None else None,
+                batch["content_feats_full_len"].to(self.device),
+                speaker_labels.to(self.device),
+                grl_lambda,
+                content_full_audio=full_audio.to(self.device) if full_audio is not None else None,
+            )
+
+        # NaN safety: a non-finite aux loss (e.g. a CTC edge case) must not poison the whole
+        # model via the shared total loss — drop it for this step and log so it's visible.
+        if asr_w > 0 and not torch.isfinite(asr_l):
+            asr_l = torch.zeros((), device=ce_loss.device)
+            self.log("train/asr_nan", 1.0, on_step=True, on_epoch=False)
+        if grl_w > 0 and not torch.isfinite(grl_l):
+            grl_l = torch.zeros((), device=ce_loss.device)
+            self.log("train/grl_nan", 1.0, on_step=True, on_epoch=False)
+
+        loss = ce_loss + z_w * z_l + lat_w * lat_l + asr_w * asr_l + grl_w * grl_l
+
+        # If the total loss is non-finite (e.g. the content path diverged under GRL
+        # reversal), SKIP this batch — returning None makes Lightning take no optimizer
+        # step, so one bad batch can't poison every weight with NaN and crash later
+        # generation (torch.multinomial device-side assert).
+        if not torch.isfinite(loss):
+            self.log("train/nonfinite_skip", 1.0, on_step=True, on_epoch=False)
+            return None
 
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         self.log("train/ce_loss", ce_loss.detach(), on_step=True, on_epoch=False, sync_dist=True)
@@ -647,7 +720,21 @@ class LiveVoiceLightningModule(L.LightningModule):
         if lat_w > 0:
             self.log("train/latent_loss", lat_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
         if asr_w > 0:
-            self.log("train/asr_loss", asr_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
+            # on_epoch too, so the key matches Stage-1's (train/asr_loss_step|_epoch) and
+            # joint vs Stage-1 runs can be overlaid on the same wandb chart. Without it
+            # Lightning names this plain "train/asr_loss" and the run looks unlogged.
+            self.log("train/asr_loss", asr_l.detach(), on_step=True, on_epoch=True, sync_dist=True)
+        if grl_w > 0:
+            self.log("train/grl_lambda", grl_lambda, on_step=True, on_epoch=False, sync_dist=True)
+            if grl_acc is not None:
+                # batch=8 over 1151 classes makes the per-STEP CE/acc extremely noisy (CE
+                # bounces 3–7, acc mostly 0) and easy to misread as "stuck at chance". Also
+                # log the epoch-mean, which is the trend that actually matters:
+                #   grl_acc_epoch → chance = speaker removed; grl_loss_epoch → ln(N) likewise.
+                self.log("train/grl_loss", grl_l.detach(), on_step=True, on_epoch=True, sync_dist=True)
+                self.log("train/grl_acc", grl_acc.detach(), on_step=True, on_epoch=True, sync_dist=True)
+            else:
+                self.log("train/grl_loss", grl_l.detach(), on_step=True, on_epoch=False, sync_dist=True)
         for k, v in per_book.items():
             self.log(f"train/{k}", v, on_step=True, on_epoch=False, sync_dist=True)
         return loss
@@ -665,10 +752,12 @@ class LiveVoiceLightningModule(L.LightningModule):
 
         codes = self._load_target_codes_or_fallback(tgt, content_paths, content_starts)
         ref_z = self._load_reference_z_or_fallback(ref, ref_paths, ref_starts)
-        out = self.model(ref, ctn, codes, content_feats=content_feats, reference_z=ref_z)
+        out = self.model(ref, ctn, codes, content_feats=content_feats, reference_z=ref_z,
+                         reference_feats=batch.get("reference_feats"))
         loss, _ = _cross_entropy_loss(
             out["all_logits"], out["delayed_targets"],
             self.config.codebook_loss_weights,
+            pos_weights=out.get("loss_pos_weights"),
         )
         self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
 
@@ -760,6 +849,7 @@ class LiveVoiceLightningModule(L.LightningModule):
                 temperature=0.0,
                 top_p=None,
                 top_k=None,
+                cfg_scale=float(getattr(self.config, "val_cfg_scale", 1.0)),
             )
             gen = self.model.decode_to_audio(codes)
             wavs = gen.detach().float().cpu()
@@ -870,6 +960,7 @@ class LiveVoiceLightningModule(L.LightningModule):
             content_audio=ctn_audio,
             temperature=float(getattr(self.config, "temperature", 1.0)),
             top_p=float(getattr(self.config, "top_p", 0.9)),
+            cfg_scale=float(getattr(self.config, "val_cfg_scale", 1.0)),
         )
         gen_audio = self.model.decode_to_audio(codes)
         sr = int(self.config.sample_rate)

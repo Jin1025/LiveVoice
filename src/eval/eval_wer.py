@@ -49,6 +49,7 @@ from livevoice.utils.checkpoint import (
     infer_content_source_from_ckpt,
     infer_speaker_conditioning_from_ckpt,
     infer_speaker_encoder_from_ckpt,
+    infer_codec_prompt_flags_from_ckpt,
 )
 
 # ─────────────────────────────────────────────
@@ -155,12 +156,14 @@ def _build_config(args, ckpt: str, device: str) -> LiveVoiceConfig:
     speaker_conditioning = infer_speaker_conditioning_from_ckpt(ckpt) or "prefix"
     speaker_encoder_type = infer_speaker_encoder_from_ckpt(ckpt) or "codec"
     fsq_levels = infer_content_fsq_from_ckpt(ckpt)
+    cp_flags = infer_codec_prompt_flags_from_ckpt(ckpt)
     print(
         f"[eval] {Path(ckpt).parent.name}: content_source={content_source} "
         f"speaker_conditioning={speaker_conditioning} speaker_encoder_type={speaker_encoder_type} "
-        f"content_fsq={fsq_levels if fsq_levels else 'off'}"
+        f"content_fsq={fsq_levels if fsq_levels else 'off'} codec_prompt={cp_flags}"
     )
     return LiveVoiceConfig(
+        **cp_flags,
         device=device,
         codec="jhcodec",
         sample_rate=16000,
@@ -326,7 +329,9 @@ def main():
     p.add_argument("--hidden_dim", type=int, default=768)
     p.add_argument("--num_decoder_layers", type=int, default=12)
     p.add_argument("--speaker_prefix_len", type=int, default=4)
-    p.add_argument("--cfg_scale", type=float, default=1.0)
+    # Default follows config.val_cfg_scale so eval matches what validation reports.
+    # cfg=1.0 measures the model well below what it can do (see config.val_cfg_scale).
+    p.add_argument("--cfg_scale", type=float, default=LiveVoiceConfig.val_cfg_scale)
     p.add_argument("--whisper_model", type=str, default="medium",
                    help="Whisper model for hyp transcription (GT upper bound used large-v3).")
     p.add_argument("--whisper_device", type=str, default="cuda")

@@ -18,6 +18,11 @@ from livevoice.model.fsq import FSQBottleneck
 from livevoice.model.speechbrain_speaker_encoder import SpeechBrainECAPASpeakerEncoder
 from livevoice.model.spark_speaker_encoder import SparkGlobalSpeakerEncoder
 from livevoice.model.asr_supervision import AsrSupervisionHead
+from livevoice.model.content_supervision import (
+    ContentSupervisionMixin,
+    apply_content_cmn,
+    build_content_path,
+)
 
 try:
     from tqdm.auto import tqdm
@@ -165,6 +170,19 @@ class LiveVoiceTransformer(nn.Module):
             })
         return caches
 
+    def set_speaker_prefix_len(self, prefix_len: int):
+        """Broadcast the ACTUAL speaker-prefix length to every decoder self-attention.
+
+        Needed because the ALiBi exemption / KV sink used to follow the CONFIGURED
+        `speaker_prefix_len` (a constant, 4), while the codec / codec_prompt speaker
+        encoders build one prefix token per reference frame (~200 for a 4s reference).
+        Call before priming the cache.
+        """
+        for layer in self.decoder_layers:
+            setter = getattr(layer.self_attn, "set_active_prefix_len", None)
+            if setter is not None:
+                setter(prefix_len)
+
     def reset_caches(self):
         for layer in self.decoder_layers:
             if hasattr(layer.self_attn, "_cache_inited"):
@@ -176,7 +194,7 @@ class LiveVoiceTransformer(nn.Module):
 # =====================================================================
 # Full model: codec + content + prosody + transformer
 # =====================================================================
-class LiveVoiceModel(nn.Module):
+class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
     """Full VC pipeline.
 
     Components:
@@ -258,12 +276,20 @@ class LiveVoiceModel(nn.Module):
         if self.speaker_conditioning == "prefix" and int(getattr(config, "speaker_prefix_len", 8)) <= 0:
             raise ValueError("speaker_conditioning='prefix' requires speaker_prefix_len > 0.")
         self.speaker_encoder_type = str(getattr(config, "speaker_encoder_type", "codec")).lower()
-        if self.speaker_encoder_type not in {"codec", "speechbrain_ecapa", "spark_global"}:
+        if self.speaker_encoder_type not in {"codec", "codec_prompt", "speechbrain_ecapa", "spark_global"}:
             raise ValueError(
-                "speaker_encoder_type must be one of: codec, speechbrain_ecapa, spark_global; "
-                f"got {self.speaker_encoder_type!r}"
+                "speaker_encoder_type must be one of: codec, codec_prompt, speechbrain_ecapa, "
+                f"spark_global; got {self.speaker_encoder_type!r}"
             )
-        if self.speaker_encoder_type == "speechbrain_ecapa":
+        if self.speaker_encoder_type == "codec_prompt":
+            # VALL-E-style: the reference is embedded with the SAME codebook embeddings as
+            # the AR previous tokens (codebook_vectors_* + decoder_input_projs), so the
+            # decoder sees it as "audio to continue" and carries the voice — no separate
+            # speaker_proj (which the AR just ignored; see debug/diag_prefix_used.py).
+            self.speaker_encoder = None
+            print("[LiveVoiceModel] codec_prompt speaker: reference codec tokens embedded via "
+                  "the shared codebook embeddings (VALL-E-style in-context prompt)")
+        elif self.speaker_encoder_type == "speechbrain_ecapa":
             self.speaker_encoder = SpeechBrainECAPASpeakerEncoder(config)
             spk_dim = int(getattr(config, "speechbrain_embedding_dim", 192))
             self.speaker_proj = nn.Linear(spk_dim, config.hidden_dim)
@@ -290,7 +316,8 @@ class LiveVoiceModel(nn.Module):
         codec_name = str(getattr(config, "codec", "mimi")).lower()
         default_src = "mimi_semantic" if codec_name == "mimi" else "hubert"
         self.content_source = str(getattr(config, "content_source", default_src)).lower()
-        valid_content_sources = {"hubert", "mimi_semantic", "streamvoiceanon", "sw2v"}
+        valid_content_sources = {"hubert", "mimi_semantic", "streamvoiceanon", "sw2v",
+                                 "zipformer"}
         if self.content_source not in valid_content_sources:
             raise ValueError(
                 f"content_source must be one of {sorted(valid_content_sources)}; "
@@ -310,10 +337,11 @@ class LiveVoiceModel(nn.Module):
                 "content_source='streamvoiceanon' but content_extractor was not provided. "
                 "Pass StreamVoiceAnonContentEncoder."
             )
-        if self.content_source == "sw2v" and self.content_extractor is None:
+        if self.content_source in ("sw2v", "zipformer") and self.content_extractor is None:
             raise ValueError(
-                "content_source='sw2v' but content_extractor was not provided. "
-                "Pass Sw2vContentEncoder."
+                f"content_source={self.content_source!r} but content_extractor was not "
+                f"provided. Pass "
+                f"{'Sw2vContentEncoder' if self.content_source == 'sw2v' else 'ZipformerContentEncoder'}."
             )
         print(
             f"[LiveVoiceModel] content_source={self.content_source}  codec={codec_name}  "
@@ -336,31 +364,16 @@ class LiveVoiceModel(nn.Module):
                 "[LiveVoiceModel] streamvoiceanon = causal semantic tokenizer "
                 f"(content_dim={config.content_proj_dim})"
             )
-        elif self.content_source == "sw2v":
-            # jhcodec streaming-wav2vec: continuous out_dim → content_proj_dim → hidden.
+        elif self.content_source in ("sw2v", "zipformer"):
+            # Continuous encoder output → content_proj_dim → hidden. Both sources share this
+            # path (and keep the sw2v_* parameter names so checkpoints stay compatible);
+            # only out_dim differs — sw2v 1024, zipformer 512.
             sw2v_dim = int(getattr(self.content_extractor, "out_dim", 1024))
-            self.sw2v_proj = nn.Linear(sw2v_dim, config.content_proj_dim)
-            self.sw2v_to_hidden = nn.Linear(config.content_proj_dim, config.hidden_dim)
-            print(f"[LiveVoiceModel] sw2v = jhcodec AudioEncoder (out_dim={sw2v_dim} → "
-                  f"content_proj_dim={config.content_proj_dim})")
-            # Optional FSQ information bottleneck after sw2v_proj (see config.py).
-            if bool(getattr(config, "use_content_fsq", False)):
-                self.content_fsq = FSQBottleneck(
-                    config.content_proj_dim, tuple(getattr(config, "fsq_levels", (8, 5, 5, 5)))
-                )
-                print(f"[LiveVoiceModel] content FSQ bottleneck: levels={self.content_fsq.levels} "
-                      f"→ codebook={self.content_fsq.codebook_size}")
-            else:
-                self.content_fsq = None
-
-            # Optional seq2seq ASR (StyleStream-style) supervision on this content
-            # embedding: hangs off sw2v_proj[+content_fsq] output only, never touches
-            # the main decoder, discarded at inference (see asr_supervision.py).
-            self.use_asr_supervision = bool(getattr(config, "use_asr_supervision", False))
-            if self.use_asr_supervision:
-                self.asr_head = AsrSupervisionHead(config)
-            else:
-                self.asr_head = None
+            # Content path + ASR/GRL heads are built by the SHARED builder so the Stage-1
+            # tokenizer (ContentTokenizerModel) and this model have identical modules and
+            # parameter names — a Stage-1 checkpoint loads straight in. See
+            # model/content_supervision.py.
+            build_content_path(self, config, sw2v_dim, log_prefix="[LiveVoiceModel]")
 
     # --------------------- helpers ---------------------
     def align_to_tokens(self, feats: torch.Tensor, num_tokens: int, causal: bool = True) -> torch.Tensor:
@@ -455,12 +468,92 @@ class LiveVoiceModel(nn.Module):
         return codes.transpose(1, 2)
 
     # --------------------- feature extractors ---------------------
+    def _embed_codec_prompt(self, codes: torch.Tensor) -> torch.Tensor:
+        """Embed reference codec tokens with the SAME embeddings as the AR previous tokens
+        (codebook_vectors_* + decoder_input_projs), summed over codebooks. Per-frame, NO
+        delay pattern and NO BOS — this is an in-context PROMPT, not a shifted AR input.
+        codes: (B, K, T_ref) → (B, T_ref, hidden)."""
+        B, K, T = codes.shape
+        emb = torch.zeros(B, T, self.config.hidden_dim, device=codes.device)
+        for k in range(K):
+            cb = getattr(self, f"codebook_vectors_{k}")
+            proj = self.decoder_input_projs[k]
+            emb = emb + proj(cb[codes[:, k, :]])   # (B, T, hidden)
+        return emb
+
+    def _encode_reference_codes(self, reference_audio: torch.Tensor | None) -> torch.Tensor:
+        """Reference audio → discrete codec tokens (B, K, T_ref) for the K predicted books."""
+        if reference_audio is None:
+            raise ValueError("codec_prompt speaker requires reference_audio (discrete codec tokens).")
+        with torch.no_grad():
+            return self.codec_model.encode(reference_audio)[:, : self.n_codebooks_predict, :]
+
+    def _uses_codec_prompt_continuation(self) -> bool:
+        """VALL-E-style: the reference is the first part of the SAME AR stream as the target,
+        rather than a separate prefix block. See config.codec_prompt_continuation."""
+        return (
+            self.speaker_encoder_type == "codec_prompt"
+            and self._uses_speaker_prefix()
+            and bool(getattr(self.config, "codec_prompt_continuation", False))
+        )
+
+    def _prompt_region_content(
+        self,
+        reference_audio: torch.Tensor | None,
+        T_ref: int,
+        B: int,
+        device: torch.device,
+        reference_feats: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(content_add, film) for the T_ref prompt positions of a continuation stream.
+
+        With ``config.codec_prompt_content`` the REFERENCE's own content features are used,
+        so the prompt region is a conditioned prediction task exactly like the target region
+        — the equivalent of VALL-E/CosyVoice2 concatenating the prompt's transcript with the
+        target's. The reference goes through the SAME `extract_content` pipeline as the
+        source (including perturbation when training), so both regions look alike to the
+        decoder. Without the flag the prompt gets null content, as before.
+
+        No delay tail here: the K-1 tail belongs at the END of the joint stream, which the
+        target region's `_align_content_delay` already supplies.
+        """
+        D = self.config.hidden_dim
+        use_ref = bool(getattr(self.config, "codec_prompt_content", False))
+        if use_ref and (reference_feats is not None or reference_audio is not None):
+            # Prefer cached reference features (training): same normalisation and baked-in
+            # perturbation as the target's, and no extra encoder pass. Falls back to the
+            # audio at inference, where an arbitrary reference has no cache entry.
+            add_raw, film_raw = self.extract_content(reference_audio, reference_feats)
+            add = self.align_to_tokens(add_raw, T_ref, causal=True)
+            if film_raw is not None:
+                return add, self.align_to_tokens(film_raw, T_ref, causal=True)
+            return add, torch.zeros(B, T_ref, 0, device=device)
+        zeros_add = torch.zeros(B, T_ref, D, device=device)
+        null_f = self.null_film_feature.expand(B, T_ref, -1)
+        return zeros_add, null_f
+
+    def _set_prefix_len_for_attn(self, prefix_len: int):
+        """Report the ACTUAL prefix length to the decoder attentions (ALiBi exemption + KV sink)."""
+        if self._uses_codec_prompt_continuation() and not bool(
+            getattr(self.config, "codec_prompt_alibi_exempt", True)
+        ):
+            prefix_len = 0
+        self.transformer.set_speaker_prefix_len(prefix_len)
+
     def encode_speaker_reference(
         self,
         reference_audio: torch.Tensor | None,
         reference_z: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reference audio → per-frame speaker embedding at decoder hidden dim."""
+        if self.speaker_encoder_type == "codec_prompt":
+            if reference_audio is None:
+                raise ValueError("codec_prompt speaker requires reference_audio (discrete codec tokens).")
+            K = self.n_codebooks_predict
+            with torch.no_grad():
+                ref_codes = self.codec_model.encode(reference_audio)[:, :K, :]  # (B, K, T_ref)
+            return self._embed_codec_prompt(ref_codes)                          # (B, T_ref, hidden)
+
         if self.speaker_encoder_type == "speechbrain_ecapa":
             if reference_audio is None:
                 raise ValueError("reference_audio is required for SpeechBrain speaker encoder.")
@@ -562,10 +655,18 @@ class LiveVoiceModel(nn.Module):
                 return zeros_add, film_raw
             return self.content_extractor.from_precomputed(content_feats), None
 
-        if content_feats is not None and self.content_source == "sw2v":
+        if content_feats is not None and self.content_source in ("sw2v", "zipformer"):
             # Fast path: precomputed sw2v features (perturbation already baked into cache).
             feats = content_feats.to(device=self.sw2v_proj.weight.device,
                                      dtype=self.sw2v_proj.weight.dtype)
+            if not bool(getattr(self.config, "content_cmn_in_cache", False)):
+                feats = apply_content_cmn(
+                    feats,
+                    str(getattr(self.config, "content_cmn", "off")),
+                    bool(getattr(self.config, "content_cmn_var", False)),
+                )
+            if self.content_refiner is not None:
+                feats = self.content_refiner(feats)             # deep causal refiner
             sw2v_emb = self.sw2v_proj(feats)                    # (B, T, content_proj_dim)
             if self.content_fsq is not None:
                 sw2v_emb = self.content_fsq(sw2v_emb)           # FSQ bottleneck (STE)
@@ -579,6 +680,33 @@ class LiveVoiceModel(nn.Module):
 
         # Apply perturbation to source audio first (used by both paths below)
         if self.use_content_perturbation and self.training:
+            # ##################################### 디버깅
+            # # ── TEMP DEBUG: listen to online content perturbation (delete after check) ──
+            # # File: src/livevoice/model/transformer.py  ≈ extract_content() online path
+            # # Saves once to {output_dir}/output/ then hits breakpoint().
+            # if not getattr(self, "_dbg_saved_perturb", False):
+            #     import os
+            #     import torchaudio
+            #     out_dir = "/workspace/LiveVoice/src/output"
+            #     os.makedirs(out_dir, exist_ok=True)
+            #     sr = int(getattr(self.config, "sample_rate", 16000))
+            #     before = content_audio.detach().float().cpu()
+            #     after = self.content_perturbation(content_audio).detach().float().cpu()
+            #     n = min(2, before.size(0))
+            #     for i in range(n):
+            #         torchaudio.save(
+            #             os.path.join(out_dir, f"content_orig_{i}.wav"),
+            #             before[i : i + 1], sr,
+            #         )
+            #         torchaudio.save(
+            #             os.path.join(out_dir, f"content_perturbed_{i}.wav"),
+            #             after[i : i + 1], sr,
+            #         )
+            #     print(f"[DEBUG perturb] saved {n} pairs → {out_dir}")
+            #     self._dbg_saved_perturb = True
+            #     breakpoint()  # remove this whole TEMP DEBUG block after listening
+            # # ── END TEMP DEBUG ──
+            # #####################################  
             content_audio = self.content_perturbation(content_audio)
 
         # ── Mimi semantic path: codec encoder → continuous z (pre-quantization) ──
@@ -606,8 +734,15 @@ class LiveVoiceModel(nn.Module):
             return self.streamvoiceanon_to_hidden(sva_emb), None
 
         # ── SW2V path: jhcodec AudioEncoder → continuous 1024-d → content_proj_dim ──
-        if self.content_source == "sw2v":
+        if self.content_source in ("sw2v", "zipformer"):
             feat = self.content_extractor(content_audio)      # (B, T_frames, out_dim)
+            feat = apply_content_cmn(
+                feat,
+                str(getattr(self.config, "content_cmn", "off")),
+                bool(getattr(self.config, "content_cmn_var", False)),
+            )
+            if self.content_refiner is not None:
+                feat = self.content_refiner(feat)             # deep causal refiner
             sw2v_emb = self.sw2v_proj(feat)                   # (B, T_frames, content_proj_dim)
             if self.content_fsq is not None:
                 sw2v_emb = self.content_fsq(sw2v_emb)         # FSQ bottleneck (STE)
@@ -629,40 +764,6 @@ class LiveVoiceModel(nn.Module):
             return zeros_add, film_raw
         return self.content_extractor(content_audio), None
 
-    def compute_asr_supervision_loss(
-        self,
-        content_feats_full: torch.Tensor,
-        content_feats_full_len: torch.Tensor,
-        phoneme_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Seq2seq ASR loss on the FULL (un-cropped) sw2v content embedding.
-
-        Runs a SEPARATE forward through sw2v_proj[+content_fsq] on the full-utterance
-        cached features (not the training window) — text labels are utterance-level with
-        no timestamps, so this only makes sense on the whole utterance. sw2v_to_hidden is
-        reused (not duplicated) so the loss shapes the exact representation the main
-        decoder consumes elsewhere.
-
-        content_feats_full:     (B, T_full, sw2v_dim) zero-padded
-        content_feats_full_len: (B,) true (unpadded) frame counts
-        phoneme_ids:             (B, T_ph) = [BOS, ph..., EOS, PAD...]
-        """
-        if self.asr_head is None:
-            return torch.tensor(0.0, device=content_feats_full.device)
-        feats = content_feats_full.to(
-            device=self.sw2v_proj.weight.device, dtype=self.sw2v_proj.weight.dtype
-        )
-        sw2v_emb = self.sw2v_proj(feats)                # (B, T_full, content_proj_dim)
-        if self.content_fsq is not None:
-            sw2v_emb = self.content_fsq(sw2v_emb)        # same FSQ bottleneck as the VC path
-        memory = self.sw2v_to_hidden(sw2v_emb)            # (B, T_full, hidden_dim)
-
-        T_full = memory.size(1)
-        arange = torch.arange(T_full, device=memory.device).unsqueeze(0)  # (1, T_full)
-        memory_key_padding_mask = arange >= content_feats_full_len.unsqueeze(1)  # True = pad
-
-        return self.asr_head.compute_loss(memory, memory_key_padding_mask, phoneme_ids)
-
     # --------------------- forward ---------------------
     def forward(
         self,
@@ -672,6 +773,9 @@ class LiveVoiceModel(nn.Module):
         prosody_audio: torch.Tensor | None = None,
         content_feats: torch.Tensor | None = None,
         reference_z: torch.Tensor | None = None,
+        reference_feats: torch.Tensor | None = None,
+        null_speaker: bool = False,
+        null_content: bool = False,
     ) -> dict:
         """Teacher-forced training forward.
 
@@ -701,24 +805,61 @@ class LiveVoiceModel(nn.Module):
             drop_ctn = torch.rand(B, device=device) < float(self.config.cfg_drop_content_p)
             drop_pro = torch.rand(B, device=device) < float(self.config.cfg_drop_prosody_p)
 
-        # 1. teacher-forced decoder input + targets
-        prev_emb = self._build_delay_input(target_codes) if use_delay else self._build_nodelay_input(target_codes)
-        targets = self._build_delay_targets(target_codes) if use_delay else self._build_nodelay_targets(target_codes)
+        # 0. VALL-E continuation: the reference codes are the FIRST part of the SAME AR
+        # stream as the target (single BOS at the very front, one delay pattern across
+        # both), so the reference tail occupies the prev_emb slots that predict the first
+        # target frames. See config.codec_prompt_continuation.
+        use_cont = self._uses_codec_prompt_continuation()
+        if use_cont:
+            prompt_codes = self._encode_reference_codes(reference_audio)
+            T_ref = int(prompt_codes.shape[2])
+            ar_codes = torch.cat([prompt_codes, target_codes], dim=2)
+        else:
+            T_ref = 0
+            ar_codes = target_codes
 
-        # prev-token dropout (reduce leakage)
+        # 1. teacher-forced decoder input + targets
+        prev_emb = self._build_delay_input(ar_codes) if use_delay else self._build_nodelay_input(ar_codes)
+        targets = self._build_delay_targets(ar_codes) if use_delay else self._build_nodelay_targets(ar_codes)
+
+        # prev-token dropout (reduce leakage). In continuation mode this applies to the
+        # TARGET region only — dropping the prompt region would be speaker dropout, which
+        # the CFG path below owns.
         p_prev = float(getattr(self.config, "prev_emb_dropout_p", 0.0))
         if self.training and p_prev > 0.0:
             mask = torch.rand(B, T_seq, 1, device=device) < p_prev
             null = self.null_prev_embedding.expand(B, T_seq, -1).to(dtype=prev_emb.dtype)
-            prev_emb = torch.where(mask, null, prev_emb)
+            if use_cont:
+                prev_emb = torch.cat(
+                    [prev_emb[:, :T_ref, :], torch.where(mask, null, prev_emb[:, T_ref:, :])],
+                    dim=1,
+                )
+            else:
+                prev_emb = torch.where(mask, null, prev_emb)
 
         # 2. speaker
-        spk = self.encode_speaker_reference(reference_audio, reference_z=reference_z)
+        # `null_speaker=True` forces the speaker signal off for the whole batch — the
+        # ablation debug/diag_prefix_used.py measures. It has to be a forward argument
+        # because in continuation mode there is no encode_speaker_reference() call to patch:
+        # the speaker lives in the prompt region of the AR stream.
         drop_spk_all = drop_spk | drop_both
-        if drop_spk_all.any():
-            spk = spk.clone()
-            null = self.null_speaker_embedding.expand_as(spk).to(dtype=spk.dtype)
-            spk[drop_spk_all] = null[drop_spk_all]
+        if null_speaker:
+            drop_spk_all = torch.ones(B, dtype=torch.bool, device=device)
+        if use_cont:
+            # The prompt IS the speaker conditioning, so CFG speaker-dropout nulls the
+            # prompt region of the stream (keeps null_speaker_embedding meaningful for CFG
+            # and for debug/diag_prefix_used.py).
+            spk = None
+            if drop_spk_all.any():
+                prev_emb = prev_emb.clone()
+                null_s = self.null_speaker_embedding.expand(B, T_ref, -1).to(dtype=prev_emb.dtype)
+                prev_emb[drop_spk_all, :T_ref, :] = null_s[drop_spk_all]
+        else:
+            spk = self.encode_speaker_reference(reference_audio, reference_z=reference_z)
+            if drop_spk_all.any():
+                spk = spk.clone()
+                null = self.null_speaker_embedding.expand_as(spk).to(dtype=spk.dtype)
+                spk[drop_spk_all] = null[drop_spk_all]
 
         # 3. content (precomputed feats take priority over online HuBERT)
         content_add_raw, film_raw = self.extract_content(content_audio, content_feats)
@@ -730,7 +871,13 @@ class LiveVoiceModel(nn.Module):
             if film_raw is not None else None
         )
 
+        # `null_content=True` forces the content signal off for the whole batch. With the
+        # FiLM path zero-initialised and an AR stream that can be continued from prev_emb
+        # alone, "the decoder ignores content" is a real failure mode; this measures it the
+        # same way null_speaker measures prompt usage.
         drop_ctn_all = drop_ctn | drop_both
+        if null_content:
+            drop_ctn_all = torch.ones(B, dtype=torch.bool, device=device)
         if drop_ctn_all.any():
             content_add = content_add.clone()
             null = self.null_content_embedding.expand(B, T_seq, -1).to(dtype=content_add.dtype)
@@ -753,10 +900,41 @@ class LiveVoiceModel(nn.Module):
             content_add = content_add + prosody_add
 
         # 5. transformer
-        if self._uses_speaker_prefix():
+        if use_cont:
+            prompt_add, prompt_film = self._prompt_region_content(
+                reference_audio, T_ref, B, device, reference_feats=reference_feats)
+            content_full = torch.cat([prompt_add.to(dtype=content_add.dtype), content_add], dim=1)
+            if film_feats is None:
+                film_full = None
+            else:
+                film_full = torch.cat([prompt_film.to(dtype=film_feats.dtype), film_feats], dim=1)
+            self._set_prefix_len_for_attn(T_ref)
+            decoder_full = self.transformer.decode_step(
+                prev_emb,
+                content_full,
+                film_full,
+                encoder_output=None,
+                use_cache=False,
+            )
+            w_prompt = float(getattr(self.config, "codec_prompt_loss_weight", 0.0))
+            if w_prompt > 0.0:
+                # Score the whole stream (pure-LM style) but down-weight the prompt region:
+                # the target region is what we actually want to be good at.
+                decoder_output = decoder_full
+                pos_w = torch.ones(B, decoder_full.size(1), device=device)
+                pos_w[:, :T_ref] = w_prompt
+                loss_pos_weights = pos_w
+            else:
+                decoder_output = decoder_full[:, T_ref:, :]
+                targets = targets[:, T_ref:, :]
+                loss_pos_weights = None
+            encoder_output = prev_emb[:, :T_ref, :]
+        elif self._uses_speaker_prefix():
+            loss_pos_weights = None
             prefix, prev_full, content_full, film_full = self._prepend_speaker_prefix(
                 spk, prev_emb, content_add, film_feats,
             )
+            self._set_prefix_len_for_attn(prefix.size(1))
             decoder_full = self.transformer.decode_step(
                 prev_full,
                 content_full,
@@ -767,6 +945,7 @@ class LiveVoiceModel(nn.Module):
             decoder_output = decoder_full[:, prefix.size(1) :, :]
             encoder_output = prefix
         else:
+            loss_pos_weights = None
             out = self.transformer(
                 spk, content_add, film_feats, prev_emb,
                 use_cache=False,
@@ -779,6 +958,7 @@ class LiveVoiceModel(nn.Module):
         return {
             "all_logits": all_logits,
             "delayed_targets": targets,
+            "loss_pos_weights": loss_pos_weights,
             "decoder_output": decoder_output,
             "encoder_output": encoder_output,
         }
@@ -860,17 +1040,35 @@ class LiveVoiceModel(nn.Module):
         if use_prefix and not use_cache:
             raise RuntimeError("speaker_conditioning='prefix' generation requires use_cache=True.")
 
-        spk = (
-            speaker_override
-            if speaker_override is not None
-            else self.encode_speaker_reference(reference_audio)
-        )
-        if use_prefix:
-            spk_prefix = self._build_speaker_prefix(spk)
-            spk_enc = None
-        else:
+        use_cont = self._uses_codec_prompt_continuation()
+        if use_cont:
+            if speaker_override is not None:
+                raise ValueError(
+                    "speaker_override is incompatible with codec_prompt continuation: the "
+                    "speaker is carried by reference codec TOKENS inside the AR stream, not "
+                    "by a speaker embedding. Set config.codec_prompt_continuation=False."
+                )
+            prompt_codes = self._encode_reference_codes(reference_audio)
+            T_ref = int(prompt_codes.shape[2])
+            spk = None
             spk_prefix = None
-            spk_enc = self.transformer.encode_speaker(spk)
+            spk_enc = None
+            self._set_prefix_len_for_attn(T_ref)
+        else:
+            prompt_codes = None
+            T_ref = 0
+            spk = (
+                speaker_override
+                if speaker_override is not None
+                else self.encode_speaker_reference(reference_audio)
+            )
+            if use_prefix:
+                spk_prefix = self._build_speaker_prefix(spk)
+                spk_enc = None
+                self._set_prefix_len_for_attn(spk_prefix.size(1))
+            else:
+                spk_prefix = None
+                spk_enc = self.transformer.encode_speaker(spk)
 
         content_add_raw, film_raw = self.extract_content(content_audio)
         if max_steps is None:
@@ -915,38 +1113,64 @@ class LiveVoiceModel(nn.Module):
 
         use_cfg = cfg_scale != 1.0
         if use_cfg:
-            null_spk = self.null_speaker_embedding.expand_as(spk).to(device=device, dtype=spk.dtype)
             null_caches = self.transformer.init_caches(B, device)
-            if use_prefix:
-                null_prefix = self._build_speaker_prefix(null_spk).to(
-                    device=device,
-                    dtype=prev_emb.dtype,
+            if use_cont:
+                # Unconditional branch = the same stream with the prompt region nulled.
+                null_prefix = self.null_speaker_embedding.expand(B, T_ref, -1).to(
+                    device=device, dtype=prev_emb.dtype,
                 )
                 null_spk_enc = None
             else:
-                null_prefix = None
-                null_spk_enc = self.transformer.encode_speaker(null_spk)
+                null_spk = self.null_speaker_embedding.expand_as(spk).to(device=device, dtype=spk.dtype)
+                if use_prefix:
+                    null_prefix = self._build_speaker_prefix(null_spk).to(
+                        device=device,
+                        dtype=prev_emb.dtype,
+                    )
+                    null_spk_enc = None
+                else:
+                    null_prefix = None
+                    null_spk_enc = self.transformer.encode_speaker(null_spk)
         else:
             null_caches = None
             null_prefix = None
             null_spk_enc = None
 
-        if use_prefix:
+        if use_cont:
+            # Prime the cache with the reference part of the joint AR stream (BOS + delayed
+            # reference codes). Then the first generated step's AR input is position T_ref of
+            # that same stream — the delay window sitting entirely on the reference tail,
+            # exactly what the training forward feeds at the boundary.
+            prime_full = self._build_delay_input(prompt_codes).to(dtype=prev_emb.dtype)
+            prefix = prime_full[:, :T_ref, :]
+            prev_emb = prime_full[:, T_ref : T_ref + 1, :]
+        elif use_prefix:
             assert spk_prefix is not None
             prefix = spk_prefix.to(device=device, dtype=prev_emb.dtype)
-            prefix_content = torch.zeros(
-                B,
-                prefix.size(1),
-                self.config.hidden_dim,
-                device=device,
-                dtype=prev_emb.dtype,
-            )
-            if film_feats is None:
-                prefix_film = None
+
+        if use_cont or use_prefix:
+            if use_cont:
+                # Must match the training stream: the prompt region carries the reference's
+                # own content when config.codec_prompt_content is on, null content otherwise.
+                p_add, p_film = self._prompt_region_content(
+                    reference_audio, prefix.size(1), B, device)
+                prefix_content = p_add.to(device=device, dtype=prev_emb.dtype)
+                prefix_film = (
+                    None if film_feats is None
+                    else p_film.to(device=device, dtype=film_feats.dtype)
+                )
             else:
-                prefix_film = self.null_film_feature.expand(B, prefix.size(1), -1).to(
+                prefix_content = torch.zeros(
+                    B,
+                    prefix.size(1),
+                    self.config.hidden_dim,
                     device=device,
-                    dtype=film_feats.dtype,
+                    dtype=prev_emb.dtype,
+                )
+                prefix_film = (
+                    None if film_feats is None
+                    else self.null_film_feature.expand(B, prefix.size(1), -1).to(
+                        device=device, dtype=film_feats.dtype)
                 )
             self.transformer.decode_step(
                 prefix,
@@ -971,7 +1195,7 @@ class LiveVoiceModel(nn.Module):
         for t in tqdm(range(T_total), desc="VC generating", leave=False):
             c_t = content_add[:, t : t + 1, :]
             f_t = film_feats[:, t : t + 1, :] if film_feats is not None else None
-            step_use_cache = use_cache and (t > 0 or use_prefix)
+            step_use_cache = use_cache and (t > 0 or use_prefix or use_cont)
 
             dec_out = self.transformer.decode_step(
                 prev_emb, c_t, f_t, spk_enc, use_cache=step_use_cache,
@@ -1000,9 +1224,16 @@ class LiveVoiceModel(nn.Module):
                 nxt = torch.zeros(B, 1, self.config.hidden_dim, device=device)
                 for k in range(K):
                     orig = t - k
+                    cb = getattr(self, f"codebook_vectors_{k}")
                     if 0 <= orig < len(generated[k]):
-                        cb = getattr(self, f"codebook_vectors_{k}")
                         nxt += self.decoder_input_projs[k](cb[generated[k][orig]]).unsqueeze(1)
+                    elif use_cont and orig < 0 and T_ref + orig >= 0:
+                        # The delay window still straddles the prompt→target boundary, so
+                        # these codebooks read the REFERENCE tail — the joint-stream
+                        # equivalent of what the training forward does at the same positions.
+                        nxt += self.decoder_input_projs[k](
+                            cb[prompt_codes[:, k, T_ref + orig]]
+                        ).unsqueeze(1)
                 prev_emb = nxt
             else:
                 for k in range(K):
@@ -1025,10 +1256,19 @@ class LiveVoiceModel(nn.Module):
 
 
 def _sample(logits, temperature, top_k, top_p):
+    # Guard against a diverged model producing NaN/Inf logits: torch.multinomial on
+    # non-finite/negative probs triggers a CUDA device-side assert that corrupts the whole
+    # context and crashes the run (surfacing later as a misleading CUBLAS_INTERNAL_ERROR).
+    # Sanitize logits and fall back to argmax if the distribution is still invalid, so a bad
+    # validation sample degrades to noise instead of killing training.
+    if not torch.isfinite(logits).all():
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
     if temperature is None or temperature <= 0:
         return torch.argmax(logits, dim=-1)
     lg = _top_k_top_p(logits, top_k, top_p)
     probs = F.softmax(lg / temperature, dim=-1)
+    if not torch.isfinite(probs).all() or (probs.sum(dim=-1) <= 0).any():
+        return torch.argmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(1)
 
 

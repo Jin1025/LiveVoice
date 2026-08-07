@@ -120,7 +120,7 @@ def extract(items, out_dir, encoder, perturber, training_sr, batch_size, skip_ex
         for wav_path, spk, utt_id, save_path in batch:
             try:
                 a = load_mono(wav_path, SW2V_SR)
-                a = perturber.forward(a.unsqueeze(0)).squeeze(0)  # pitch + EQ (CPU)
+                a = perturber.forward(a.unsqueeze(0)).squeeze(0)  # pitch + EQ + formant shift (CPU)
                 audios.append(a)
             except Exception as e:
                 print(f"  [warn] failed {wav_path}: {e}")
@@ -176,24 +176,34 @@ def main():
                          "all shards write to the same out_dir so the cache merges automatically.")
     pl.add_argument("--num_shards", type=int, default=1,
                     help="Total number of parallel shards (e.g. 3 for GPUs 5,6,7).")
+    pl.add_argument("--perturb", dest="perturb", action="store_true",
+                    help="Bake source-side pitch/EQ(/VTLN) into the cache.")
+    pl.add_argument("--no_perturb", dest="perturb", action="store_false",
+                    help="Extract clean (unperturbed) features.")
+    pl.set_defaults(perturb=None)  # None → follow LiveVoiceConfig.use_content_perturbation
     args = p.parse_args()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # Config: 16 kHz so ContentPerturbation + sw2v agree; perturbation values come from
-    # the dataclass defaults (pitch ±4, EQ ±6 dB) — same knobs as the HuBERT cache.
+    # Config: 16 kHz so ContentPerturbation + sw2v agree; perturbation knobs come from
+    # LiveVoiceConfig (use_content_perturbation / pitch / EQ / VTLN).
     config = LiveVoiceConfig(sample_rate=SW2V_SR, sw2v_sample_rate=SW2V_SR,
                              sw2v_ckpt=args.sw2v_ckpt, sw2v_config=args.sw2v_config)
+    do_perturb = bool(config.use_content_perturbation) if args.perturb is None else bool(args.perturb)
 
     print(f"[extract-sw2v] loading AudioEncoder ({args.sw2v_ckpt}) on {args.device} ...")
     encoder = Sw2vBatchEncoder(config, args.device)
-    print(f"[extract-sw2v] out_dim={encoder.out_dim}  "
-          f"perturb: pitch±{config.perturb_pitch_semitones} EQ±{config.perturb_eq_gain_db}dB "
-          f"vtln={config.use_vtln}")
+    if do_perturb:
+        print(f"[extract-sw2v] out_dim={encoder.out_dim}  "
+              f"perturb=ON pitch±{config.perturb_pitch_semitones} "
+              f"EQ±{config.perturb_eq_gain_db}dB vtln={config.use_vtln}")
+    else:
+        print(f"[extract-sw2v] out_dim={encoder.out_dim}  perturb=OFF (clean cache)")
 
     perturber = ContentPerturbation(config)
-    perturber.train()  # enable perturbation
+    # ContentPerturbation only applies transforms in train(); eval() is identity.
+    perturber.train(do_perturb)
 
     splits = [s.strip() for s in args.splits.split(",")]
     print(f"[extract-sw2v] discovering LibriTTS ({splits}) at {args.libritts_path} ...")

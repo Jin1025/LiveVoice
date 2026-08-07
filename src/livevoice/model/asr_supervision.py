@@ -66,10 +66,16 @@ class AsrSupervisionHead(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(layer, num_layers=n_layers)
         self.out_proj = nn.Linear(d_model, vocab_size)
+        # Teacher-forcing input dropout: randomly ZERO input-phoneme embeddings so the
+        # decoder can't fill those positions from the phoneme LM alone and MUST read the
+        # content memory. Fixes the "LM shortcut" where asr_loss drops without using
+        # content at all (verified via debug/diag_asr_uses_content.py: content-usage gap
+        # ≈ 0 with p=0). Only active in .train().
+        self.teacher_dropout = float(getattr(config, "asr_teacher_dropout", 0.0))
         print(
             f"[AsrSupervisionHead] seq2seq (StyleStream-style, phoneme-level), "
             f"layers={n_layers} d_model={d_model} ffn={ffn_dim} vocab={vocab_size} "
-            f"— training-only, discarded at inference"
+            f"teacher_dropout={self.teacher_dropout} — training-only, discarded at inference"
         )
 
     def forward(
@@ -82,7 +88,13 @@ class AsrSupervisionHead(nn.Module):
         tgt_ids: (B, T_tgt) teacher-forced input ids (BOS + phones, EOS excluded).
         Returns logits (B, T_tgt, vocab_size).
         """
-        tgt = self.pos_enc(self.tok_emb(tgt_ids))
+        emb = self.tok_emb(tgt_ids)                          # (B, T_tgt, d_model)
+        if self.training and self.teacher_dropout > 0:
+            # word-dropout: zero whole token embeddings (keep positional info) so those
+            # positions must be predicted from the content memory, not the prev tokens.
+            keep = (torch.rand(emb.shape[:2], device=emb.device) >= self.teacher_dropout)
+            emb = emb * keep.unsqueeze(-1).to(emb.dtype)
+        tgt = self.pos_enc(emb)
         T_tgt = tgt_ids.size(1)
         # Bool causal mask (not the float -inf variant) so its dtype matches the bool
         # key-padding masks below — avoids PyTorch's "mismatched mask dtype" warning/path.

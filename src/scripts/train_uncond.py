@@ -90,6 +90,7 @@ def main():
     log_dir = os.path.join(config.output_dir, "logs")
     ckpt_dir = os.path.join(config.output_dir, "checkpoints", config.exp_name)
     if args.use_wandb and WandbLogger is not None:
+        os.environ.setdefault("WANDB_CONSOLE", "off")
         logger = WandbLogger(
             project=args.wandb_project,
             entity=args.wandb_entity,

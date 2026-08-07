@@ -42,6 +42,7 @@ from livevoice.utils.checkpoint import (
     infer_content_source_from_ckpt,
     infer_speaker_conditioning_from_ckpt,
     infer_speaker_encoder_from_ckpt,
+    infer_codec_prompt_flags_from_ckpt,
 )
 
 
@@ -174,6 +175,10 @@ def _build_inference_config(args) -> LiveVoiceConfig:
         value = getattr(args, name, None)
         if value:
             cfg_kwargs[name] = value
+
+    # Rebuild codec_prompt the way the ckpt was trained (old ckpts predate continuation).
+    for k, v in infer_codec_prompt_flags_from_ckpt(args.ckpt).items():
+        cfg_kwargs.setdefault(k, v)
 
     return LiveVoiceConfig(**cfg_kwargs)
 

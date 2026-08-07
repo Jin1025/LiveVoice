@@ -181,6 +181,14 @@ class MultiHeadAttention(nn.Module):
             self.alibi_prefix_len = int(getattr(config, "speaker_prefix_len", 0))
         else:
             self.alibi_prefix_len = 0
+        # The CONFIGURED length above is only correct for speaker encoders that emit a
+        # fixed-size prefix (speechbrain_ecapa). The "codec"/"codec_prompt" encoders build
+        # one prefix token per reference frame (audio_duration*50, e.g. 200 for 4s), so the
+        # exemption has to follow the ACTUAL prefix the model built — otherwise every prompt
+        # frame past index `speaker_prefix_len` keeps the full ALiBi distance penalty and,
+        # sitting 100-400 positions away, becomes unreachable for the large-slope heads.
+        # `set_active_prefix_len` is how the model reports the real length at runtime.
+        self._active_prefix_len = self.alibi_prefix_len
         self.sink_size = max(1, self.alibi_prefix_len)
 
         # Projection layers
@@ -203,6 +211,34 @@ class MultiHeadAttention(nn.Module):
         self._total_seen = 0      # total number of non-sink tokens appended (monotonic)
         self.cur_cache_len = 0    # sink_size + _non_sink_len (exposed for compatibility)
     
+    def set_active_prefix_len(self, prefix_len: int):
+        """Tell this attention how many leading positions are speaker-prefix tokens.
+
+        Those columns get a zero ALiBi distance penalty (reachable from any query) and are
+        pinned as the KV-cache attention sink. Must be called BEFORE the cache is
+        (re-)initialised, i.e. before the use_cache=False priming pass.
+        """
+        p = max(0, int(prefix_len))
+        if p == self._active_prefix_len:
+            return
+        self._active_prefix_len = p
+        if (not self.cross_attn) and self.purpose == "decoder":
+            self.sink_size = max(1, p)
+            self._cache_inited = False
+            self._ring_write_pos = self.sink_size
+            self._non_sink_len = 0
+            self._total_seen = 0
+            self.cur_cache_len = 0
+
+    def _apply_prefix_exemption(self, alibi_slice: torch.Tensor) -> torch.Tensor:
+        """Zero the ALiBi distance penalty on the leading prefix columns of a bias slice."""
+        p = min(self._active_prefix_len, alibi_slice.size(-1))
+        if p <= 0:
+            return alibi_slice
+        out = alibi_slice.clone()
+        out[..., :p] = 0.0
+        return out
+
     def _init_attn_mask(self, capacity: int):
         """Initialize causal mask and ALiBi bias.
         
@@ -250,12 +286,9 @@ class MultiHeadAttention(nn.Module):
             self.register_buffer("causal_attn_bias", causal_attn_bias)
 
             alibi_attn_bias = (m * relative_positions).unsqueeze(0)  # [1, H, L, L]
-            # Prefix-aware: zero distance penalty for prefix columns so they
-            # stay accessible from any query position regardless of distance.
-            # The causal mask is unchanged — queries still can't see future
-            # tokens, but past prefix tokens are no longer penalized.
-            if self.alibi_prefix_len > 0:
-                alibi_attn_bias[..., : self.alibi_prefix_len] = 0.0
+            # NOTE: the prefix exemption is NOT baked into this buffer any more — it is
+            # applied to the sliced bias in forward()/forward_stateless() using
+            # `_active_prefix_len`, which tracks the prefix the model actually built.
             self.register_buffer("alibi_attn_bias", alibi_attn_bias)
     
     def forward(self, x, mem=None, use_cache=False):
@@ -328,7 +361,9 @@ class MultiHeadAttention(nn.Module):
         else:
             # Decoder self-attention: causal mask + asymmetric ALiBi
             causal_attn_bias_slice = self.causal_attn_bias[:, :, q_start:q_end, : self.cur_cache_len]
-            alibi_attn_bias_slice = self.alibi_attn_bias[:, :, q_start:q_end, : self.cur_cache_len]
+            alibi_attn_bias_slice = self._apply_prefix_exemption(
+                self.alibi_attn_bias[:, :, q_start:q_end, : self.cur_cache_len]
+            )
             attn_bias = causal_attn_bias_slice + alibi_attn_bias_slice
         
         y = F.scaled_dot_product_attention(
@@ -339,8 +374,8 @@ class MultiHeadAttention(nn.Module):
             dropout_p=self.attn_dropout.p if self.training else 0.0,
         )
 
-        # Diagnostic: store cross-attn weights when flag is set
-        if self.cross_attn and getattr(self, '_capture_attn_weights', False):
+        # Diagnostic: store attention weights when flag is set (cross- or self-attn)
+        if getattr(self, '_capture_attn_weights', False):
             with torch.no_grad():
                 d_k = q.size(-1)
                 raw_scores = torch.matmul(q, k.transpose(-2, -1)) / (d_k ** 0.5)
@@ -416,7 +451,9 @@ class MultiHeadAttention(nn.Module):
         else:
             # Decoder self-attention: causal mask + asymmetric ALiBi
             causal_attn_bias_slice = self.causal_attn_bias[:, :, q_start:q_end, :kv_cache_out["cur_cache_len"]]
-            alibi_attn_bias_slice = self.alibi_attn_bias[:, :, q_start:q_end, :kv_cache_out["cur_cache_len"]]
+            alibi_attn_bias_slice = self._apply_prefix_exemption(
+                self.alibi_attn_bias[:, :, q_start:q_end, :kv_cache_out["cur_cache_len"]]
+            )
             attn_bias = causal_attn_bias_slice + alibi_attn_bias_slice
         
         y = F.scaled_dot_product_attention(
