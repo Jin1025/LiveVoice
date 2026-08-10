@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import os
 import random
 import sys
@@ -57,14 +58,17 @@ from livevoice.lightning import LiveVoiceLightningModule
 from livevoice.model import (
     HuBERTContentExtractor,
     StreamVoiceAnonContentEncoder,
+    Sw2vContentEncoder,
     LiveVoiceModel,
     build_codec,
 )
 from livevoice.utils.checkpoint import (
+    infer_codec_prompt_flags_from_ckpt,
     infer_content_source_from_ckpt,
     infer_speaker_conditioning_from_ckpt,
     infer_speaker_encoder_from_ckpt,
     load_model_weights_from_ckpt,
+    read_config_from_ckpt,
 )
 from eval.vpc_pretrained import (
     VPCASREvaluator,
@@ -136,10 +140,38 @@ def _read_trials(path: Path) -> list[tuple[str, str, int]]:
 # ──────────────────────────────────────────────────────────────────────
 #  VC anonymizer
 # ──────────────────────────────────────────────────────────────────────
+# Fields the EVAL owns — never taken from the checkpoint. Everything else in a stored
+# config describes the model that was trained and must be reproduced exactly, or we score
+# the weights inside a different architecture (this is how the 2026-08-04 CFG sweep got
+# invalidated: audio_duration and the codec_prompt_* flags silently came from today's
+# defaults instead of from the run).
+_EVAL_OWNED_FIELDS = frozenset({
+    "device", "output_dir",
+    # Feature caches only cover LibriTTS utterances. VPC enrol/trial wavs are not in them,
+    # so every content path has to run on-the-fly here regardless of how it was trained.
+    "features_dir", "sw2v_features_dir", "zipformer_features_dir",
+    # Auxiliary training heads take no part in generation, and GRL additionally needs a
+    # grl_num_speakers the eval has no speaker vocab for.
+    "use_asr_supervision", "use_speaker_grl",
+    # Training-time augmentation; inference guidance is controlled by --cfg_scale.
+    "use_cfg_dropout",
+})
+
+# Decisive for reproducing the model — echoed so a wrong build is visible in the log.
+_CONFIG_ECHO_FIELDS = (
+    "content_source", "content_conditioning", "content_cmn", "content_cmn_in_cache",
+    "content_refiner_layers", "use_content_fsq", "use_content_perturbation",
+    "zipformer_layer", "zipformer_align_pad_frames",
+    "speaker_encoder_type", "speaker_conditioning", "speaker_prefix_len",
+    "codec_prompt_continuation", "codec_prompt_content",
+    "audio_duration", "hidden_dim", "num_decoder_layers", "n_codebooks_predict",
+)
+
+
 def _build_vc_config(args: argparse.Namespace, device: str) -> LiveVoiceConfig:
     codec = str(args.codec).lower()
     sample_rate = 24000 if codec == "mimi" else 16000
-    return LiveVoiceConfig(
+    kw = dict(
         device=device,
         codec=codec,
         sample_rate=sample_rate,
@@ -159,6 +191,52 @@ def _build_vc_config(args: argparse.Namespace, device: str) -> LiveVoiceConfig:
         use_content_perturbation=bool(args.use_content_perturbation),
     )
 
+    stored = read_config_from_ckpt(args.ckpt) if args.ckpt else None
+    if stored:
+        known = {f.name for f in dataclasses.fields(LiveVoiceConfig)}
+        overridden = []
+        for k, v in stored.items():
+            if k not in known or k in _EVAL_OWNED_FIELDS:
+                continue
+            if k in kw and kw[k] != v:
+                overridden.append(f"{k}: {kw[k]!r} → {v!r}")
+            kw[k] = v
+        print(f"[eval] stored config found in ckpt ({len(stored)} fields) — using it")
+        for line in overridden:
+            print(f"[eval]   CLI overridden by ckpt  {line}")
+    else:
+        # Pre-CONFIG_CKPT_KEY checkpoint: nothing to read, so fall back to topology
+        # inference. A codec_prompt_* field that did not exist yet must read as OFF, not as
+        # today's default — that is what infer_codec_prompt_flags_from_ckpt encodes.
+        kw.update(infer_codec_prompt_flags_from_ckpt(args.ckpt))
+        print("[eval] WARNING: no stored config in this ckpt (saved before configs were "
+              "checkpointed). Architecture is inferred; verify hidden_dim/audio_duration/"
+              "content_* by hand before trusting the numbers.")
+
+    cfg = LiveVoiceConfig(**kw)
+    # Belt and braces: caches must be off even if a field slipped past the filter above.
+    cfg.features_dir = None
+    cfg.sw2v_features_dir = None
+    cfg.zipformer_features_dir = None
+    print("[eval] config: " + "  ".join(
+        f"{f}={getattr(cfg, f, '<n/a>')}" for f in _CONFIG_ECHO_FIELDS))
+
+    # Fail before loading the codec / content encoder / ASV attacker, not thousands of
+    # utterances in. Every anonymisation path here goes through generate_anonymized ->
+    # speaker_override, which averages a speaker representation over K pool references.
+    # codec_prompt continuation has no speaker representation to average: the reference IS a
+    # codec token stream occupying the first T_ref positions of the same AR sequence, so
+    # generate() rejects speaker_override outright.
+    if (cfg.speaker_encoder_type == "codec_prompt"
+            and cfg.speaker_conditioning == "prefix"
+            and bool(getattr(cfg, "codec_prompt_continuation", False))):
+        raise SystemExit(
+            "[eval] this checkpoint uses codec_prompt continuation, which the K-reference "
+            "blending anonymiser in this script cannot drive (_anonymize_svanon -> "
+            "generate_anonymized -> speaker_override). It needs a single-reference path "
+            "calling _anonymize() / model.generate(reference_audio=...) directly.")
+    return cfg
+
 
 def _auto_infer(args: argparse.Namespace) -> None:
     if str(args.content_source).lower() == "auto":
@@ -172,14 +250,32 @@ def _auto_infer(args: argparse.Namespace) -> None:
         print(f"[eval] speaker_encoder_type=auto → {args.speaker_encoder_type!r}")
 
 
+def _build_content_extractor(cfg):
+    """Content encoder for the trained content_source. Must mirror train.py — a source that
+    silently falls through to None hands the decoder no content at all, and the model then
+    rides the AR stream: fluent audio saying the wrong words."""
+    cs = str(cfg.content_source).lower()
+    if cs == "hubert":
+        return HuBERTContentExtractor(cfg)
+    if cs == "streamvoiceanon":
+        return StreamVoiceAnonContentEncoder(cfg)
+    if cs == "sw2v":
+        return Sw2vContentEncoder(cfg)
+    if cs == "zipformer":
+        from livevoice.model.zipformer_content import ZipformerContentEncoder
+        layer = str(cfg.zipformer_layer)
+        return ZipformerContentEncoder(
+            cfg, cfg.zipformer_ckpt, layer=(layer if layer == "out" else int(layer)))
+    if cs in ("mimi_semantic", "none", ""):
+        return None
+    raise SystemExit(
+        f"[eval] content_source={cs!r} has no extractor branch here; add one rather than "
+        f"running with no content encoder.")
+
+
 def _build_vc_model(args, cfg, dev):
     codec_model = build_codec(cfg)
-    if cfg.content_source == "hubert":
-        content_extractor = HuBERTContentExtractor(cfg)
-    elif cfg.content_source == "streamvoiceanon":
-        content_extractor = StreamVoiceAnonContentEncoder(cfg)
-    else:
-        content_extractor = None
+    content_extractor = _build_content_extractor(cfg)
     core = LiveVoiceModel(cfg, codec_model, content_extractor, prosody_extractor=None)
     missing, unexpected = load_model_weights_from_ckpt(core, args.ckpt, log_prefix="[eval]")
     if missing:

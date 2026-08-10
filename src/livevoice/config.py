@@ -297,8 +297,11 @@ class LiveVoiceConfig:
     # which is NOT on the codec grid and would need upsampling.
     zipformer_ckpt: str = "/mnt/data/disk3/yejin/zipformer_pretrained.pt"
     zipformer_layer: str = "-1"
-    zipformer_features_dir = None
-    # zipformer_features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/zipformer_cmn_6"
+    # Annotated (unlike a bare ``= None``) so it stays a real dataclass field even when off:
+    # an unannotated attribute is skipped by dataclasses.asdict, so it never reached the
+    # checkpoint and a ckpt could not say whether it was trained cached or on-the-fly.
+    zipformer_features_dir: str | None = None
+    # zipformer_features_dir: str | None = "/mnt/data/disk2/yejin/LiveVoice/features/zipformer_cmn_6"
     # Front padding (in 50 fps frames)
     #   0  → best lag −4  (content ~80 ms stale, NO added latency)  ← streaming default
     #  −6  → best lag  0  (aligned, but ~120 ms of lookahead)
