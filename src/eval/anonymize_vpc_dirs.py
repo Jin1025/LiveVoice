@@ -40,9 +40,11 @@ GPUs). Reruns skip finished files, so an interrupted shard just resumes.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import glob
 import io
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -50,19 +52,31 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import librosa
 import soundfile as sf
 import torch
 import torchaudio
 from tqdm import tqdm
 
-from eval.eval_anon import (
-    DEFAULT_VPC_ROOT,
-    _build_vc_config,
-    _build_vc_model,
-    _make_selector,
-    _read_kaldi,
-    _load_ref,
+from livevoice.config import LiveVoiceConfig
+from livevoice.lightning import LiveVoiceLightningModule
+from livevoice.model import (
+    HuBERTContentExtractor,
+    StreamVoiceAnonContentEncoder,
+    Sw2vContentEncoder,
+    LiveVoiceModel,
+    build_codec,
 )
+from livevoice.utils.checkpoint import (
+    infer_codec_prompt_flags_from_ckpt,
+    infer_content_source_from_ckpt,
+    infer_speaker_conditioning_from_ckpt,
+    infer_speaker_encoder_from_ckpt,
+    load_model_weights_from_ckpt,
+    read_config_from_ckpt,
+)
+
+DEFAULT_VPC_ROOT = "/mnt/data/disk3/yejin/VPC"
 
 # Track 1 needs all of these: the four ASV dirs, IEMOCAP for UAR, and train-clean-360 to
 # fine-tune the semi-informed attacker.
@@ -72,6 +86,62 @@ TRACK1_DATASETS = (
     "IEMOCAP_dev", "IEMOCAP_test",
     "train-clean-360",
 )
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Kaldi / audio IO
+# ──────────────────────────────────────────────────────────────────────
+def _read_kaldi(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2:
+                out[parts[0]] = parts[1]
+    return out
+
+
+def _resolve_wav(scp_value: str, wav_base: Path | None = None) -> str:
+    if scp_value.rstrip().endswith("|"):
+        raise ValueError(
+            f"wav.scp pipe entries are not supported here, use _decode_entry: {scp_value!r}"
+        )
+    p = Path(scp_value)
+    if p.is_file():
+        return str(p.resolve())
+    if wav_base is not None:
+        cand = (wav_base / scp_value).resolve()
+        if cand.is_file():
+            return str(cand)
+    if os.path.isfile(scp_value):
+        return os.path.abspath(scp_value)
+    raise FileNotFoundError(
+        f"wav not found for wav.scp entry {scp_value!r} (wav_base={wav_base})"
+    )
+
+
+def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
+    try:
+        with sf.SoundFile(path) as f:
+            audio_np = f.read(dtype="float32", always_2d=True)
+            sr = int(f.samplerate)
+        audio = torch.from_numpy(audio_np).float().mean(dim=1)
+    except Exception:
+        audio_np, sr = librosa.load(path, sr=None, mono=True)
+        audio = torch.from_numpy(audio_np.astype("float32"))
+        sr = int(sr)
+    if sr != target_sr:
+        audio = torchaudio.functional.resample(audio, sr, target_sr)
+    return audio / (audio.abs().max() + 1e-8)
+
+
+def _load_ref(path, target_sr, crop_sec) -> torch.Tensor:
+    w = _load_full_mono_wav(path, target_sr)
+    n = int(crop_sec * target_sr)
+    if crop_sec and crop_sec > 0 and w.numel() > n:
+        start = random.Random(f"crop:{path}").randint(0, w.numel() - n)
+        w = w[start : start + n]
+    return w
 
 
 _AUDIO_EXT = (".flac", ".wav", ".ogg", ".opus", ".mp3")
@@ -113,6 +183,249 @@ def _load_scp_audio(entry: str, vpc_root: Path, target_sr: int) -> torch.Tensor:
     if int(sr) != target_sr:
         w = torchaudio.functional.resample(w, int(sr), target_sr)
     return w / (w.abs().max() + 1e-8)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Rebuilding the trained model
+# ──────────────────────────────────────────────────────────────────────
+# Fields the EVAL owns — never taken from the checkpoint. Everything else in a stored config
+# describes the model that was trained and must be reproduced exactly, or we score the weights
+# inside a different architecture (this is how the 2026-08-04 CFG sweep got invalidated:
+# audio_duration and the codec_prompt_* flags silently came from today's defaults).
+_EVAL_OWNED_FIELDS = frozenset({
+    "device", "output_dir",
+    # Feature caches only cover LibriTTS utterances. VPC enrol/trial wavs are not in them, so
+    # every content path has to run on-the-fly here regardless of how it was trained.
+    "features_dir", "sw2v_features_dir", "zipformer_features_dir",
+    # Auxiliary training heads take no part in generation, and GRL additionally needs a
+    # grl_num_speakers the eval has no speaker vocab for.
+    "use_asr_supervision", "use_speaker_grl",
+    # Training-time augmentation; inference guidance is controlled by --cfg_scale.
+    "use_cfg_dropout",
+})
+
+# Decisive for reproducing the model — echoed so a wrong build is visible in the log.
+_CONFIG_ECHO_FIELDS = (
+    "content_source", "content_conditioning", "content_cmn", "content_cmn_in_cache",
+    "content_refiner_layers", "use_content_fsq", "use_content_perturbation",
+    "zipformer_layer", "zipformer_align_pad_frames",
+    "speaker_encoder_type", "speaker_conditioning", "speaker_prefix_len",
+    "codec_prompt_continuation", "codec_prompt_content",
+    "audio_duration", "hidden_dim", "num_decoder_layers", "n_codebooks_predict",
+)
+
+
+def _auto_infer(args: argparse.Namespace) -> None:
+    if str(args.content_source).lower() == "auto":
+        args.content_source = infer_content_source_from_ckpt(args.ckpt) or "hubert"
+    if str(args.speaker_conditioning).lower() == "auto":
+        args.speaker_conditioning = infer_speaker_conditioning_from_ckpt(args.ckpt) or "prefix"
+    if str(args.speaker_encoder_type).lower() == "auto":
+        args.speaker_encoder_type = infer_speaker_encoder_from_ckpt(args.ckpt) or "codec"
+
+
+def _build_vc_config(args: argparse.Namespace, device: str) -> LiveVoiceConfig:
+    codec = str(args.codec).lower()
+    kw = dict(
+        device=device,
+        codec=codec,
+        sample_rate=24000 if codec == "mimi" else 16000,
+        hidden_dim=int(args.hidden_dim),
+        num_decoder_layers=int(args.num_decoder_layers),
+        ffn_dim=4 * int(args.hidden_dim),
+        n_codebooks_predict=int(args.n_codebooks),
+        content_source=str(args.content_source).lower(),
+        speaker_conditioning=str(args.speaker_conditioning).lower(),
+        speaker_prefix_len=int(args.speaker_prefix_len),
+        speaker_encoder_type=str(args.speaker_encoder_type).lower(),
+        speechbrain_source=args.speechbrain_source,
+        speechbrain_sample_rate=int(args.speechbrain_sample_rate),
+        speechbrain_embedding_dim=int(args.speechbrain_embedding_dim),
+        features_dir=None,
+        output_dir=args.output_dir,
+        use_content_perturbation=bool(args.use_content_perturbation),
+    )
+
+    stored = read_config_from_ckpt(args.ckpt) if args.ckpt else None
+    if stored:
+        known = {f.name for f in dataclasses.fields(LiveVoiceConfig)}
+        defaults = {f.name: f.default for f in dataclasses.fields(LiveVoiceConfig)}
+        overridden, relocated = [], []
+        for k, v in stored.items():
+            if k not in known or k in _EVAL_OWNED_FIELDS:
+                continue
+            # A stored config records where the weights lived WHEN IT WAS TRAINED. Those
+            # files get moved; an absolute path that no longer exists must not override a
+            # working default, or every checkpoint predating a reorganisation becomes
+            # unloadable. Only fall back when the current default actually resolves.
+            if isinstance(v, str) and v.startswith("/") and not os.path.exists(v):
+                d = defaults.get(k)
+                if isinstance(d, str) and os.path.exists(d):
+                    relocated.append(f"{k}: {v} (missing) → {d}")
+                    continue
+            if k in kw and kw[k] != v:
+                overridden.append(f"{k}: {kw[k]!r} → {v!r}")
+            kw[k] = v
+        print(f"[eval] stored config found in ckpt ({len(stored)} fields) — using it")
+        for line in overridden:
+            print(f"[eval]   CLI overridden by ckpt  {line}")
+        for line in relocated:
+            print(f"[eval]   stale path in ckpt, using config.py default  {line}")
+    else:
+        # Pre-CONFIG_CKPT_KEY checkpoint: nothing to read, so fall back to topology inference.
+        # A codec_prompt_* field that did not exist yet must read as OFF, not as today's
+        # default — that is what infer_codec_prompt_flags_from_ckpt encodes.
+        kw.update(infer_codec_prompt_flags_from_ckpt(args.ckpt))
+        print("[eval] WARNING: no stored config in this ckpt (saved before configs were "
+              "checkpointed). Architecture is inferred; verify hidden_dim/audio_duration/"
+              "content_* by hand before trusting the numbers.")
+
+    cfg = LiveVoiceConfig(**kw)
+    # Belt and braces: caches must be off even if a field slipped past the filter above.
+    cfg.features_dir = None
+    cfg.sw2v_features_dir = None
+    cfg.zipformer_features_dir = None
+    print("[eval] config: " + "  ".join(
+        f"{f}={getattr(cfg, f, '<n/a>')}" for f in _CONFIG_ECHO_FIELDS))
+    return cfg
+
+
+def _build_content_extractor(cfg):
+    """Content encoder for the trained content_source. Must mirror train.py — a source that
+    silently falls through to None hands the decoder no content at all, and the model then
+    rides the AR stream: fluent audio saying the wrong words."""
+    cs = str(cfg.content_source).lower()
+    if cs == "hubert":
+        return HuBERTContentExtractor(cfg)
+    if cs == "streamvoiceanon":
+        return StreamVoiceAnonContentEncoder(cfg)
+    if cs == "sw2v":
+        return Sw2vContentEncoder(cfg)
+    if cs == "zipformer":
+        from livevoice.model.zipformer_content import ZipformerContentEncoder
+        layer = str(cfg.zipformer_layer)
+        return ZipformerContentEncoder(
+            cfg, cfg.zipformer_ckpt, layer=(layer if layer == "out" else int(layer)))
+    if cs in ("mimi_semantic", "none", ""):
+        return None
+    raise SystemExit(
+        f"[eval] content_source={cs!r} has no extractor branch here; add one rather than "
+        f"running with no content encoder.")
+
+
+def _build_vc_model(args, cfg, dev):
+    codec_model = build_codec(cfg)
+    core = LiveVoiceModel(cfg, codec_model, _build_content_extractor(cfg), prosody_extractor=None)
+    missing, unexpected = load_model_weights_from_ckpt(core, args.ckpt, log_prefix="[eval]")
+    if missing:
+        print(f"[eval] warn: {len(missing)} missing keys (first 3): {missing[:3]}")
+    if unexpected:
+        print(f"[eval] warn: {len(unexpected)} unexpected keys (first 3): {unexpected[:3]}")
+    lit = LiveVoiceLightningModule(cfg, core)
+    lit.eval()
+    return lit.to(dev)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Pseudo-speaker prompt selection (StreamVoiceAnon+)
+# ──────────────────────────────────────────────────────────────────────
+def _scan_pool(root: str, wav_base: Path | None = None) -> dict[str, list[str]]:
+    """{speaker: [wav, ...]} for the pseudo-speaker pool.
+
+    Kaldi dirs use wav.scp (+utt2spk). Otherwise the speaker is the first path component
+    under `root`, which covers both layouts we use:
+        VCTK      <root=.../VCTK-Corpus/wav48>/p225/p225_001.wav
+        LibriTTS  <root=.../LibriTTS/train-other-500>/1234/<chapter>/*.wav
+    """
+    p = Path(root)
+    out: dict[str, list[str]] = {}
+    if (p / "wav.scp").is_file():
+        u2s = _read_kaldi(p / "utt2spk") if (p / "utt2spk").is_file() else {}
+        for utt, v in _read_kaldi(p / "wav.scp").items():
+            out.setdefault(u2s.get(utt, utt), []).append(_resolve_wav(v, wav_base))
+    else:
+        for ext in ("*.wav", "*.flac"):
+            for x in p.rglob(ext):
+                parts = x.relative_to(p).parts
+                out.setdefault(parts[0] if len(parts) > 1 else "_flat", []).append(str(x))
+    if not out:
+        raise SystemExit(f"--anon_pool_dir has no wav.scp and no .wav/.flac under {root}")
+    return {k: sorted(v) for k, v in sorted(out.items())}
+
+
+class PromptSelector:
+    """SVA+-style SINGLE-utterance prompt selection.
+
+    StreamVoiceAnon+ (arXiv:2603.06079) drives a codec LM by continuation from one prompt --
+    "a neutral utterance from the target anonymous speaker conceals source identity" -- and
+    reports the vctk-1fix strategy, i.e. a single fixed target speaker. There is deliberately
+    no K-reference blending: StreamVoiceAnon 2024's
+    g_anon = alpha * mean_i(g_i) + (1 - alpha) * g_s
+    averages speaker EMBEDDINGS, which has no analogue when the reference is a codec token
+    stream occupying the first T_ref positions of the same AR sequence.
+
+    Both strategies satisfy VPC 2026 evaluation plan v1.2 section 2.1: the pseudo-speaker
+    assignment must be identical across utterances and must not rely on speaker labels.
+      1fix  one fixed prompt for every trial utterance -- "Voice anonymization systems that
+            assign a single pseudo-speaker to all utterances also satisfy this requirement"
+      1rnd  one prompt drawn per trial utterance, seeded by the utterance id, so the random
+            numbers differ per utterance as the plan requires
+    A per-source-speaker mapping is intentionally absent: it would read utt2spk and so break
+    the "not rely on speaker labels" rule.
+    """
+
+    def __init__(self, pool_dir: str, strategy: str, seed: int,
+                 wav_base: Path | None = None,
+                 fixed_spk: str | None = None, fixed_utt: str | None = None):
+        self.strategy = str(strategy).lower()
+        if self.strategy not in ("1fix", "1rnd"):
+            raise SystemExit(f"unknown --anon_strategy {strategy!r}; expected 1fix or 1rnd")
+        self.seed = int(seed)
+        self.by_spk = _scan_pool(pool_dir, wav_base)
+        self.all_wavs = [w for v in self.by_spk.values() for w in v]
+        self.fixed: str | None = None
+        if self.strategy == "1fix":
+            if fixed_utt:
+                self.fixed = fixed_utt
+                spk = "<explicit>"
+            else:
+                spk = fixed_spk or random.Random(self.seed).choice(list(self.by_spk))
+                if spk not in self.by_spk:
+                    raise SystemExit(
+                        f"--anon_fixed_spk {spk!r} not in pool; have e.g. "
+                        f"{list(self.by_spk)[:8]}")
+                # VCTK/LibriTTS are read speech, so any utterance is the "neutral utterance"
+                # SVA+ asks for; pick deterministically so reruns reuse the same prompt.
+                self.fixed = random.Random(f"{self.seed}:{spk}").choice(self.by_spk[spk])
+            print(f"[anon] strategy=1fix  target speaker={spk}  prompt={self.fixed}")
+        else:
+            print(f"[anon] strategy=1rnd  prompt drawn per utterance from the pool")
+        print(f"[anon] pool: {len(self.by_spk)} speakers, {len(self.all_wavs)} utterances "
+              f"({pool_dir})")
+        if len(self.by_spk) < 2:
+            print("[anon] WARNING: pool has <2 speakers — for VCTK point --anon_pool_dir at "
+                  "the wav48/ directory, not the corpus root.")
+
+    def ref_for(self, utt: str) -> str:
+        if self.strategy == "1fix":
+            return self.fixed
+        return random.Random(f"{self.seed}:{utt}").choice(self.all_wavs)
+
+
+_SELECTOR_CACHE: dict[tuple, PromptSelector] = {}
+
+
+def _make_selector(args) -> PromptSelector:
+    """One selector per run. Cached because it must be IDENTICAL across enrolment, trials and
+    train-clean-360 (1fix would otherwise pick a different prompt per call) and because
+    scanning a pool like LibriTTS train-other-500 is not free."""
+    key = (args.anon_pool_dir, str(args.anon_strategy).lower(), int(args.anon_seed),
+           getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None))
+    if key not in _SELECTOR_CACHE:
+        _SELECTOR_CACHE[key] = PromptSelector(
+            args.anon_pool_dir, args.anon_strategy, args.anon_seed, args.wav_base,
+            getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None))
+    return _SELECTOR_CACHE[key]
 
 
 def _copy_metadata(src: Path, dst: Path) -> None:
@@ -225,6 +538,7 @@ def main() -> None:
     if not args.ckpt:
         raise SystemExit("--ckpt is required unless --finalize_only")
     dev = torch.device("cpu" if args.cpu else "cuda")
+    _auto_infer(args)
     cfg = _build_vc_config(args, str(dev))
     lit = _build_vc_model(args, cfg, dev)
     sel = _make_selector(args)
