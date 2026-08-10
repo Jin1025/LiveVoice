@@ -664,6 +664,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                     feats,
                     str(getattr(self.config, "content_cmn", "off")),
                     bool(getattr(self.config, "content_cmn_var", False)),
+                    prior_frames=float(getattr(self.config, "content_cmn_prior_frames", 0.0)),
                 )
             if self.content_refiner is not None:
                 feats = self.content_refiner(feats)             # deep causal refiner
@@ -740,6 +741,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 feat,
                 str(getattr(self.config, "content_cmn", "off")),
                 bool(getattr(self.config, "content_cmn_var", False)),
+                prior_frames=float(getattr(self.config, "content_cmn_prior_frames", 0.0)),
             )
             if self.content_refiner is not None:
                 feat = self.content_refiner(feat)             # deep causal refiner

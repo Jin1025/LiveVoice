@@ -184,7 +184,7 @@ class _Bottleneck(nn.Module):
 @torch.no_grad()
 def extract_features(items, config, condition, device, encode_fn, perturb, bottleneck,
                      feats_dir, max_seconds, frames_per_utt, seed,
-                     cmn="off", cmn_var=False):
+                     cmn="off", cmn_var=False, cmn_prior_frames=0.0):
     """Return (utt_vecs (N,D), utt_labels (N,), frame_vecs (M,D), frame_labels (M,),
     frame_utt_idx (M,)) for one condition. `encode_fn(audio_BT) -> (B,T,D)` is the
     raw content encoder (sw2v AudioEncoder or HuBERT layer-N hidden)."""
@@ -207,7 +207,8 @@ def extract_features(items, config, condition, device, encode_fn, perturb, bottl
         # CMN at the frontend, exactly where the model applies it (config.content_cmn),
         # i.e. BEFORE the bottleneck — never at the point we mean-pool below, which would
         # force the pooled vector to zero and make the utterance metric vacuous.
-        feats = apply_content_cmn(feats.float(), cmn, cmn_var)
+        feats = apply_content_cmn(feats.float(), cmn, cmn_var,
+                                  prior_frames=float(cmn_prior_frames))
 
         if bottleneck is not None:
             feats = bottleneck(feats.float())
@@ -299,6 +300,10 @@ def main():
                          "per-utterance mean offset — no retraining needed.")
     ap.add_argument("--cmn_var", action="store_true",
                     help="also divide by the std (CMVN rather than CMN)")
+    ap.add_argument("--cmn_prior_frames", type=float, default=0.0,
+                    help="virtual prior count n0 for --cmn causal; match "
+                         "config.content_cmn_prior_frames. n0>0 leaves the first ~n0 frames "
+                         "near-raw, so expect the utterance-level probe acc to RISE a little")
     ap.add_argument("--probe_epochs", type=int, default=300)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -378,7 +383,8 @@ def main():
             uX, uy, fX, fy, futt = extract_features(
                 items, config, cond, device, encode_fn, perturb, stage_mod,
                 feats_dir, max_seconds, args.frames_per_utt, args.seed,
-                cmn=args.cmn, cmn_var=args.cmn_var)
+                cmn=args.cmn, cmn_var=args.cmn_var,
+                cmn_prior_frames=args.cmn_prior_frames)
 
             # utterance-level
             u_tr, u_te = train_linear_probe(

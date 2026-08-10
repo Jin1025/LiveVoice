@@ -86,6 +86,16 @@ class LiveVoiceConfig:
     # trained with one setting must not be evaluated with another.
     content_cmn: str = "causal" # off, utterance, causal
     content_cmn_var: bool = False   # also divide by the std (CMVN rather than CMN)
+    # Virtual prior count n0 for content_cmn="causal" (Kaldi OnlineCmvn's global_frames).
+    #   0  the original estimator: the running mean at t=0 IS the single observed frame, so
+    #      out[0] is identically zero (measured ||out[0]||=0.000 vs raw 3.98) and the estimate
+    #      only settles as O(1/t) — deviation from the offline mean was still 0.78 at 500 ms.
+    #      Suspected contributor to the onset hallucination in ~10-20% of generations.
+    #   50 pretend n0 frames of mean 0 preceded frame 0; early frames then pass through
+    #      near-raw and the transient flattens (deviation ~0.37 from 0 ms to 2 s).
+    # Changes the content distribution → needs retraining, and a cache extracted with CMN
+    # baked in (content_cmn_in_cache) must be re-extracted with the same value.
+    content_cmn_prior_frames: float = 25.0
     
     freeze_hubert: bool = True
     # Center-align HuBERT content frames to the codec token grid via waveform padding

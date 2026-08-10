@@ -40,6 +40,8 @@ def apply_content_cmn(
     mode: str = "off",
     use_var: bool = False,
     eps: float = 1e-5,
+    prior_frames: float = 0.0,
+    prior_mean: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cepstral mean (variance) normalisation on content features (B, T, D).
 
@@ -58,6 +60,27 @@ def apply_content_cmn(
       "off"        no-op
       "utterance"  subtract the whole-utterance mean — NOT causal, offline only
       "causal"     subtract a running mean over frames <= t — streaming-safe
+
+    ``prior_frames`` (n0) fixes the onset transient of the causal mode. With the plain
+    estimator mu_t = (f_0+...+f_t)/(t+1) the mean at t=0 is f_0 itself, so out[0] is
+    IDENTICALLY ZERO for every utterance — measured ||out[0]|| = 0.000 against a raw feature
+    norm of 3.98 — and the estimate only settles as O(1/t) (deviation from the offline mean
+    was still 0.78 at 500 ms, 0.35 at 2 s). Pretending we already observed n0 frames of mean
+    ``prior_mean`` before frame 0,
+
+        mu_t = (f_0 + ... + f_t + n0 * prior_mean) / (t + 1 + n0)
+
+    makes the prior dominate early (out[0] ~ f_0 - prior_mean) and wash out as
+    n0/(n0+t+1), so the transient disappears: with n0=50, prior_mean=0 the deviation is
+    ~0.37 flat from 0 ms to 2 s instead of 1.00 -> 0.35. This is Kaldi's OnlineCmvn trick
+    (its `global_frames` / `speaker_frames` counts).
+
+    ``prior_mean`` of None means zero, i.e. early frames pass through un-normalised. Supply
+    a training-set global mean (D,) or (1,1,D) to normalise them properly instead — slightly
+    better again (0.29 vs 0.37 at t=0) at the cost of shipping that vector.
+
+    n0 > 0 changes the content distribution, so a model trained with one setting must not be
+    evaluated with another. Default 0.0 reproduces the original estimator exactly.
     """
     if not mode or mode == "off":
         return feats
@@ -68,13 +91,31 @@ def apply_content_cmn(
             out = out / feats.std(dim=1, keepdim=True).clamp_min(eps)
         return out
     if mode == "causal":
+        n0 = float(prior_frames or 0.0)
+        if n0 < 0:
+            raise ValueError(f"prior_frames must be >= 0, got {prior_frames!r}")
         n = torch.arange(
             1, feats.size(1) + 1, device=feats.device, dtype=feats.dtype
         ).view(1, -1, 1)
-        mu = feats.cumsum(dim=1) / n
+        denom = n + n0
+        num = feats.cumsum(dim=1)
+        if n0 > 0 and prior_mean is not None:
+            pm = prior_mean.to(device=feats.device, dtype=feats.dtype).reshape(1, 1, -1)
+            num = num + n0 * pm
+        mu = num / denom
         out = feats - mu
         if use_var:
-            var = ((feats * feats).cumsum(dim=1) / n - mu * mu).clamp_min(0.0)
+            sq = (feats * feats).cumsum(dim=1)
+            if n0 > 0:
+                # Unit-variance prior around prior_mean: E[f^2] prior = prior_mean^2 + 1.
+                # Without it the early variance would be ~0 and the division would explode.
+                pm2 = (
+                    prior_mean.to(device=feats.device, dtype=feats.dtype).reshape(1, 1, -1) ** 2
+                    if prior_mean is not None
+                    else torch.zeros(1, 1, feats.size(-1), device=feats.device, dtype=feats.dtype)
+                )
+                sq = sq + n0 * (pm2 + 1.0)
+            var = (sq / denom - mu * mu).clamp_min(0.0)
             out = out / var.sqrt().clamp_min(eps)
         return out
     raise ValueError(f"content_cmn must be off/utterance/causal, got {mode!r}")
@@ -159,6 +200,7 @@ class ContentSupervisionMixin:
                 feats,
                 str(getattr(self.config, "content_cmn", "off")),
                 bool(getattr(self.config, "content_cmn_var", False)),
+                prior_frames=float(getattr(self.config, "content_cmn_prior_frames", 0.0)),
             )
         if self.content_refiner is not None:
             feats = self.content_refiner(feats)

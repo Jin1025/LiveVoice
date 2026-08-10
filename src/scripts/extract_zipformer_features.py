@@ -103,6 +103,10 @@ def main():
     p.add_argument("--cmn", default="off", choices=["off", "utterance", "causal"],
                    help="bake full-utterance CMN into the cache (then set "
                         "config.content_cmn='off' so it is not applied twice)")
+    p.add_argument("--cmn_prior_frames", type=float, default=0.0,
+                   help="virtual prior count n0 for --cmn causal; MUST equal "
+                        "config.content_cmn_prior_frames or the cache and the model "
+                        "disagree on the first ~n0 frames of every utterance")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--max_seconds", type=float, default=0.0,
                    help=">0 skips utterances longer than this (memory guard)")
@@ -156,7 +160,8 @@ def main():
             with torch.no_grad():
                 f = enc(a.unsqueeze(0).to(device))          # (1, T, D), codec-aligned
             if args.cmn != "off":
-                f = apply_content_cmn(f, args.cmn, False)
+                f = apply_content_cmn(f, args.cmn, False,
+                                      prior_frames=float(args.cmn_prior_frames))
             f = f.squeeze(0).float().cpu()
             want = -(-a.numel() // HOP)
             if on_grid and f.shape[0] != want:

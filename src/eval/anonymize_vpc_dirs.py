@@ -428,6 +428,87 @@ def _make_selector(args) -> PromptSelector:
     return _SELECTOR_CACHE[key]
 
 
+# ──────────────────────────────────────────────────────────────────────
+#  Output-directory safety
+# ──────────────────────────────────────────────────────────────────────
+# Written into every dir we create, so a later run can tell "this is mine, and it was produced
+# with these settings" from "this is VPC's, do not touch".
+_STAMP = ".livevoice_anon.json"
+
+# Suffixes the VPC baselines themselves write into data/. Reusing one would interleave our
+# audio with theirs under a name the evaluator already treats as that baseline.
+_RESERVED_SUFFIXES = ("_mcadams", "_sttts", "_sttts_multi", "_nac", "_B4", "_BM1", "_BM2",
+                      "_BM3", "_asrbn")
+
+
+def _run_fingerprint(args) -> dict:
+    """Everything that changes the AUDIO. Deliberately excludes --shard/--num_shards: shards
+    are parallel workers on ONE output dir and must agree, not conflict."""
+    return {
+        "ckpt": str(args.ckpt),
+        "anon_strategy": str(args.anon_strategy),
+        "anon_pool_dir": str(args.anon_pool_dir),
+        "anon_seed": int(args.anon_seed),
+        "anon_fixed_spk": args.anon_fixed_spk,
+        "anon_fixed_utt": args.anon_fixed_utt,
+        "ref_crop_sec": float(args.ref_crop_sec),
+        "temperature": float(args.temperature),
+        "cfg_scale": float(args.cfg_scale),
+        "top_p": float(args.top_p),
+        "top_k": int(args.top_k),
+    }
+
+
+def _validate_suffix(suffix: str, datasets: list[str], vpc_root: Path) -> None:
+    """Refuse suffixes that would land on top of VPC's own directories.
+
+    ``data/<ds><suffix>`` is plain string concatenation, so e.g. ``--datasets libri_dev
+    --anon_suffix _enrolls`` resolves to ``data/libri_dev_enrolls`` — the real enrolment set,
+    whose metadata and wav.scp we would then overwrite. Nothing about that is recoverable.
+    """
+    if not suffix or not suffix.strip():
+        raise SystemExit("--anon_suffix must be non-empty (it is what keeps our output out of "
+                         "VPC's own data dirs)")
+    if any(c in suffix for c in "/ \t"):
+        raise SystemExit(f"--anon_suffix {suffix!r} must not contain a path separator or space")
+    if suffix in _RESERVED_SUFFIXES:
+        raise SystemExit(f"--anon_suffix {suffix!r} is a VPC baseline suffix; pick another")
+    data = vpc_root / "data"
+    for ds in datasets:
+        out = f"{ds}{suffix}"
+        target = data / out
+        if (target / "wav.scp").is_file() and not (target / _STAMP).is_file():
+            raise SystemExit(
+                f"refusing to write into data/{out}: it already has a wav.scp but no {_STAMP}, "
+                f"so it is not ours (an original VPC set, or another tool's output).")
+
+
+def _claim_output_dir(dst: Path, fingerprint: dict, ds: str) -> None:
+    """Create/verify the stamp. Guards the failure mode that actually bites: rerunning with a
+    different strategy or checkpoint into the same suffix, where the resume logic would skip
+    every existing wav and silently hand back the PREVIOUS run's audio."""
+    import json
+    dst.mkdir(parents=True, exist_ok=True)
+    stamp = dst / _STAMP
+    if stamp.is_file():
+        try:
+            prev = json.loads(stamp.read_text())
+        except Exception:
+            prev = {}
+        diff = {k: (prev.get(k), v) for k, v in fingerprint.items() if prev.get(k) != v}
+        if diff:
+            raise SystemExit(
+                f"data/{dst.name} was generated with different settings:\n" +
+                "\n".join(f"    {k}: existing={o!r}  now={n!r}" for k, (o, n) in diff.items()) +
+                f"\n  Reusing it would mix two runs — finished utterances are skipped, so the "
+                f"old audio would survive. Use a new --anon_suffix, or delete data/{dst.name}.")
+        return
+    # Shards race here; identical content makes the last writer harmless.
+    tmp = dst / f".{_STAMP}.{os.getpid()}"
+    tmp.write_text(json.dumps(fingerprint, indent=2, sort_keys=True))
+    os.replace(tmp, stamp)
+
+
 def _copy_metadata(src: Path, dst: Path) -> None:
     """Copy the Kaldi metadata files (utt2spk, spk2utt, text, utt2emo, trials, …) but not the
     directories, which hold audio. Same rule as VPC's utils.copy_data_dir."""
@@ -462,6 +543,7 @@ def _finalize(ds: str, vpc_root: Path, suffix: str) -> bool:
 def _run_dataset(ds, vpc_root, suffix, lit, cfg, sel, gen_kwargs, dev, args) -> None:
     src, dst = vpc_root / "data" / ds, vpc_root / "data" / f"{ds}{suffix}"
     scp = _read_kaldi(src / "wav.scp")
+    _claim_output_dir(dst, _run_fingerprint(args), ds)
     (dst / "wav").mkdir(parents=True, exist_ok=True)
     utts = sorted(scp)[args.shard :: args.num_shards]
     sr = int(cfg.sample_rate)
@@ -524,6 +606,16 @@ def main() -> None:
     args.wav_base = vpc_root
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
     suffix = args.anon_suffix
+    _validate_suffix(suffix, datasets, vpc_root)
+
+    # utts[shard::num_shards] is a legal slice for ANY shard, so an out-of-range shard silently
+    # produces a partial, overlapping split instead of failing. --shard is an index into the
+    # split, not a GPU id; CUDA_VISIBLE_DEVICES picks the GPU.
+    if not 0 <= args.shard < args.num_shards:
+        raise SystemExit(
+            f"--shard must be in [0, {args.num_shards}) for --num_shards {args.num_shards}, "
+            f"got {args.shard}. Shards 0..{args.num_shards - 1} together cover every utterance; "
+            f"any other index leaves gaps. (Pick the GPU with CUDA_VISIBLE_DEVICES, not --shard.)")
 
     if args.finalize_only:
         ok = all(_finalize(ds, vpc_root, suffix) for ds in datasets)
