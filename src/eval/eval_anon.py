@@ -13,6 +13,11 @@ Attack scenarios (frozen pretrained ASV — eval_pre only, no ASV retraining):
 Higher EER ⇒ better anonymization. Lower WER on anonymized audio ⇒ better utility.
 Semi-informed ASV (eval_post) is **not** implemented here.
 
+Pseudo-speaker assignment follows StreamVoiceAnon+ (arXiv:2603.06079): a SINGLE prompt
+utterance conditions the codec LM by continuation. ``--anon_strategy`` is ``1fix`` (one fixed
+target speaker, SVA+'s vctk-1fix) or ``1rnd`` (one prompt per utterance). The K-reference
+embedding blending of StreamVoiceAnon 2024 is not offered — see ``PromptSelector``.
+
 Data layout (Kaldi / VPC format)
 --------------------------------
   enroll_dir/wav.scp, utt2spk, …
@@ -21,19 +26,19 @@ Data layout (Kaldi / VPC format)
 
 Examples
 --------
-  # VPC eval_pre batch (libri_dev + libri_test, EER + ASR):
+  # VPC eval_pre batch, VCTK pool, SVA+ 1fix:
   CUDA_VISIBLE_DEVICES=0 python src/eval/eval_anon.py \\
       --datasets libri_dev,libri_test \\
-      --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/prefix+jhcodec+hubert/step_latest.ckpt \\
-      --anon_pool_dir /mnt/data/disk2/LibriTTS/train-other-500 \\
+      --ckpt /mnt/data/disk2/yejin/LiveVoice/checkpoints/<run>/step_latest.ckpt \\
+      --anon_pool_dir /mnt/data/disk2/VCTK-Corpus/wav48 \\
+      --anon_strategy 1fix --anon_fixed_spk p225 \\
       --anon_out_dir /mnt/data/disk2/yejin/LiveVoice/anon \\
       --out_csv vpc_eval_pre.csv
 
-  # Single trial set (EER only):
+  # LibriTTS pool, random prompt per utterance:
   CUDA_VISIBLE_DEVICES=0 python src/eval/eval_anon.py \\
-      --enroll_dir /path/vpc/data/libri_test_enrolls \\
-      --trial_dir  /path/vpc/data/libri_test_trials_mixed \\
-      --ckpt ... --anon_pool_dir ... --scenarios oo,oa
+      --ckpt ... --anon_pool_dir /mnt/data/disk2/LibriTTS/train-other-500 \\
+      --anon_strategy 1rnd --scenarios oo,aa
 """
 from __future__ import annotations
 
@@ -221,20 +226,6 @@ def _build_vc_config(args: argparse.Namespace, device: str) -> LiveVoiceConfig:
     print("[eval] config: " + "  ".join(
         f"{f}={getattr(cfg, f, '<n/a>')}" for f in _CONFIG_ECHO_FIELDS))
 
-    # Fail before loading the codec / content encoder / ASV attacker, not thousands of
-    # utterances in. Every anonymisation path here goes through generate_anonymized ->
-    # speaker_override, which averages a speaker representation over K pool references.
-    # codec_prompt continuation has no speaker representation to average: the reference IS a
-    # codec token stream occupying the first T_ref positions of the same AR sequence, so
-    # generate() rejects speaker_override outright.
-    if (cfg.speaker_encoder_type == "codec_prompt"
-            and cfg.speaker_conditioning == "prefix"
-            and bool(getattr(cfg, "codec_prompt_continuation", False))):
-        raise SystemExit(
-            "[eval] this checkpoint uses codec_prompt continuation, which the K-reference "
-            "blending anonymiser in this script cannot drive (_anonymize_svanon -> "
-            "generate_anonymized -> speaker_override). It needs a single-reference path "
-            "calling _anonymize() / model.generate(reference_audio=...) directly.")
     return cfg
 
 
@@ -287,32 +278,104 @@ def _build_vc_model(args, cfg, dev):
     return lit.to(dev)
 
 
-def _build_pool(path: str, wav_base: Path | None = None) -> list[str]:
-    p = Path(path)
-    scp = p / "wav.scp"
-    if scp.is_file():
-        return [_resolve_wav(v, wav_base) for v in _read_kaldi(scp).values()]
-    wavs = [str(x) for ext in ("*.flac", "*.wav") for x in p.rglob(ext)]
-    if not wavs:
-        raise SystemExit(f"--anon_pool_dir has no wav.scp and no .flac/.wav under {path}")
-    return sorted(wavs)
+def _scan_pool(root: str, wav_base: Path | None = None) -> dict[str, list[str]]:
+    """{speaker: [wav, ...]} for the pseudo-speaker pool.
+
+    Kaldi dirs use wav.scp (+utt2spk). Otherwise the speaker is the first path component
+    under `root`, which covers both layouts we use:
+        VCTK      <root=.../VCTK-Corpus/wav48>/p225/p225_001.wav
+        LibriTTS  <root=.../LibriTTS/train-other-500>/1234/<chapter>/*.wav
+    """
+    p = Path(root)
+    out: dict[str, list[str]] = {}
+    if (p / "wav.scp").is_file():
+        u2s = _read_kaldi(p / "utt2spk") if (p / "utt2spk").is_file() else {}
+        for utt, v in _read_kaldi(p / "wav.scp").items():
+            out.setdefault(u2s.get(utt, utt), []).append(_resolve_wav(v, wav_base))
+    else:
+        for ext in ("*.wav", "*.flac"):
+            for x in p.rglob(ext):
+                parts = x.relative_to(p).parts
+                out.setdefault(parts[0] if len(parts) > 1 else "_flat", []).append(str(x))
+    if not out:
+        raise SystemExit(f"--anon_pool_dir has no wav.scp and no .wav/.flac under {root}")
+    return {k: sorted(v) for k, v in sorted(out.items())}
 
 
-_STRATEGY_K = {"libri-4rnd": 4, "libri-1rnd": 1, "libri-1fix": 1, "single": 1}
+class PromptSelector:
+    """SVA+-style SINGLE-utterance prompt selection.
+
+    StreamVoiceAnon+ (arXiv:2603.06079) drives a codec LM by continuation from one prompt --
+    "a neutral utterance from the target anonymous speaker conceals source identity" -- and
+    reports the vctk-1fix strategy, i.e. a single fixed target speaker. There is deliberately
+    no K-reference blending here: StreamVoiceAnon 2024's
+    g_anon = alpha * mean_i(g_i) + (1 - alpha) * g_s
+    averages speaker EMBEDDINGS, which has no analogue when the reference is a codec token
+    stream occupying the first T_ref positions of the same AR sequence. That is why the 4rnd
+    strategies are gone rather than merely unused.
+
+    Both strategies satisfy VPC 2026 evaluation plan v1.2 section 2.1: the pseudo-speaker
+    assignment must be identical across utterances and must not rely on speaker labels.
+      1fix  one fixed prompt for every trial utterance -- "Voice anonymization systems that
+            assign a single pseudo-speaker to all utterances also satisfy this requirement"
+      1rnd  one prompt drawn per trial utterance, seeded by the utterance id, so the random
+            numbers differ per utterance as the plan requires
+    A per-source-speaker mapping is intentionally absent: it would read utt2spk and so break
+    the "not rely on speaker labels" rule.
+    """
+
+    def __init__(self, pool_dir: str, strategy: str, seed: int,
+                 wav_base: Path | None = None,
+                 fixed_spk: str | None = None, fixed_utt: str | None = None):
+        self.strategy = str(strategy).lower()
+        if self.strategy not in ("1fix", "1rnd"):
+            raise SystemExit(f"unknown --anon_strategy {strategy!r}; expected 1fix or 1rnd")
+        self.seed = int(seed)
+        self.by_spk = _scan_pool(pool_dir, wav_base)
+        self.all_wavs = [w for v in self.by_spk.values() for w in v]
+        self.fixed: str | None = None
+        if self.strategy == "1fix":
+            if fixed_utt:
+                self.fixed = fixed_utt
+                spk = "<explicit>"
+            else:
+                spk = fixed_spk or random.Random(self.seed).choice(list(self.by_spk))
+                if spk not in self.by_spk:
+                    raise SystemExit(
+                        f"--anon_fixed_spk {spk!r} not in pool; have e.g. "
+                        f"{list(self.by_spk)[:8]}")
+                # VCTK/LibriTTS are read speech, so any utterance is the "neutral utterance"
+                # SVA+ asks for; pick deterministically so reruns reuse the same prompt.
+                self.fixed = random.Random(f"{self.seed}:{spk}").choice(self.by_spk[spk])
+            print(f"[anon] strategy=1fix  target speaker={spk}  prompt={self.fixed}")
+        else:
+            print(f"[anon] strategy=1rnd  prompt drawn per utterance from the pool")
+        print(f"[anon] pool: {len(self.by_spk)} speakers, {len(self.all_wavs)} utterances "
+              f"({pool_dir})")
+        if len(self.by_spk) < 2:
+            print("[anon] WARNING: pool has <2 speakers — for VCTK point --anon_pool_dir at "
+                  "the wav48/ directory, not the corpus root.")
+
+    def ref_for(self, utt: str) -> str:
+        if self.strategy == "1fix":
+            return self.fixed
+        return random.Random(f"{self.seed}:{utt}").choice(self.all_wavs)
 
 
-def _assign_pseudo_targets(src_speakers: list[str], pool_wavs: list[str], seed: int) -> dict[str, str]:
-    rng = random.Random(seed)
-    return {spk: rng.choice(pool_wavs) for spk in sorted(src_speakers)}
+_SELECTOR_CACHE: dict[tuple, PromptSelector] = {}
 
 
-def _select_refs(strategy, utt, utt2spk, pool_wavs, k, seed, fixed_ref, pseudo, level="utt"):
-    if strategy == "libri-1fix":
-        return fixed_ref
-    if strategy == "single":
-        return [pseudo[utt2spk[utt]]]
-    key = utt2spk[utt] if level == "spk" else utt
-    return random.Random(f"{seed}:{key}").sample(pool_wavs, min(k, len(pool_wavs)))
+def _make_selector(args) -> PromptSelector:
+    """One selector per run. Cached because it must be IDENTICAL across enrolment, trials and
+    train-clean-360 (1fix would otherwise pick a different prompt per call) and because
+    scanning a pool like LibriTTS train-other-500 is not free."""
+    key = (args.anon_pool_dir, str(args.anon_strategy).lower(), int(args.anon_seed),
+           getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None))
+    if key not in _SELECTOR_CACHE:
+        _SELECTOR_CACHE[key] = PromptSelector(
+            args.anon_pool_dir, args.anon_strategy, args.anon_seed, args.wav_base,
+            getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None))
+    return _SELECTOR_CACHE[key]
 
 
 def _load_ref(path, target_sr, crop_sec) -> torch.Tensor:
@@ -325,20 +388,10 @@ def _load_ref(path, target_sr, crop_sec) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _anonymize_svanon(lit, content_wav, ref_wavs, target_sr, dev, alpha, gen_kwargs, crop_sec):
+def _anonymize(lit, content_wav, ref_wav, target_sr, dev, gen_kwargs, crop_sec=0.0):
+    """One content utterance + one prompt utterance -> anonymized audio."""
     ctn = _load_full_mono_wav(content_wav, target_sr).unsqueeze(0).to(dev)
-    crop = crop_sec if len(ref_wavs) > 1 else 0.0
-    refs = [_load_ref(r, target_sr, crop).unsqueeze(0).to(dev) for r in ref_wavs]
-    codes = lit.model.generate_anonymized(
-        content_audio=ctn, ref_audios=refs, alpha=float(alpha), **gen_kwargs
-    )
-    return lit.model.decode_to_audio(codes)[0].detach().float().cpu()
-
-
-@torch.no_grad()
-def _anonymize(lit, content_wav, ref_wav, target_sr, dev, gen_kwargs) -> torch.Tensor:
-    ctn = _load_full_mono_wav(content_wav, target_sr).unsqueeze(0).to(dev)
-    ref = _load_full_mono_wav(ref_wav, target_sr).unsqueeze(0).to(dev)
+    ref = _load_ref(ref_wav, target_sr, crop_sec).unsqueeze(0).to(dev)
     codes = lit.model.generate(reference_audio=ref, content_audio=ctn, **gen_kwargs)
     return lit.model.decode_to_audio(codes)[0].detach().float().cpu()
 
@@ -361,15 +414,7 @@ def _enroll_spk_embeddings(
     wav = _read_kaldi(enroll_dir / "wav.scp")
     utt2spk = _read_kaldi(enroll_dir / "utt2spk")
     acc: dict[str, list[torch.Tensor]] = {}
-    pool_wavs = _build_pool(args.anon_pool_dir, args.wav_base) if anonymize else None
-    strategy = str(args.anon_strategy).lower() if anonymize else ""
-    k = int(args.anon_k) if anonymize and int(args.anon_k) > 0 else _STRATEGY_K.get(strategy, 1)
-    fixed_ref = pseudo = None
-    if anonymize:
-        if strategy == "libri-1fix":
-            fixed_ref = [random.Random(args.anon_seed).choice(pool_wavs)]
-        elif strategy == "single":
-            pseudo = _assign_pseudo_targets(list(set(utt2spk.values())), pool_wavs, args.anon_seed)
+    sel = _make_selector(args) if anonymize else None
 
     for utt, scp in tqdm(wav.items(), desc="enroll anon+emb" if anonymize else "enroll emb"):
         src = _resolve_wav(scp, args.wav_base)
@@ -384,13 +429,9 @@ def _enroll_spk_embeddings(
             elif getattr(args, "cache_only", False):
                 raise FileNotFoundError(f"--cache_only: missing enroll wav {cached}")
             else:
-                refs = _select_refs(
-                    strategy, utt, utt2spk, pool_wavs, k, args.anon_seed,
-                    fixed_ref, pseudo, args.anon_level,
-                )
-                aud = _anonymize_svanon(
-                    lit, src, refs, int(cfg.sample_rate), dev,
-                    args.alpha, gen_kwargs, args.ref_crop_sec,
+                aud = _anonymize(
+                    lit, src, sel.ref_for(utt), int(cfg.sample_rate), dev,
+                    gen_kwargs, args.ref_crop_sec,
                 )
                 if not cached:
                     raise RuntimeError("anon_out_dir required for VPC ASV embedding")
@@ -411,16 +452,9 @@ def _trial_utt_embeddings(
     utt2spk = _read_kaldi(trial_dir / "utt2spk")
     target_sr = int(cfg.sample_rate) if cfg is not None else attacker.sample_rate
 
-    strategy = str(args.anon_strategy).lower()
-    k = int(args.anon_k) if int(args.anon_k) > 0 else _STRATEGY_K[strategy]
-    fixed_ref = pseudo = None
-    pool_wavs = None
+    sel = None
     if anonymize:
-        pool_wavs = _build_pool(args.anon_pool_dir, args.wav_base)
-        if strategy == "libri-1fix":
-            fixed_ref = [random.Random(args.anon_seed).choice(pool_wavs)]
-        elif strategy == "single":
-            pseudo = _assign_pseudo_targets(list(set(utt2spk.values())), pool_wavs, args.anon_seed)
+        sel = _make_selector(args)
         if args.anon_out_dir:
             os.makedirs(args.anon_out_dir, exist_ok=True)
 
@@ -434,12 +468,8 @@ def _trial_utt_embeddings(
             elif getattr(args, "cache_only", False):
                 raise FileNotFoundError(f"--cache_only: missing trial wav {cached}")
             else:
-                refs = _select_refs(
-                    strategy, utt, utt2spk, pool_wavs, k, args.anon_seed,
-                    fixed_ref, pseudo, args.anon_level,
-                )
-                aud = _anonymize_svanon(
-                    lit, src, refs, target_sr, dev, args.alpha, gen_kwargs, args.ref_crop_sec
+                aud = _anonymize(
+                    lit, src, sel.ref_for(utt), target_sr, dev, gen_kwargs, args.ref_crop_sec
                 )
                 if not cached:
                     raise RuntimeError("anon_out_dir required for VPC ASV embedding")
@@ -492,15 +522,7 @@ def _resolve_dataset_jobs(args) -> list[dict]:
 @torch.no_grad()
 def _anonymize_kaldi_wavs(kaldi_dir: Path, lit, cfg, gen_kwargs, dev, args, out_subdir: str) -> dict[str, str]:
     wav = _read_kaldi(kaldi_dir / "wav.scp")
-    utt2spk = _read_kaldi(kaldi_dir / "utt2spk")
-    pool_wavs = _build_pool(args.anon_pool_dir, args.wav_base)
-    strategy = str(args.anon_strategy).lower()
-    k = int(args.anon_k) if int(args.anon_k) > 0 else _STRATEGY_K[strategy]
-    fixed_ref = pseudo = None
-    if strategy == "libri-1fix":
-        fixed_ref = [random.Random(args.anon_seed).choice(pool_wavs)]
-    elif strategy == "single":
-        pseudo = _assign_pseudo_targets(list(set(utt2spk.values())), pool_wavs, args.anon_seed)
+    sel = _make_selector(args)
     target_sr = int(cfg.sample_rate)
     anon_map: dict[str, str] = {}
     base_out = Path(args.anon_out_dir) / out_subdir
@@ -511,11 +533,7 @@ def _anonymize_kaldi_wavs(kaldi_dir: Path, lit, cfg, gen_kwargs, dev, args, out_
         if dst.is_file():
             anon_map[utt] = str(dst)
             continue
-        refs = _select_refs(
-            strategy, utt, utt2spk, pool_wavs, k, args.anon_seed,
-            fixed_ref, pseudo, args.anon_level,
-        )
-        aud = _anonymize_svanon(lit, src, refs, target_sr, dev, args.alpha, gen_kwargs, args.ref_crop_sec)
+        aud = _anonymize(lit, src, sel.ref_for(utt), target_sr, dev, gen_kwargs, args.ref_crop_sec)
         sf.write(str(dst), aud.numpy(), target_sr)
         anon_map[utt] = str(dst)
     return anon_map
@@ -602,13 +620,20 @@ def main() -> None:
     p.add_argument("--vpc_exp_dir", default=None, help="default: <vpc_root>/exp")
 
     p.add_argument("--ckpt", default=None)
-    p.add_argument("--anon_pool_dir", default="/mnt/data/disk2/LibriTTS/train-other-500")
-    p.add_argument("--anon_strategy", default="libri-4rnd",
-                   choices=["libri-4rnd", "libri-1rnd", "libri-1fix", "single"])
-    p.add_argument("--anon_level", default="utt", choices=["utt", "spk"])
-    p.add_argument("--anon_k", type=int, default=0)
-    p.add_argument("--alpha", type=float, default=0.9)
-    p.add_argument("--ref_crop_sec", type=float, default=3.0)
+    p.add_argument("--anon_pool_dir", default="/mnt/data/disk2/VCTK-Corpus/wav48",
+                   help="pseudo-speaker pool. VCTK: point at wav48/ (SVA+ setting). "
+                        "LibriTTS: /mnt/data/disk2/LibriTTS/train-other-500")
+    p.add_argument("--anon_strategy", default="1fix", choices=["1fix", "1rnd"],
+                   help="1fix = one fixed prompt utterance for everything (SVA+ vctk-1fix); "
+                        "1rnd = one prompt drawn per utterance. Both are utterance-level "
+                        "under VPC 2026 rules; 4rnd embedding blending is not supported "
+                        "because codec-prompt continuation has no embedding to average.")
+    p.add_argument("--anon_fixed_spk", default=None,
+                   help="1fix only: pool speaker id (e.g. p225). Default: chosen by --anon_seed")
+    p.add_argument("--anon_fixed_utt", default=None,
+                   help="1fix only: exact prompt wav path, overrides --anon_fixed_spk")
+    p.add_argument("--ref_crop_sec", type=float, default=3.0,
+                   help="prompt length; SVA crops prompts to 3 s")
     p.add_argument("--anon_out_dir", default='/mnt/data/disk2/yejin/LiveVoice/anon')
     p.add_argument(
         "--cache_only",

@@ -52,7 +52,7 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     jhcodec_repo: str = "/workspace/jhcodec"
     jhcodec_config: str = "/workspace/jhcodec/config/config_mimi_recon.json"
-    jhcodec_ckpt: str = "/mnt/data/disk3/yejin/jhcodec/jhcodec_mimi_1000000.pt"
+    jhcodec_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/jhcodec/jhcodec_mimi_1000000.pt"
     jhcodec_sample_rate: int = 16000
     jhcodec_n_codebooks: int = 8
     jhcodec_codebook_size: int = 1024
@@ -192,7 +192,7 @@ class LiveVoiceConfig:
     #   "ecapa"      — SpeechBrain ECAPA-TDNN (source above).
     #   "wavlm_tdnn" — UniSpeech WavLM-large + ECAPA-TDNN head (finetuned .pth).
     val_spk_encoder: str = "wavlm_tdnn"
-    wavlm_sv_ckpt: str = "/mnt/data/disk3/yejin/wavlm_large_finetune.pth"
+    wavlm_sv_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/wavlm_large_finetune.pth"
     wavlm_sv_variant: str = "wavlm_large"   # or "wavlm_base_plus"
     wavlm_sv_sample_rate: int = 16000
 
@@ -295,7 +295,7 @@ class LiveVoiceConfig:
     # the tap matter here. zipformer_layer: -1 = just before the final 50->25Hz downsample
     # (deepest, still 50 fps); 0..5 = that stack's output; "out" = the 25 fps encoder output,
     # which is NOT on the codec grid and would need upsampling.
-    zipformer_ckpt: str = "/mnt/data/disk3/yejin/zipformer_pretrained.pt"
+    zipformer_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/zipformer_pretrained.pt"
     zipformer_layer: str = "-1"
     # Annotated (unlike a bare ``= None``) so it stays a real dataclass field even when off:
     # an unannotated attribute is skipped by dataclasses.asdict, so it never reached the
@@ -312,7 +312,7 @@ class LiveVoiceConfig:
     # SW2V (jhcodec streaming-wav2vec content encoder).
     sw2v_repo: str = "/workspace/jhcodec"
     sw2v_config: str = "/workspace/jhcodec/config/config_w2vcossim.json"
-    sw2v_ckpt: str = "/mnt/data/disk3/yejin/jhcodec/sw2v_120000.pt"
+    sw2v_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/jhcodec/sw2v_120000.pt"
     sw2v_sample_rate: int = 16000
 
     # FSQ information bottleneck on the content path (StyleStream-style, arXiv:2602.20113).
