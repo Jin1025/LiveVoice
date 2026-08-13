@@ -1,35 +1,76 @@
-# Core dependencies
-torch>=2.0.0
-torchaudio>=2.0.0
-lightning>=2.0.0
-numpy>=1.24.0
-scipy>=1.10.0
+# LiveVoice — pinned to the environment the published numbers were produced with.
+#
+#   conda create -n sound python=3.10 -y && conda activate sound
+#   pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+#       --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# torch is NOT listed below: the CUDA build has to come from the pytorch index, and a plain
+# `pip install torch` would silently fetch a different one. cu124 needs driver >= 525; newer
+# drivers are backward compatible, so a CUDA 12.8 or 13.x host is fine.
+#
+# Ranges were pinned after a server migration turned "works here" into "resolves to whatever
+# is newest today" — the two breakages that cost the most time are called out inline.
 
-# Audio codec + features
-descript-audio-codec>=1.0.0
-transformers>=4.40.0       # HuBERT
-librosa>=0.10.0
-soundfile>=0.12.1
-torchcrepe>=0.0.19         # F0 / periodicity (optional prosody)
+# ---- core ----
+lightning==2.6.0
+torchmetrics==1.8.2
+numpy==1.26.4              # HARD PIN. numpy 2.x breaks numba/librosa/parselmouth here.
+scipy==1.15.3
+einops==0.8.1
 
-# Data / logging
-pandas>=2.0.0
-huggingface-hub<1.0.0
-tensorboard>=2.13.0
-wandb>=0.16.0
-matplotlib>=3.7.0
-einops>=0.7.0
-hydra-core>=1.3.2
-omegaconf>=2.3.0
-pyyaml>=6.0
+# ---- audio / features ----
+librosa==0.11.0            # 0.10 -> 0.11 moved time_stretch/pitch_shift to keyword-only args
+soundfile==0.13.1
+resampy==0.4.3
+soxr==1.0.0
+audioread==3.1.0
+numba==0.63.1              # must agree with numpy; upgrade the two together or not at all
+llvmlite==0.46.0
+torchcrepe==0.0.24         # F0 / periodicity (config.pitch_method="crepe")
+praat-parselmouth==0.4.7   # formant/VTLN perturbation (config.use_vtln)
+descript-audio-codec==1.0.0
+torch-stoi==0.2.3
+torchlibrosa==0.1.0
 
-# Evaluation
-jiwer>=3.0.0               # WER for intelligibility
-speechbrain>=1.0.0         # ECAPA-TDNN speaker encoder / speaker similarity
-scikit-learn>=1.3.0        # VPC-style cosine EER (sklearn.metrics.pairwise)
-pyloudnorm>=0.1.1          # VPC ASV loudness normalization (eval_pre asv_ssl)
-hyperpyyaml>=1.2.0         # VPC SpeechBrain hyperparams loading
+# ---- models ----
+transformers==4.57.6       # HuBERT / w2v-BERT. See the VPC note at the bottom.
+tokenizers==0.22.2
+huggingface-hub==0.36.0
+safetensors==0.7.0
+sentencepiece==0.2.1
+speechbrain==1.1.0         # ECAPA-TDNN speaker encoder, S-SIM
 
-# Optional / dev
-jupyter>=1.0.0
-ipython>=8.0.0
+# ---- config / logging ----
+omegaconf==2.3.0
+hydra-core==1.3.2
+pyyaml==6.0.3
+tensorboard==2.20.0
+wandb==0.26.0
+matplotlib==3.10.8
+tqdm==4.65.2
+pandas==2.3.3
+
+# ---- evaluation ----
+jiwer==4.0.0               # WER
+scikit-learn==1.7.2        # cosine EER
+pyloudnorm==0.2.0          # VPC ASV loudness normalization
+hyperpyyaml==1.2.3         # VPC SpeechBrain hyperparams
+kaldiio==2.18.0            # Kaldi ark/scp for the VPC data dirs
+
+# ---- dev ----
+jupyter==1.1.1
+ipython==8.38.0
+
+# ---------------------------------------------------------------------------
+# The VPC checkouts are SEPARATE environments — do not install them here.
+# Both build their own micromamba venv via their own 00_install.sh:
+#
+#   VPC 2026   torch 2.8.0+cu128, python 3.11, attacker = asv_ssl (WavLM-Large + ECAPA)
+#   VPC 2024   torch 2.0.1+cu117, python 3.11, attacker = asv_orig (ECAPA-TDNN)
+#
+# VPC 2024 ships speechbrain 0.5.16, which imports Wav2Vec2FeatureExtractor from transformers.
+# transformers 5.x disables its torch backend when torch < 2.5 and drops that symbol, so
+# speechbrain then reports "Please install transformers" even though it is installed. Its venv
+# needs transformers==4.40.2 / tokenizers<0.20 / huggingface_hub<0.26.
+# ---------------------------------------------------------------------------
