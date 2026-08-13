@@ -78,6 +78,16 @@ from livevoice.utils.checkpoint import (
 
 DEFAULT_VPC_ROOT = "/mnt/data/disk3/yejin/VPC"
 
+# The pseudo-speaker, pinned rather than redrawn. The seeded search below is reproducible, but
+# it is reproducible only for a fixed pool + seed + screening rule: retuning --ref_min_sec or
+# --ref_trim_db, or pointing at a differently-populated VCTK copy, silently moves the target
+# speaker and makes two runs incomparable. A published number should name its pseudo-speaker,
+# so it is a constant here. Chosen by the screen at seed 1234 and then verified:
+#   p231 (VCTK, 23, F, English/Southern England), 9.35s raw -> 3.00s conditioned
+#   90% speech, peak 1.000, tail-200ms RMS 0.236 (ends mid-phrase, not in a pause)
+# Set --anon_fixed_utt "" to fall back to the seeded search.
+DEFAULT_ANON_PROMPT = "/mnt/data/disk2/VCTK-Corpus/wav48/p231/p231_023.wav"
+
 # Track 1 needs all of these: the four ASV dirs, IEMOCAP for UAR, and train-clean-360 to
 # fine-tune the semi-informed attacker.
 TRACK1_DATASETS = (
@@ -135,8 +145,103 @@ def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
     return audio / (audio.abs().max() + 1e-8)
 
 
-def _load_ref(path, target_sr, crop_sec) -> torch.Tensor:
+# ── prompt conditioning ───────────────────────────────────────────────
+# Why this exists. The first run with an untrimmed VCTK prompt produced SILENCE for 52% of
+# libri and 69% of IEMOCAP utterances (peak 0.005, flat from sample 0), which drove WER to
+# 59/86% -- and 90% of those errors were DELETIONS, i.e. the ASR heard nothing at all.
+# The prompt seed 1234 had picked, p345_226.wav, was 2.56s of which 1.1s leading and 0.4s
+# trailing were silence:
+#     100ms RMS  [.006 .008 .008 .008 .008 .004 .008 .007 .013 .011 .013 |
+#                 .215 .316 .364 .355 .184 .226 .231 .252 .211 .166 .098 | .017 .006 .008]
+# A VALL-E-style codec LM continues the prompt's token stream, so a prompt ENDING in silence
+# is a strong prior to keep emitting silence -- and with greedy decoding there is no sampling
+# noise to escape it. VCTK is padded at both ends, so this is the rule, not bad luck.
+#
+# Three rules follow, all applied here so 1fix and 1rnd both get them:
+#   1. trim leading/trailing silence
+#   2. require >= min_sec of speech after trimming (a short prompt carries little timbre and,
+#      below crop_sec, silently disables cropping altogether -- which is how p345_226 got in)
+#   3. end the crop ON SPEECH, never in a pause
+_TRIM_FRAME_MS = 20.0
+
+
+def _frame_rms(w: torch.Tensor, sr: int, frame_ms: float = _TRIM_FRAME_MS):
+    """(rms per frame, hop) — hop == frame, no overlap; only used for silence decisions."""
+    hop = max(1, int(sr * frame_ms / 1000.0))
+    t = w.numel() // hop
+    if t == 0:
+        return torch.zeros(0), hop
+    return w[: t * hop].reshape(t, hop).pow(2).mean(dim=1).sqrt(), hop
+
+
+def _speech_frames(w: torch.Tensor, sr: int, top_db: float):
+    """Boolean mask of frames louder than `top_db` below the loudest frame.
+
+    Relative to the peak rather than absolute, so it is unaffected by the peak-normalisation
+    in _load_full_mono_wav and by VCTK's per-speaker level differences.
+    """
+    rms, hop = _frame_rms(w, sr)
+    if rms.numel() == 0:
+        return torch.zeros(0, dtype=torch.bool), hop
+    thr = rms.max() * (10.0 ** (-abs(top_db) / 20.0))
+    return rms > thr, hop
+
+
+def _trim_silence(w: torch.Tensor, sr: int, top_db: float) -> torch.Tensor:
+    mask, hop = _speech_frames(w, sr, top_db)
+    idx = mask.nonzero().flatten()
+    if idx.numel() == 0:
+        return w                      # all-silent file: leave it, the caller screens it out
+    return w[int(idx[0]) * hop : min(w.numel(), (int(idx[-1]) + 1) * hop)]
+
+
+def _speech_seconds(w: torch.Tensor, sr: int, top_db: float) -> float:
+    mask, hop = _speech_frames(w, sr, top_db)
+    return float(mask.sum()) * hop / sr
+
+
+def _crop_ending_on_speech(w: torch.Tensor, sr: int, crop_sec: float, top_db: float,
+                           tail_ms: float = 200.0) -> torch.Tensor:
+    """Best `crop_sec` window, scored on TAIL ENERGY first, then on whole-window energy.
+
+    Scored on RMS rather than on a speech/silence flag. A binary "is the tail speech" score
+    ties across most windows of a read-speech file, and the tie-break then picks whichever
+    window came first -- which on p231_023 gave a tail RMS of 0.066 where 0.236 was available
+    at identical whole-window energy. Since a weak tail is exactly what makes the codec LM
+    continue into silence, the thing to maximise is the tail level itself, continuously.
+
+    Whole-window RMS is the secondary term so the winner is not a single loud burst preceded
+    by a pause; `top_db` is still honoured as a floor, so an all-silent tail can never win.
+    """
+    n = int(crop_sec * sr)
+    if n <= 0 or w.numel() <= n:
+        return w
+    rms, hop = _frame_rms(w, sr)
+    if rms.numel() == 0:
+        return w[-n:]
+    floor = rms.max() * (10.0 ** (-abs(top_db) / 20.0))
+    n_tail = max(1, int(tail_ms / _TRIM_FRAME_MS))
+    n_win = max(1, n // hop)
+    best, best_key = None, None
+    # step by one frame; a 10s VCTK file is ~460 candidate windows, so this is free
+    for end in range(n_win, rms.numel() + 1):
+        seg = rms[end - n_win : end]
+        tail = seg[-n_tail:]
+        key = (float(tail.mean() >= floor), float(tail.mean()), float(seg.mean()))
+        if best_key is None or key > best_key:
+            best, best_key = end, key
+    stop = min(w.numel(), best * hop)
+    return w[max(0, stop - n) : stop]
+
+
+def _load_ref(path, target_sr, crop_sec, trim_db: float = 35.0) -> torch.Tensor:
     w = _load_full_mono_wav(path, target_sr)
+    if trim_db > 0:
+        w = _trim_silence(w, target_sr, trim_db)
+        if crop_sec and crop_sec > 0:
+            w = _crop_ending_on_speech(w, target_sr, crop_sec, trim_db)
+        return w
+    # trim_db <= 0 reproduces the pre-fix behaviour exactly, for A/B against the broken run
     n = int(crop_sec * target_sr)
     if crop_sec and crop_sec > 0 and w.numel() > n:
         start = random.Random(f"crop:{path}").randint(0, w.numel() - n)
@@ -376,7 +481,9 @@ class PromptSelector:
 
     def __init__(self, pool_dir: str, strategy: str, seed: int,
                  wav_base: Path | None = None,
-                 fixed_spk: str | None = None, fixed_utt: str | None = None):
+                 fixed_spk: str | None = None, fixed_utt: str | None = None,
+                 sr: int = 16000, min_sec: float = 4.0, trim_db: float = 35.0,
+                 crop_sec: float = 3.0):
         self.strategy = str(strategy).lower()
         if self.strategy not in ("1fix", "1rnd"):
             raise SystemExit(f"unknown --anon_strategy {strategy!r}; expected 1fix or 1rnd")
@@ -389,15 +496,10 @@ class PromptSelector:
                 self.fixed = fixed_utt
                 spk = "<explicit>"
             else:
-                spk = fixed_spk or random.Random(self.seed).choice(list(self.by_spk))
-                if spk not in self.by_spk:
-                    raise SystemExit(
-                        f"--anon_fixed_spk {spk!r} not in pool; have e.g. "
-                        f"{list(self.by_spk)[:8]}")
-                # VCTK/LibriTTS are read speech, so any utterance is the "neutral utterance"
-                # SVA+ asks for; pick deterministically so reruns reuse the same prompt.
-                self.fixed = random.Random(f"{self.seed}:{spk}").choice(self.by_spk[spk])
+                spk, self.fixed = self._screen(
+                    fixed_spk, sr, min_sec, trim_db, max(crop_sec, min_sec))
             print(f"[anon] strategy=1fix  target speaker={spk}  prompt={self.fixed}")
+            self._report(self.fixed, sr, trim_db, crop_sec)
         else:
             print(f"[anon] strategy=1rnd  prompt drawn per utterance from the pool")
         print(f"[anon] pool: {len(self.by_spk)} speakers, {len(self.all_wavs)} utterances "
@@ -405,6 +507,69 @@ class PromptSelector:
         if len(self.by_spk) < 2:
             print("[anon] WARNING: pool has <2 speakers — for VCTK point --anon_pool_dir at "
                   "the wav48/ directory, not the corpus root.")
+
+    def _screen(self, fixed_spk: str | None, sr: int, min_sec: float, trim_db: float,
+                need_sec: float) -> tuple[str, str]:
+        """Pick (speaker, utterance) among candidates that survive the silence rules.
+
+        Speakers are tried in a seeded order rather than by a single draw, so a speaker whose
+        recordings are all too short cannot leave the run with no valid prompt. Within a
+        speaker the choice is deterministic -- most speech after trimming -- because the SAME
+        prompt has to come back on every resume and for every dataset in the run.
+        """
+        order = list(self.by_spk)
+        if fixed_spk:
+            if fixed_spk not in self.by_spk:
+                raise SystemExit(f"--anon_fixed_spk {fixed_spk!r} not in pool; have e.g. "
+                                 f"{list(self.by_spk)[:8]}")
+            order = [fixed_spk]
+        else:
+            random.Random(self.seed).shuffle(order)
+        rejected = 0
+        for spk in order:
+            scored = []
+            for w in self.by_spk[spk]:
+                try:
+                    a = _trim_silence(_load_full_mono_wav(w, sr), sr, trim_db)
+                except Exception:
+                    continue
+                sec = a.numel() / sr
+                if sec < max(min_sec, need_sec):
+                    rejected += 1
+                    continue
+                scored.append((_speech_seconds(a, sr, trim_db), sec, w))
+            if scored:
+                scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+                if rejected:
+                    print(f"[anon] prompt screen: rejected {rejected} candidate(s) shorter "
+                          f"than {max(min_sec, need_sec):.1f}s of speech after trimming")
+                return spk, scored[0][2]
+            if fixed_spk:
+                raise SystemExit(
+                    f"--anon_fixed_spk {fixed_spk!r} has no utterance with >= "
+                    f"{max(min_sec, need_sec):.1f}s of speech after trimming at "
+                    f"--ref_trim_db {trim_db}. Lower --ref_min_sec or pick another speaker.")
+        raise SystemExit(f"no pool utterance has >= {max(min_sec, need_sec):.1f}s of speech "
+                         f"after trimming at --ref_trim_db {trim_db}")
+
+    @staticmethod
+    def _report(path: str, sr: int, trim_db: float, crop_sec: float) -> None:
+        """Print what the model will actually be conditioned on. Cheap, and the last chance to
+        catch a silent prompt before committing ~13 GPU-h of generation."""
+        try:
+            raw = _load_full_mono_wav(path, sr)
+            ref = _load_ref(path, sr, crop_sec, trim_db)
+        except Exception as e:                                   # pragma: no cover
+            print(f"[anon] prompt report unavailable: {e}")
+            return
+        rms, hop = _frame_rms(ref, sr, 100.0)
+        tail = ref[-int(0.2 * sr):]
+        print(f"[anon] prompt: raw {raw.numel()/sr:.2f}s -> conditioned {ref.numel()/sr:.2f}s "
+              f"({_speech_seconds(ref, sr, trim_db):.2f}s speech), "
+              f"peak {float(ref.abs().max()):.3f}, "
+              f"tail-200ms rms {float(tail.pow(2).mean().sqrt()):.4f}")
+        print(f"[anon] prompt 100ms rms: "
+              f"{[round(float(x), 3) for x in rms]}")
 
     def ref_for(self, utt: str) -> str:
         if self.strategy == "1fix":
@@ -420,11 +585,14 @@ def _make_selector(args) -> PromptSelector:
     train-clean-360 (1fix would otherwise pick a different prompt per call) and because
     scanning a pool like LibriTTS train-other-500 is not free."""
     key = (args.anon_pool_dir, str(args.anon_strategy).lower(), int(args.anon_seed),
-           getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None))
+           getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None),
+           float(args.ref_min_sec), float(args.ref_trim_db), float(args.ref_crop_sec))
     if key not in _SELECTOR_CACHE:
         _SELECTOR_CACHE[key] = PromptSelector(
             args.anon_pool_dir, args.anon_strategy, args.anon_seed, args.wav_base,
-            getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None))
+            getattr(args, "anon_fixed_spk", None), getattr(args, "anon_fixed_utt", None),
+            sr=16000, min_sec=float(args.ref_min_sec), trim_db=float(args.ref_trim_db),
+            crop_sec=float(args.ref_crop_sec))
     return _SELECTOR_CACHE[key]
 
 
@@ -452,6 +620,8 @@ def _run_fingerprint(args) -> dict:
         "anon_fixed_spk": args.anon_fixed_spk,
         "anon_fixed_utt": args.anon_fixed_utt,
         "ref_crop_sec": float(args.ref_crop_sec),
+        "ref_trim_db": float(args.ref_trim_db),
+        "ref_min_sec": float(args.ref_min_sec),
         "temperature": float(args.temperature),
         "cfg_scale": float(args.cfg_scale),
         "top_p": float(args.top_p),
@@ -509,6 +679,58 @@ def _claim_output_dir(dst: Path, fingerprint: dict, ds: str) -> None:
     os.replace(tmp, stamp)
 
 
+def _purge(vpc_root: Path, suffix: str, datasets: list[str], confirmed: bool) -> None:
+    """Remove one run: our audio dirs AND everything VPC derived from them.
+
+    Deleting only data/<ds><suffix> is not enough and is the trap worth guarding against.
+    VPC caches speaker embeddings under exp/asv_ssl/cosine_out/emb_xvect/<ds><suffix>/, and a
+    rerun REUSES them -- so new audio would be scored with the old audio's embeddings and the
+    EER would silently describe a run that no longer exists. The ASR/SER working dirs and the
+    results CSVs are the same story, one directory up.
+
+    Our own dirs are only removed when they carry the stamp, so a name collision with a VPC
+    directory can never turn this into a data-loss event. VPC's derived artifacts are matched
+    by suffix instead (they are not ours to stamp), which is why --anon_suffix is required and
+    is checked against _RESERVED_SUFFIXES by the caller.
+    """
+    data_dirs, derived, skipped = [], [], []
+    for ds in datasets:
+        d = vpc_root / "data" / f"{ds}{suffix}"
+        if not d.exists():
+            continue
+        (data_dirs if (d / _STAMP).is_file() else skipped).append(d)
+    for pat in (f"data/*{suffix}", f"exp/*/*{suffix}", f"exp/*/*{suffix}.csv",
+                f"exp/*/*{suffix}/", f"exp/asv_ssl/cosine_out/*/*{suffix}",
+                f"exp/results_summary/*{suffix}"):
+        for p in sorted(glob.glob(str(vpc_root / pat))):
+            q = Path(p)
+            if q in data_dirs or q in skipped or q in derived:
+                continue
+            if q.is_dir() and (q / _STAMP).is_file():
+                data_dirs.append(q)
+            else:
+                derived.append(q)
+
+    if not data_dirs and not derived:
+        print(f"[purge] nothing matching {suffix!r} under {vpc_root}")
+        return
+    print(f"[purge] target {vpc_root}   suffix {suffix!r}")
+    for d in data_dirs:
+        n = len(list((d / "wav").glob("*.wav"))) if (d / "wav").is_dir() else 0
+        print(f"    ours     {d.relative_to(vpc_root)}   ({n} wav)")
+    for d in derived:
+        print(f"    derived  {d.relative_to(vpc_root)}")
+    for d in skipped:
+        print(f"    KEPT (no {_STAMP}, not ours)  {d.relative_to(vpc_root)}")
+    if not confirmed:
+        print(f"\n[purge] dry run — nothing deleted. Add --yes to delete the "
+              f"{len(data_dirs) + len(derived)} path(s) above.")
+        return
+    for d in data_dirs + derived:
+        shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink(missing_ok=True)
+    print(f"\n[purge] deleted {len(data_dirs) + len(derived)} path(s)")
+
+
 def _copy_metadata(src: Path, dst: Path) -> None:
     """Copy the Kaldi metadata files (utt2spk, spk2utt, text, utt2emo, trials, …) but not the
     directories, which hold audio. Same rule as VPC's utils.copy_data_dir."""
@@ -551,7 +773,8 @@ def _run_dataset(ds, vpc_root, suffix, lit, cfg, sel, gen_kwargs, dev, args) -> 
     print(f"[anon] {ds}: shard {args.shard}/{args.num_shards} → {len(todo)}/{len(utts)} to do")
     for utt in tqdm(todo, desc=f"{ds}[{args.shard}]"):
         ctn = _load_scp_audio(scp[utt], vpc_root, sr).unsqueeze(0).to(dev)
-        ref = _load_ref(sel.ref_for(utt), sr, args.ref_crop_sec).unsqueeze(0).to(dev)
+        ref = _load_ref(sel.ref_for(utt), sr, args.ref_crop_sec,
+                        float(args.ref_trim_db)).unsqueeze(0).to(dev)
         codes = lit.model.generate(reference_audio=ref, content_audio=ctn, **gen_kwargs)
         aud = lit.model.decode_to_audio(codes)[0].detach().float().cpu()
         # Write via a temp name so an interrupted run never leaves a truncated wav that the
@@ -570,14 +793,34 @@ def main() -> None:
                    help="e.g. _lv_vctk1fix — becomes data/<ds><suffix>/ and VPC's anon_data_suffix")
     p.add_argument("--finalize_only", action="store_true",
                    help="skip generation; just write wav.scp + metadata for completed dirs")
+    p.add_argument("--purge", action="store_true",
+                   help="delete this suffix's audio dirs AND the VPC eval artifacts derived "
+                        "from them (cached ASV embeddings above all — a rerun reuses them and "
+                        "would score new audio with the old audio's embeddings). Lists the "
+                        "targets and deletes nothing unless --yes is also given.")
+    p.add_argument("--yes", action="store_true",
+                   help="with --purge, actually delete instead of listing")
 
     p.add_argument("--ckpt", default=None)
     p.add_argument("--anon_pool_dir", default="/mnt/data/disk2/VCTK-Corpus/wav48")
     p.add_argument("--anon_strategy", default="1fix", choices=["1fix", "1rnd"])
     p.add_argument("--anon_fixed_spk", default=None)
-    p.add_argument("--anon_fixed_utt", default=None)
+    p.add_argument("--anon_fixed_utt", default=DEFAULT_ANON_PROMPT,
+                   help="exact prompt wav; pinned by default so every run and every dataset "
+                        "shares one pseudo-speaker. Pass \"\" to re-enable the seeded search "
+                        "over --anon_pool_dir.")
     p.add_argument("--anon_seed", type=int, default=1234)
     p.add_argument("--ref_crop_sec", type=float, default=3.0)
+    p.add_argument("--ref_trim_db", type=float, default=35.0,
+                   help="silence threshold in dB below the prompt's loudest 20ms frame. "
+                        "Leading/trailing silence is trimmed and the crop is placed to END "
+                        "ON SPEECH; a prompt ending in a pause makes the codec LM continue "
+                        "with silence (52%% of outputs were silent before this existed). "
+                        "0 turns off every silence-aware step -- no trimming, random crop "
+                        "position, and screening falls back to raw duration -- for A/B only.")
+    p.add_argument("--ref_min_sec", type=float, default=4.0,
+                   help="reject pool utterances with less than this much audio after "
+                        "trimming; raised to --ref_crop_sec if that is larger")
 
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
@@ -616,6 +859,10 @@ def main() -> None:
             f"--shard must be in [0, {args.num_shards}) for --num_shards {args.num_shards}, "
             f"got {args.shard}. Shards 0..{args.num_shards - 1} together cover every utterance; "
             f"any other index leaves gaps. (Pick the GPU with CUDA_VISIBLE_DEVICES, not --shard.)")
+
+    if args.purge:
+        _purge(vpc_root, suffix, datasets, bool(args.yes))
+        return
 
     if args.finalize_only:
         ok = all(_finalize(ds, vpc_root, suffix) for ds in datasets)

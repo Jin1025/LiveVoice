@@ -273,7 +273,7 @@ def utt_split_mask(items, test_frac, seed):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--zipformer_ckpt",
-                    default="/mnt/data/disk3/yejin/zipformer_pretrained.pt",
+                    default="/mnt/data/disk2/yejin/LiveVoice/pretrained_models/zipformer_pretrained.pt",
                     help="icefall streaming-Zipformer checkpoint (content_source=zipformer)")
     ap.add_argument("--zipformer_layer", default="-1",
                     help="which tap: -1 = just before the final 50->25Hz downsample "
