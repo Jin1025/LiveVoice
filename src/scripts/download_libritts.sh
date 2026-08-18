@@ -6,11 +6,11 @@ TARGET_DIR="/mnt/data/disk2/LibriTTS"
 URLS=(
   "https://openslr.trmal.net/resources/60/train-clean-100.tar.gz"
   "https://openslr.trmal.net/resources/60/train-clean-360.tar.gz"
-  "https://openslr.trmal.net/resources/60/train-other-500.tar.gz"
+  # "https://openslr.trmal.net/resources/60/train-other-500.tar.gz"
   "https://openslr.trmal.net/resources/60/test-clean.tar.gz"
-  "https://openslr.trmal.net/resources/60/test-other.tar.gz"
+  # "https://openslr.trmal.net/resources/60/test-other.tar.gz"
   "https://openslr.trmal.net/resources/60/dev-clean.tar.gz"
-  "https://openslr.trmal.net/resources/60/dev-other.tar.gz"
+  # "https://openslr.trmal.net/resources/60/dev-other.tar.gz"
 )
 
 mkdir -p "$TARGET_DIR"

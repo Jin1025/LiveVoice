@@ -253,6 +253,18 @@ class LiveVoiceConfig:
 
     # MusicGen delay pattern over codec codebooks
     use_delay_pattern: bool = True
+    # Cap on the per-codebook delay: delay(k) = min(k, delay_cap). K-1 (=7) is the full
+    # MusicGen pattern and the historical behaviour; 0 is fully parallel and matches
+    # use_delay_pattern=False. Intermediate values keep the sequential conditioning where RVQ
+    # actually needs it (the coarse books carry the signal, the fine tail is low-energy
+    # residual) while cutting the latency it costs:
+    #     cap 7  0 1 2 3 4 5 6 7   140 ms
+    #     cap 4  0 1 2 3 4 4 4 4    80 ms   ← 160 ms total with zipformer_align_pad_frames=-4
+    #     cap 3  0 1 2 3 3 3 3 3    60 ms
+    #     cap 0  0 0 0 0 0 0 0 0     0 ms
+    # Changing it changes the AR stream layout, so a checkpoint must be decoded with the same
+    # value it was trained with.
+    delay_cap: int = 7
     n_codebooks_predict: int = 8  # keep it small at 16 kHz (coarse bookss carry most info)
     # Coarse codebooks weighted higher (carry content/prosody, intelligibility);
     # fine codebooks gently down-weighted but not too low (still need detail).

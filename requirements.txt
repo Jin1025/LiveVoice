@@ -28,8 +28,6 @@ audioread==3.1.0
 numba==0.63.1              # must agree with numpy; upgrade the two together or not at all
 llvmlite==0.46.0
 torchcrepe==0.0.24         # F0 / periodicity (config.pitch_method="crepe")
-praat-parselmouth==0.4.7   # formant/VTLN perturbation (config.use_vtln)
-descript-audio-codec==1.0.0
 torch-stoi==0.2.3
 torchlibrosa==0.1.0
 
@@ -40,6 +38,7 @@ huggingface-hub==0.36.0
 safetensors==0.7.0
 sentencepiece==0.2.1
 speechbrain==1.1.0         # ECAPA-TDNN speaker encoder, S-SIM
+openai-whisper==20250625   # WER
 
 # ---- config / logging ----
 omegaconf==2.3.0
@@ -57,6 +56,7 @@ scikit-learn==1.7.2        # cosine EER
 pyloudnorm==0.2.0          # VPC ASV loudness normalization
 hyperpyyaml==1.2.3         # VPC SpeechBrain hyperparams
 kaldiio==2.18.0            # Kaldi ark/scp for the VPC data dirs
+s3prl==0.4.18              # WavLM-TDNN, S_SIM
 
 # ---- dev ----
 jupyter==1.1.1

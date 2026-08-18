@@ -398,6 +398,39 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         idx = torch.linspace(0, T_src - 1, num_tokens, device=feats.device).long()
         return feats[:, idx, :]
 
+    def _codebook_delays(self) -> list[int]:
+        """Delay of each codebook, in frames. delay(k) = min(k, cap).
+
+        The full MusicGen pattern (cap = K-1) buys hierarchical conditioning: predicting
+        codebook k at time t happens only after codebooks < k of that same t are already in
+        the input. It costs K-1 frames of algorithmic latency — 140 ms at 8 books / 50 fps,
+        the largest single term in this system's budget.
+
+        That conditioning is not worth the same everywhere. RVQ is residual: cb0 carries most
+        of the signal and cb1 refines it, while cb6 and cb7 encode low-energy leftovers whose
+        dependence on each other is weak. Capping the delay keeps the sequential ordering
+        where it pays (the coarse books) and lets the fine tail be predicted in parallel:
+
+            cap 7  0 1 2 3 4 5 6 7   140 ms   full pattern (default, unchanged behaviour)
+            cap 4  0 1 2 3 4 4 4 4    80 ms
+            cap 3  0 1 2 3 3 3 3 3    60 ms
+            cap 0  0 0 0 0 0 0 0 0     0 ms   fully parallel (== use_delay_pattern=False)
+
+        Codebooks sharing a delay are predicted independently of each other, but still
+        conditioned on every book with a smaller delay.
+        """
+        K = self.n_codebooks_predict
+        if not bool(getattr(self.config, "use_delay_pattern", True)):
+            return [0] * K
+        cap = int(getattr(self.config, "delay_cap", K - 1))
+        if cap < 0:
+            raise ValueError(f"delay_cap must be >= 0, got {cap}")
+        return [min(k, cap) for k in range(K)]
+
+    def _delay_tail(self) -> int:
+        """Extra stream positions the delay pattern appends (== the largest delay)."""
+        return max(self._codebook_delays())
+
     def _align_content_delay(
         self,
         feats: torch.Tensor,
@@ -417,16 +450,17 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         already-decoded times), so they receive a null content signal.
         """
         body = self.align_to_tokens(feats, base_len, causal=True)
-        K = self.n_codebooks_predict
-        if not use_delay or K <= 1:
+        n_tail = self._delay_tail() if use_delay else 0
+        if n_tail <= 0:
             return body
-        tail = null_vec.to(device=body.device, dtype=body.dtype).expand(feats.size(0), K - 1, -1)
+        tail = null_vec.to(device=body.device, dtype=body.dtype).expand(feats.size(0), n_tail, -1)
         return torch.cat([body, tail], dim=1)
 
     # --------------------- delay pattern ---------------------
     def _build_delay_input(self, codes: torch.Tensor) -> torch.Tensor:
         B, K, T = codes.shape
-        T_delay = T + K - 1
+        d = self._codebook_delays()
+        T_delay = T + max(d)
         D = self.config.hidden_dim
         device = codes.device
         emb = torch.zeros(B, T_delay, D, device=device)
@@ -434,8 +468,8 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             cb = getattr(self, f"codebook_vectors_{k}")
             proj = self.decoder_input_projs[k]
             emb_k = proj(cb[codes[:, k, :]])  # (B, T, D)
-            start = k + 1
-            end = min(k + 1 + T, T_delay)
+            start = d[k] + 1
+            end = min(d[k] + 1 + T, T_delay)
             emb[:, start:end, :] += emb_k[:, : end - start, :]
         bos = self.transformer.start_token.expand(B, -1, -1)
         emb[:, 0:1, :] = bos
@@ -443,10 +477,10 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
 
     def _build_delay_targets(self, codes: torch.Tensor) -> torch.Tensor:
         B, K, T = codes.shape
-        T_delay = T + K - 1
-        tgt = torch.full((B, T_delay, K), -100, device=codes.device, dtype=codes.dtype)
+        d = self._codebook_delays()
+        tgt = torch.full((B, T + max(d), K), -100, device=codes.device, dtype=codes.dtype)
         for k in range(K):
-            tgt[:, k : k + T, k] = codes[:, k, :]
+            tgt[:, d[k] : d[k] + T, k] = codes[:, k, :]
         return tgt
 
     def _build_nodelay_input(self, codes: torch.Tensor) -> torch.Tensor:
@@ -794,7 +828,8 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         B, _, T = target_codes.shape
         device = target_codes.device
         use_delay = bool(getattr(self.config, "use_delay_pattern", True))
-        T_seq = (T + K - 1) if use_delay else T
+        d_cb = self._codebook_delays()
+        T_seq = (T + self._delay_tail()) if use_delay else T
 
         # CFG dropout masks
         drop_both = torch.zeros(B, dtype=torch.bool, device=device)
@@ -1035,6 +1070,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         """If `speaker_override` (B, *, hidden) is given it replaces the speaker
         representation from `reference_audio` (used by anonymized generation)."""
         use_delay = bool(getattr(self.config, "use_delay_pattern", True))
+        d_cb = self._codebook_delays()
         K = self.n_codebooks_predict
         device = content_audio.device
         B = content_audio.shape[0]
@@ -1090,7 +1126,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             # ceil(L/hop)) and the center-aligned HuBERT content count, so content aligns
             # 1:1 to the generated tokens with no resample.
             max_steps = max(1, -(-n_samples // hop))
-        T_total = (max_steps + K - 1) if use_delay else max_steps
+        T_total = (max_steps + self._delay_tail()) if use_delay else max_steps
 
         # Align content 1:1 to the codebook-0 timeline (length max_steps) and null-pad
         # the K-1 delay tail — identical to the training forward. causal=True keeps the
@@ -1214,7 +1250,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
 
             if use_delay:
                 for k in range(K):
-                    orig = t - k
+                    orig = t - d_cb[k]
                     if 0 <= orig < max_steps:
                         lg = self.codebook_heads[k](hidden_full)
                         if use_cfg:
@@ -1225,7 +1261,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 # next prev_emb
                 nxt = torch.zeros(B, 1, self.config.hidden_dim, device=device)
                 for k in range(K):
-                    orig = t - k
+                    orig = t - d_cb[k]
                     cb = getattr(self, f"codebook_vectors_{k}")
                     if 0 <= orig < len(generated[k]):
                         nxt += self.decoder_input_projs[k](cb[generated[k][orig]]).unsqueeze(1)

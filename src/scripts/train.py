@@ -110,7 +110,7 @@ _RUN_SETTINGS = [
                   "pitch_prior_hz", "pitch_fmin", "pitch_fmax", "use_random_median_filter"]),
     ("prompt",   ["codec_prompt_content", "codec_prompt_loss_weight",
                   "speaker_encoder_type", "speaker_conditioning", "audio_duration"]),
-    ("stream",   ["use_delay_pattern", "n_codebooks_predict"]),
+    ("stream",   ["use_delay_pattern", "delay_cap", "n_codebooks_predict"]),
     ("aux loss", ["use_asr_supervision", "asr_supervision_type", "asr_loss_weight",
                   "use_speaker_grl", "grl_objective", "grl_lambda_max", "grl_num_clusters"]),
     ("optim",    ["precision", "train_batch_size", "learning_rate", "max_epochs"]),
