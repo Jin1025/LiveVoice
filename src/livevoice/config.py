@@ -84,7 +84,7 @@ class LiveVoiceConfig:
     #   "off" | "utterance" (offline, exact) | "causal" (running mean — streaming-safe)
     # Changing this changes the content path's input distribution, so a Stage-1 checkpoint
     # trained with one setting must not be evaluated with another.
-    content_cmn: str = "causal" # off, utterance, causal
+    content_cmn: str = "off" # off, utterance, causal
     content_cmn_var: bool = False   # also divide by the std (CMVN rather than CMN)
     # Virtual prior count n0 for content_cmn="causal" (Kaldi OnlineCmvn's global_frames).
     #   0  the original estimator: the running mean at t=0 IS the single observed frame, so
@@ -95,7 +95,7 @@ class LiveVoiceConfig:
     #      near-raw and the transient flattens (deviation ~0.37 from 0 ms to 2 s).
     # Changes the content distribution → needs retraining, and a cache extracted with CMN
     # baked in (content_cmn_in_cache) must be re-extracted with the same value.
-    content_cmn_prior_frames: float = 25.0
+    content_cmn_prior_frames: float = 0.0
     
     freeze_hubert: bool = True
     # Center-align HuBERT content frames to the codec token grid via waveform padding
@@ -104,18 +104,44 @@ class LiveVoiceConfig:
     content_center_align: bool = True
 
     # ------------------------------------------------------------------
-    # Prosody features (optional, causal)
+    # Prosody features (causal)
     # ------------------------------------------------------------------
-    use_prosody: bool = False  # start without, add later if speaker leaks
+    use_prosody: bool = True 
     prosody_hop_length: int = 320
     n_fft: int = 1024
-    pitch_method: str = "crepe"  # "crepe" | "fft"
-    pitch_bins: int = 360
+    pitch_method: str = "yin" # "yin" | "crepe"
+    pitch_bins: int = 360        # CREPE grid: 20 cents/bin from C1, shared by both methods
     pitch_threshold: float = 0.1
+    # Extraction range for the SOURCE audio (prosody is read from content_audio, not from the
+    # pseudo-speaker prompt), so it has to cover every speaker we convert FROM. Measured with
+    # librosa.yin over libri_dev_trials_mixed + IEMOCAP_dev, 60 utts each:
+    #                    1%     5%   median    95%    99%
+    #   libri    m      50.7   56.4   133.6   367.4  469.8
+    #   libri    f      50.9   56.4   187.4   325.5  465.8
+    #   IEMOCAP  m      50.3   51.0   111.3   291.5  411.4
+    #   IEMOCAP  f      50.4   50.8   166.1   325.5  407.6
+    # fmin=70 would silence the bottom ~5% of male speech and every creaky phrase-final vowel,
+    # which is exactly where sadness lives. Raising fmin also costs nothing to fix later, but
+    # a frame wrongly marked unvoiced is gone for good.
+    pitch_fmin: float = 55.0
+    pitch_fmax: float = 500.0
+    yin_threshold: float = 0.15  # de Cheveigné & Kawahara absolute threshold
+    # Feed F0 as cents relative to a CAUSAL running mean of log-F0 rather than absolute Hz.
+    # Register (the mean) is speaker identity; the deviation from it is emotion — sadness
+    # narrows and lowers the excursion, anger widens it. Mean-subtraction drops the first and
+    # keeps the second. Variance is deliberately NOT normalised: dividing by sigma would
+    # flatten exactly the excursion that distinguishes the emotions, which is the thing this
+    # feature exists to restore (ACC_sad was 3.7 vs an original 63.6).
+    pitch_normalize: bool = True
+    # Virtual prior count for that running mean, same trick as content_cmn_prior_frames:
+    # with n0=0 the first voiced frame IS the mean, so its deviation is identically zero.
+    pitch_prior_frames: float = 25.0
+    pitch_prior_hz: float = 150.0   # neutral register the prior sits at
+    pitch_norm_span_cents: float = 1200.0  # grid half-range, +/- 1 octave of deviation
     prosody_hidden_dim: int = 128
 
     # median filter to make prosody "sketch-like" (cross-speaker transfer)
-    use_random_median_filter: bool = True
+    use_random_median_filter: bool = False
     median_filter_min_size: int = 1
     median_filter_max_size: int = 15
     median_filter_inference_size: int = 5
@@ -185,7 +211,7 @@ class LiveVoiceConfig:
     # gradient (null-prompt ΔCE ≈ 0.01). Keep it BELOW 1.0: the target region is what we
     # actually want to be good at, and the prompt is ~half the stream. Pair with
     # codec_prompt_content=True so the scored task is conditioned rather than unconditional.
-    codec_prompt_loss_weight: float = 0.3
+    codec_prompt_loss_weight: float = 1.0 # 0.3
 
     speechbrain_source: str = "speechbrain/spkrec-ecapa-voxceleb"
     speechbrain_savedir: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/speechbrain__spkrec-ecapa-voxceleb"

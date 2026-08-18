@@ -2,11 +2,29 @@
 
 Trimmed-down, speech-focused version of sonic's SketchFeatureExtractor:
 - A-weighted loudness from magnitude STFT
-- Pitch-probability distribution via CREPE ("tiny") or FFT fallback
+- Pitch-probability distribution via YIN (default) or CREPE ("tiny")
 - No spectral centroid, no rhythm bands — speech prosody is mostly F0 + energy
 - Optional random median filter to make the control sketch-like across speakers
 
 All operations are causal (center=False, left-pad only).
+
+Why YIN and not the old FFT fallback: that fallback did not estimate F0 at all. It rescaled
+the 50-2000 Hz magnitude bins to `pitch_bins` and softmaxed them, so what reached the model
+was a coarse spectral envelope — harmonics, formants and all — not a pitch track. Anything
+downstream conditioned on "pitch" would in fact have been conditioned on timbre, which is the
+one thing this system exists to remove. It is deleted rather than kept as a fallback.
+
+Why not CREPE: it is a CNN forward per frame. Correctness is not the issue (it is frame-wise,
+so it is causal); cost is. Measured on 5 s of audio at 16 kHz, hop 320:
+
+    torch YIN (this file)   RTF ~0.0006      librosa.pyin   RTF 0.026
+
+YIN also runs batched on GPU inside the training loop, where a numpy pitch tracker would
+serialise every step. CREPE is kept selectable for offline comparison.
+
+Framing: a YIN frame needs W analysis samples plus tau_max lag samples. Both are taken from
+INSIDE the n_fft window the STFT already reads (W = n_fft - tau_max), so the pitch track adds
+no lookahead beyond the loudness track and the two are frame-aligned by construction.
 """
 from __future__ import annotations
 
@@ -36,17 +54,43 @@ class ProsodyExtractor(nn.Module):
 
         self.register_buffer("a_weighting", self._a_weighting())
 
-        self.pitch_method = str(getattr(config, "pitch_method", "crepe"))
+        self.pitch_method = str(getattr(config, "pitch_method", "yin"))
+        if self.pitch_method not in ("yin", "crepe"):
+            raise ValueError(f"pitch_method must be 'yin' or 'crepe', got {self.pitch_method!r}")
         self.pitch_bins = int(config.pitch_bins)
         self.pitch_threshold = float(config.pitch_threshold)
-        self.crepe_available = False
+        self.fmin = float(getattr(config, "pitch_fmin", 70.0))
+        self.fmax = float(getattr(config, "pitch_fmax", 400.0))
+        self.yin_threshold = float(getattr(config, "yin_threshold", 0.15))
+        self.pitch_normalize = bool(getattr(config, "pitch_normalize", True))
+        self.pitch_prior_frames = float(getattr(config, "pitch_prior_frames", 25.0))
+        self.pitch_prior_hz = float(getattr(config, "pitch_prior_hz", 150.0))
+        self.pitch_norm_span = float(getattr(config, "pitch_norm_span_cents", 1200.0))
         if self.pitch_method == "crepe":
             try:
                 import torchcrepe  # noqa: F401
-                self.crepe_available = True
-            except ImportError:
-                print("[ProsodyExtractor] torchcrepe not installed — falling back to FFT pitch.")
-                self.pitch_method = "fft"
+            except ImportError as e:
+                # No silent downgrade: the old code fell back to a spectral-envelope stand-in,
+                # so a missing package quietly changed WHAT the model was conditioned on.
+                raise ImportError(
+                    "pitch_method='crepe' needs torchcrepe. Install it, or set "
+                    "config.pitch_method='yin' (cheaper, and the default)."
+                ) from e
+
+        # YIN lag range, in samples. tau_max is carved out of the STFT window so the pitch
+        # track reads no further ahead than the loudness track does.
+        self.tau_min = max(2, int(self.sr / self.fmax))
+        self.tau_max = min(int(self.sr / self.fmin) + 1, self.n_fft // 2)
+        self.yin_win = self.n_fft - self.tau_max
+        if self.yin_win < 2 * self.tau_max:
+            raise ValueError(
+                f"n_fft={self.n_fft} too small for pitch_fmin={self.fmin} Hz: leaves "
+                f"{self.yin_win} analysis samples for {self.tau_max} lags. Raise n_fft or fmin.")
+
+        # CREPE's target grid: 360 bins of 20 cents from C1 (32.70 Hz). Sharing it keeps the
+        # two methods interchangeable behind one `pitch_proj`.
+        cents = 20.0 * torch.arange(self.pitch_bins, dtype=torch.float32)
+        self.register_buffer("bin_hz", 32.70 * 2.0 ** (cents / 1200.0))
 
         # projections
         self.loudness_proj = nn.Linear(1, config.prosody_hidden_dim)
@@ -98,20 +142,94 @@ class ProsodyExtractor(nn.Module):
                 outs.append(probs.unsqueeze(0))
         return torch.cat(outs, dim=0)
 
-    def _pitch_fft(self, audio: torch.Tensor) -> torch.Tensor:
-        stft = torch.stft(
-            audio, n_fft=self.n_fft, hop_length=self.hop_length,
-            window=torch.hann_window(self.n_fft, device=audio.device),
-            return_complex=True, center=False,
-        )
-        mag = torch.abs(stft).transpose(1, 2)  # (B, T, F)
-        min_bin = int(50 * self.n_fft / self.sr)
-        max_bin = int(2000 * self.n_fft / self.sr)
-        pm = mag[..., min_bin:max_bin]
-        B, T, P = pm.shape
-        pm = F.interpolate(pm.reshape(B * T, 1, P), size=self.pitch_bins, mode="linear", align_corners=False)
-        pm = pm.reshape(B, T, self.pitch_bins)
-        probs = F.softmax(pm / 1.1, dim=-1)
+    def _pitch_yin(self, audio: torch.Tensor) -> torch.Tensor:
+        """YIN F0 → soft one-hot over `pitch_bins`. (B, T, bins), all-zero where unvoiced.
+
+        de Cheveigné & Kawahara (2002), steps 1-5. The difference function is computed from
+        power sums and an FFT cross-correlation rather than directly, which is what keeps the
+        cost at O(N log N) per frame instead of O(W * tau_max) — the direct form would need a
+        (B, T, tau_max, W) intermediate, ~870 MB at batch 8.
+        """
+        W, tmax = self.yin_win, self.tau_max
+        frames = audio.unfold(-1, self.n_fft, self.hop_length)          # (B, T, n_fft)
+        B, T, _ = frames.shape
+        x = frames.reshape(B * T, self.n_fft)
+
+        # d(tau) = p(0) + p(tau) - 2 r(tau)
+        cs = torch.cumsum(F.pad(x * x, (1, 0)), dim=-1)                 # (BT, n_fft+1)
+        p = cs[:, W:] - cs[:, :-W]                                      # p(tau), tau=0..tmax
+        p = p[:, : tmax + 1]
+        n = 1 << int(self.n_fft + W - 1).bit_length()
+        r = torch.fft.irfft(
+            torch.fft.rfft(x, n=n) * torch.fft.rfft(x[:, :W], n=n).conj(), n=n
+        )[:, : tmax + 1]
+        d = (p[:, :1] + p - 2.0 * r).clamp_min(0.0)
+
+        # cumulative mean normalised difference; d'(0) := 1
+        cum = torch.cumsum(d, dim=-1)
+        lag = torch.arange(1, tmax + 1, device=x.device, dtype=d.dtype)
+        dn = torch.ones_like(d)
+        dn[:, 1:] = d[:, 1:] * lag / cum[:, 1:].clamp_min(1e-12)
+
+        # first lag below threshold, else global minimum (absolute-threshold step)
+        cand = dn[:, self.tau_min : tmax + 1]
+        below = cand < self.yin_threshold
+        first = torch.where(
+            below.any(dim=-1), below.float().argmax(dim=-1), cand.argmin(dim=-1)
+        ) + self.tau_min
+
+        # parabolic interpolation on the chosen lag
+        i = first.clamp(1, tmax - 1)
+        g = torch.gather
+        y0 = g(dn, 1, (i - 1).unsqueeze(1)).squeeze(1)
+        y1 = g(dn, 1, i.unsqueeze(1)).squeeze(1)
+        y2 = g(dn, 1, (i + 1).unsqueeze(1)).squeeze(1)
+        denom = (y0 - 2 * y1 + y2)
+        shift = torch.where(denom.abs() > 1e-12, 0.5 * (y0 - y2) / denom, torch.zeros_like(denom))
+        tau = i.to(d.dtype) + shift.clamp(-1.0, 1.0)
+        f0 = (self.sr / tau.clamp_min(1e-6)).reshape(B, T)
+
+        # voicing: aperiodicity at the chosen lag. y1 IS d'(tau), so 1-y1 is periodicity.
+        conf = (1.0 - y1).clamp(0.0, 1.0).reshape(B, T)
+        voiced = ((y1 < self.yin_threshold).reshape(B, T)
+                  & (f0 >= self.fmin) & (f0 <= self.fmax))
+        return self._bin_pitch(f0, voiced, conf)
+
+    def _bin_pitch(self, f0: torch.Tensor, voiced: torch.Tensor,
+                   conf: torch.Tensor) -> torch.Tensor:
+        """(B,T) F0 → (B,T,bins) soft one-hot, Gaussian in cents. Zero where unvoiced.
+
+        With ``pitch_normalize`` the grid is cents RELATIVE to a causal running mean of
+        log-F0 instead of absolute Hz. That is the whole privacy argument for this feature:
+        a speaker's register (the mean) is one of the strongest identity cues in F0, while
+        emotion lives in the DEVIATION from it — sadness narrows and lowers the excursion,
+        anger widens it. Subtracting the mean drops the identity term and keeps the emotion
+        term. Dividing by the standard deviation as well would drop the emotion term too, so
+        it is deliberately NOT done.
+
+        The mean is causal (frames <= t, voiced only) so this stays streaming-safe, and it
+        carries the same virtual-prior count as content CMN: without one, the first voiced
+        frame IS the mean, so its deviation is identically zero for every utterance.
+        """
+        B, T = f0.shape
+        dev = self.pitch_normalize
+        if dev:
+            lf = torch.log2(f0.clamp_min(1e-6)) * 1200.0            # cents, absolute
+            m = voiced.to(lf.dtype)
+            n0, p0 = self.pitch_prior_frames, 1200.0 * torch.log2(
+                torch.tensor(self.pitch_prior_hz, dtype=lf.dtype, device=lf.device))
+            num = torch.cumsum(lf * m, dim=1) + n0 * p0
+            den = torch.cumsum(m, dim=1) + n0
+            cents = lf - num / den.clamp_min(1e-6)
+            grid = torch.linspace(-self.pitch_norm_span, self.pitch_norm_span,
+                                  self.pitch_bins, device=f0.device, dtype=lf.dtype)
+            sigma = 2.0 * self.pitch_norm_span / (self.pitch_bins - 1)
+        else:
+            cents = 1200.0 * torch.log2(f0.clamp_min(1e-6) / 32.70)
+            grid = 20.0 * torch.arange(self.pitch_bins, device=f0.device, dtype=f0.dtype)
+            sigma = 25.0
+        probs = torch.exp(-0.5 * ((grid.view(1, 1, -1) - cents.unsqueeze(-1)) / sigma) ** 2)
+        probs = probs * conf.unsqueeze(-1) * voiced.to(probs.dtype).unsqueeze(-1)
         return torch.where(probs > self.pitch_threshold, probs, torch.zeros_like(probs))
 
     # ----------------- public API -----------------
@@ -127,10 +245,10 @@ class ProsodyExtractor(nn.Module):
         audio = audio.float()
         mag = self.stft(audio).transpose(1, 2)  # (B, T_frames, F)
         loudness = self._loudness(mag)          # (B, T_frames)
-        if self.pitch_method == "crepe" and self.crepe_available:
+        if self.pitch_method == "crepe":
             pitch = self._pitch_crepe(audio)
         else:
-            pitch = self._pitch_fft(audio)
+            pitch = self._pitch_yin(audio)
 
         T = loudness.shape[1]
         if pitch.shape[1] != T:

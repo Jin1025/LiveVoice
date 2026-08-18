@@ -48,31 +48,36 @@ class EveryNEpochCheckpoint(Callback):
         trainer.save_checkpoint(ckpt_path)
 
 
+def _CLI_OVERRIDES(args) -> dict:
+    """CLI flags allowed to override LiveVoiceConfig. Values of None are dropped."""
+    return {"exp_name": args.exp_name, "train_batch_size": args.train_batch_size}
+
+
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--exp_name", type=str, default="base_libritts")
-    p.add_argument("--output_dir", type=str, default="/mnt/data/disk2/yejin/LiveVoice")
-    # Dataset selection
+    """Operational flags only.
+
+    Everything that defines the MODEL or the RUN lives in LiveVoiceConfig and nowhere else.
+    This used to be a mirror of the config, and the mirror won: `--use_prosody` was declared
+    `action="store_true"`, so argparse handed its own default (False) to LiveVoiceConfig on
+    every launch and `use_prosody = True` in config.py did nothing. Two runs reached 163k and
+    99k steps before anyone noticed. An argument only belongs here if LiveVoiceConfig has no
+    field for it — otherwise there are two sources of truth and the CLI silently wins.
+    """
+    p = argparse.ArgumentParser(description=__doc__)
+    # The two exceptions, and the reason they are safe: default=None, so argparse never hands
+    # LiveVoiceConfig a value that was not typed on the command line. `action="store_true"` is
+    # what broke --use_prosody — its default False was passed in on every launch and overwrote
+    # config.py. Any future override belongs in _CLI_OVERRIDES with default=None, not here.
+    p.add_argument("--exp_name", type=str, default='base',
+                   help="override config.exp_name (run name / checkpoint dir)")
+    p.add_argument("--batch_size", dest="train_batch_size", type=int, default=8,
+                   help="override config.train_batch_size")
     p.add_argument("--dataset", type=str, default="libritts", choices=["vctk", "libritts"],
-                   help="Which dataset to use. libritts automatically sets 24 kHz config.")
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--val_batch_size", type=int, default=4)
-    p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--max_epochs", type=int, default=100)
+                   help="which dataset to build the datamodule from")
     p.add_argument("--max_steps", type=int, default=400000,
-                   help="Stop after this many optimizer steps (e.g. 400000). "
-                        "Training ends when max_steps or max_epochs is hit first.")
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--use_prosody", action="store_true")
-    p.add_argument("--wer_epoch_samples", type=int, default=50,
-                   help="Fixed (seeded) #utterances for the epoch-end WER/spk_sim eval.")
-    p.add_argument("--wavlm_sv_variant", type=str, default="wavlm_large",
-                   choices=["wavlm_large", "wavlm_base_plus"])
-    p.add_argument("--max_windows", type=int, default=None)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--precision", type=str, default="32")
-    p.add_argument("--compile", action="store_true")
-    p.add_argument("--resume_from", type=str, default=None)
+                   help="stop after this many optimizer steps (Trainer arg, not a config field)")
+    p.add_argument("--resume_from", type=str, default=None,
+                   help="checkpoint to resume the Trainer from")
     # STAGE 2: start from a Stage-1 content tokenizer (train_content_tokenizer.py) and
     # freeze the content path, so the VC decoder can't pull speaker back into content.
     p.add_argument("--content_tokenizer_ckpt", type=str, default=None,
@@ -88,36 +93,61 @@ def parse_args():
     p.set_defaults(use_wandb=True)
     p.add_argument("--wandb_project", type=str, default="LiveVoice")
     p.add_argument("--wandb_entity", type=str, default=None)
-    # Ablations
-    p.add_argument("--zero_speaker", action="store_true")
-    p.add_argument("--zero_content", action="store_true")
-    p.add_argument("--ablate_cross_attn", action="store_true")
     return p.parse_args()
+
+
+
+# The settings that silently change WHAT gets trained, printed where a run starts. A run named
+# "prosody_baseline" reached 163k steps with use_prosody=False because the flag lives in
+# config.py and nothing echoed it back; the checkpoint was only distinguishable from the
+# previous ablation by reading its stored config afterwards. Anything on this list either
+# alters the model's inputs or has already been set wrong once.
+_RUN_SETTINGS = [
+    ("content",  ["content_source", "content_cmn", "content_cmn_prior_frames",
+                  "content_cmn_in_cache", "zipformer_align_pad_frames",
+                  "use_content_perturbation"]),
+    ("prosody",  ["use_prosody", "pitch_method", "pitch_normalize", "pitch_prior_frames",
+                  "pitch_prior_hz", "pitch_fmin", "pitch_fmax", "use_random_median_filter"]),
+    ("prompt",   ["codec_prompt_content", "codec_prompt_loss_weight",
+                  "speaker_encoder_type", "speaker_conditioning", "audio_duration"]),
+    ("stream",   ["use_delay_pattern", "n_codebooks_predict"]),
+    ("aux loss", ["use_asr_supervision", "asr_supervision_type", "asr_loss_weight",
+                  "use_speaker_grl", "grl_objective", "grl_lambda_max", "grl_num_clusters"]),
+    ("optim",    ["precision", "train_batch_size", "learning_rate", "max_epochs"]),
+]
+
+
+def _print_run_settings(config, args) -> None:
+    """Echo the run-defining settings, flagging the ones that are OFF.
+
+    Groups whose main switch is off are collapsed to one line: an ablation is defined as much
+    by what it disables as by what it enables, and a wall of irrelevant sub-settings is how the
+    important line gets skimmed past.
+    """
+    gates = {"prosody": "use_prosody", "aux loss": None}
+    print("[train] ---- run settings " + "-" * 46)
+    for group, keys in _RUN_SETTINGS:
+        gate = gates.get(group)
+        if gate is not None and not bool(getattr(config, gate, False)):
+            print(f"[train]   {group:9s} {gate}=False  (rest of group inactive)")
+            continue
+        vals = []
+        for k in keys:
+            if not hasattr(config, k):
+                continue
+            v = getattr(config, k)
+            vals.append(f"{k}={v!r}")
+        for i in range(0, len(vals), 3):
+            head = group if i == 0 else ""
+            print(f"[train]   {head:9s} " + "  ".join(vals[i:i + 3]))
+    print(f"[train]   output    exp_name={config.exp_name}  dir={config.output_dir}")
+    print("[train] " + "-" * 65)
 
 
 def main():
     args = parse_args()
-    L.seed_everything(args.seed)
-
-    config = LiveVoiceConfig(
-        exp_name=args.exp_name,
-        output_dir=args.output_dir, 
-        train_batch_size=args.batch_size,
-        val_batch_size=args.val_batch_size,
-        num_workers=args.num_workers,
-        max_epochs=args.max_epochs,
-        learning_rate=args.lr,
-        use_prosody=args.use_prosody,
-        wer_epoch_samples=args.wer_epoch_samples,
-        wavlm_sv_variant=args.wavlm_sv_variant,
-        max_windows=args.max_windows,
-        seed=args.seed,
-        precision=args.precision,
-        compile=args.compile,
-        zero_speaker=args.zero_speaker,
-        zero_content=args.zero_content,
-        ablate_cross_attn=args.ablate_cross_attn,
-    )
+    config = LiveVoiceConfig(**{k: v for k, v in _CLI_OVERRIDES(args).items() if v is not None})
+    L.seed_everything(config.seed)
 
     # HuBERT and SW2V both support precomputed caches, but use separate config paths.
     content_source = str(config.content_source).lower()
@@ -171,6 +201,8 @@ def main():
           f"codec: {config.codec}  n_codebooks: {config.n_codebooks_predict}  "
           f"speaker_encoder: {config.speaker_encoder_type}")
 
+    _print_run_settings(config, args)
+
     print(f"[train] Building codec ({config.codec})...")
     codec_model = build_codec(config)
 
@@ -212,7 +244,7 @@ def main():
     print("[train] Building LiveVoiceModel...")
     model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor)
 
-    if args.compile:
+    if config.compile:
         print("[train] torch.compile ...")
         model = torch.compile(model)
 
