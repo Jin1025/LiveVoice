@@ -1,0 +1,391 @@
+% Template for ICASSP-2026 paper; to be used with:
+%          spconf.sty  - ICASSP/ICIP LaTeX style file, and
+%          IEEEbib.bst - IEEE bibliography style file.
+% --------------------------------------------------------------------------
+\documentclass{article}
+\usepackage{spconf,amsmath,graphicx,hyperref}
+\usepackage{booktabs}
+
+% Example definitions.
+% --------------------
+\def\x{{\mathbf x}}
+\def\L{{\cal L}}
+
+% Title.
+% ------
+\title{LiveAnon: Streamable Speaker Anonymization}
+%
+% Single address.
+% ---------------
+\name{Yejin Kim, Kyungsu kim, Seungu Han, Kyogu Lee}
+\address{$^1$ Seoul National University, Seoul, Korea\\
+  $^2$ Interdisciplinary Program in Artificial Intelligence, Seoul National University\\
+  $^3$ Artificial Intelligence Institute, Seoul National University}
+%
+% For example:
+% ------------
+%\address{School\\
+%	Department\\
+%	Address}
+%
+% Two addresses (uncomment and modify for two-address case).
+% ----------------------------------------------------------
+%\twoauthors
+%  {A. Author-one, B. Author-two\sthanks{Thanks to XYZ agency for funding.}}
+%	{School A-B\\
+%	Department A-B\\
+%	Address A-B}
+%  {C. Author-three, D. Author-four\sthanks{The fourth author performed the work
+%	while at ...}}
+%	{School C-D\\
+%	Department C-D\\
+%	Address C-D}
+%
+\begin{document}
+%\ninept
+%
+\maketitle
+%
+\begin{abstract}
+Speaker anonymization aims to protect speaker identity while preserving speech utility, yet streaming scenarios introduce additional challenges in balancing privacy, utility, latency, and generation quality. We propose LiveAnon, a streaming speaker anonymization framework that enables inference-time control over the privacy--utility trade-off within a single model. LiveAnon adopts an autoregressive codec language model with ASR bottleneck features and a causal Transformer decoder. Classifier-free guidance is applied to prosody conditioning to adjust the privacy--utility balance at inference time. We further introduce a capped delay pattern that partially parallelizes RVQ codec generation, providing a configurable trade-off between streaming latency and generation quality. We evaluate LiveAnon under the VoicePrivacy Challenge 2024 and 2026 protocols in terms of speaker privacy, speech utility, and streaming performance.
+\end{abstract}
+%
+\begin{keywords}
+Streaming speaker anonymization, voice conversion, prosody modeling, neural audio codec 
+\end{keywords}
+%
+\section{Introduction}
+\label{sec:intro}
+
+Speaker anonymization (SA) aims to conceal speaker identity while retaining linguistic and paralinguistic information such as emotion \cite{tomashenko2022voiceprivacy}. 
+Since these attributes are jointly encoded in speech, suppressing speaker identity often comes at the cost of preserving other speech information, resulting in a privacy-utility trade-off \cite{zhang2023voicepm,cai2024privacy}. 
+Beyond offline processing, streaming anonymization is increasingly important for privacy-sensitive interactive applications, including call centers, voice assistants, medical conversations, and legal communications \cite{meyer2025use}. 
+Together, these considerations highlight two key challenges for streaming SA: balancing latency with quality and privacy with utility.
+
+Existing SA systems generally follow two main approaches: cascaded ASR-to-TTS \cite{meyer2023anonymizing} and voice conversion (VC)-based anonymization \cite{panariello2024speaker, yao2024npu, huang2024diffvc+}, with neural VC underlying most state-of-the-art systems \cite{miao2026voiceprivacy}. 
+Neural VC methods can be broadly divided into autoregressive (AR) and non-autoregressive (NAR) frameworks. 
+AR methods \cite{wang2024streamvoice, wang2024streamvoice+, kuzmin2026stream} support causal generation and can maintain generation quality and consistency through sequential decoding, but this increases decoding latency.
+NAR methods \cite{ning2024dualvc, ma2026meanvc} can achieve lower latency through parallel or few-step generation, but their performance can degrade when operating on short segments in streaming settings.
+Consequently, achieving low latency while retaining high generation quality remains a key challenge for streaming VC and SA.
+
+Preserving emotion is important for maintaining the utility of anonymized speech \cite{tomashenko2024voiceprivacy}.
+SA approaches have improved emotion preservation by incorporating prosodic features \cite{meyer2023prosody, franzreb2025private, he2025emotion} or distilling emotion representations \cite{yao2025easy, kuzmin2026streamvoiceanon+}.
+However, most existing approaches operate at a fixed privacy-utility point determined during training, without explicit control at inference time.
+Recent work \cite{ulgen2026diffanon} has introduced classifier-free guidance (CFG) to adjust this balance within a single model by controlling prosody preservation, but the framework is designed for offline SA.
+
+To address these limitations, we introduce LiveAnon, a streamable speaker anonymization framework with inference-time control over the privacy--utility trade-off within a single model.
+This control is achieved by applying classifier-free guidance (CFG) to prosody conditioning in an autoregressive codec language model.
+LiveAnon employs ASR bottleneck features for linguistic content and a causal Transformer decoder for neural audio codec generation.
+We introduce a capped delay pattern that partially parallelizes RVQ codec generation, providing a configurable trade-off between streaming latency and generation quality.
+We evaluate LiveAnon following the VoicePrivacy Challenge 2024 and 2026 protocols to assess privacy, utility, and streaming performance.
+
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.9\linewidth]{architecture.png}
+  \caption{Training and inference pipeline. The 3-second reference is encoded to codec tokens and placed at the front of the token sequence; the model produces the converted speech by simply continuing that sequence. Speaker and acoustic tokens share one set of codebook embeddings; each position carries 8 codebooks under the capped delay pattern. Content $\mathbf{c}$ conditions the decoder via FiLM; prosody $\mathbf{p}$ from the Causal MPM is injected via per-layer additive projection. (a)~Training: both regions are teacher-forced and scored as next-token prediction. (b)~Inference: the prompt is pre-filled into the KV cache and generation starts from the last prefilled frame.}
+  \label{fig:architecture}
+\end{figure*}
+
+%  We will release our implementation at https://github.com/....
+
+
+
+% \section{RELATED WORK}
+% \label{sec:related}
+
+% \subsection{SA in emotion}
+% \label{sec:sa}
+
+% ==================================================================
+\section{Proposed Method}
+\label{sec:method}
+
+\subsection{System Overview}
+\label{ssec:overview}
+
+Fig.~\ref{fig:architecture} illustrates the overall architecture of LiveVoice.
+The system consists of a content encoder, a neural audio codec, a causal masked prosody model (MPM), and an autoregressive voice conversion (ARVC) based on a transformer decoder.
+All components are designed for streaming operation during both training and inference.
+
+\textbf{Codec}
+We use JHCodec, a streaming neural audio codec operating at 16\,kHz with 50\,fps frame rate and 8 residual vector quantization (RVQ) codebooks of size 1024.
+
+\textbf{Content encoder}
+We extract bottleneck features (BNF) $\mathbf{c} \in \mathbb{R}^{T \times 256}$ from a frozen streaming Zipformer ASR encoder\footnote{\url{https://github.com/k2-fsa/icefall}; streaming Zipformer trained on LibriSpeech with chunk size 16 and left context 128 frames.}.
+The Zipformer adopts a U-Net-like structure with six encoder stacks.
+To match the codec frame rate, we tap the features just before the final 50$\to$25\,Hz downsampling layer, yielding 512-dimensional features at 50\,fps (120\,ms lookahead), projected to 256 dimensions.
+
+% \textbf{Causal masked prosody model}
+% We extract prosody features $\mathbf{p} \in \mathbb{R}^{T \times 256}$ from a frozen causal MPM.
+% Adapted from the bidirectional MPM, our model replaces bidirectional attention with causal (left-context-only) Conformer layers and uses causal running-mean pitch normalization to remove speaker-specific register.
+% The model is pretrained via self-supervised masked prediction on quantized frame-level pitch, energy, and voice activity features at 50\,fps.
+
+% ------------------------------------------------------------------
+\subsection{Autoregressive Voice Conversion}
+\label{ssec:arvc}
+
+The ARVC decoder generates codec tokens autoregressively, conditioned on speaker identity, content, and prosody.
+The architecture follows recent AR voice conversion approaches.
+
+\textbf{Speaker conditioning.}
+Following VALL-E, we adopt a codec prompt continuation strategy: the reference utterance $\mathbf{r}$ is encoded into discrete codec tokens using the same codebook embeddings as the AR decoder input, and concatenated as a prefix into a single autoregressive stream.
+The decoder treats the reference as audio to continue, naturally transferring the speaker's voice characteristics.
+% At inference, classifier-free guidance (CFG) amplifies the speaker conditioning signal.
+
+\textbf{Content conditioning.}
+Content features $\mathbf{c}$ are injected via Feature-wise Linear Modulation (FiLM).
+Each decoder layer $i$ has its own MLP producing scale $\gamma_i$ and shift $\beta_i$:
+\begin{equation}
+    \mathbf{x}_i = \mathbf{x}_i \cdot (1 + \gamma_i) + \beta_i, \quad \gamma_i, \beta_i = \text{MLP}_i(\mathbf{c})
+\end{equation}
+
+\textbf{AR decoder.}
+The Transformer decoder (12 layers, $d{=}768$, 8 heads) predicts 8 RVQ codebooks per frame using the capped delay pattern (Section~\ref{ssec:capped_delay}).
+ALiBi positional encoding is used, with the prompt region exempted from the distance decay to keep speaker information accessible regardless of target length.
+
+% ------------------------------------------------------------------
+\subsection{Latency--Quality Trade-off via Capped Delay Pattern}
+\label{ssec:capped_delay}
+
+MusicGen introduced the \textit{delay pattern} for autoregressive generation over multiple RVQ codebooks: codebook $k$ is delayed by $k$ steps, so at each AR step the model predicts all $K$ codebooks but each conditioned on its predecessors.
+For $K{=}8$ codebooks at 50\,fps, the full delay pattern introduces $(K{-}1) \times 20 = 140$\,ms of algorithmic latency.
+
+We propose the \textit{capped delay pattern} that limits the per-codebook delay to a configurable cap $c$:
+\begin{equation}
+    \text{delay}(k) = \min(k, \; c), \quad k = 0, \ldots, K{-}1
+\end{equation}
+Codebooks $k \leq c$ retain sequential conditioning; codebooks $k > c$ are predicted in parallel with codebook $c$.
+In RVQ, the coarse codebooks carry the bulk of content and prosody, while the fine codebooks encode low-energy residual that benefits less from sequential conditioning.
+
+Table~\ref{tab:capped_delay} illustrates the trade-off.
+$c{=}7$ recovers the full MusicGen delay pattern; $c{=}0$ is fully parallel.
+A larger $c$ yields lower WER; a smaller $c$ reduces latency.
+
+\begin{table}[h]
+\centering
+\caption{Capped delay pattern for $K{=}8$ codebooks. Delay is per-codebook offset in frames (20\,ms each).}
+\label{tab:capped_delay}
+\smallskip
+
+\begin{tabular}{@{}cccc@{}}
+\toprule
+\textbf{Cap $c$} & \textbf{Per-book delays} & \textbf{Delay} & \textbf{Total} \\
+\midrule
+7 (full) & 0 1 2 3 4 5 6 7 & 140\,ms & 220\,ms \\
+4        & 0 1 2 3 4 4 4 4 & 80\,ms  & 160\,ms \\
+3        & 0 1 2 3 3 3 3 3 & 60\,ms  & 140\,ms \\
+0 (par.) & 0 0 0 0 0 0 0 0 & 0\,ms   & 80\,ms  \\
+\bottomrule
+\end{tabular}
+
+\end{table}
+
+% ------------------------------------------------------------------
+\subsection{Causal Masked Prosody Model}
+\label{ssec:mpm}
+
+The Causal MPM learns self-supervised representations from three frame-level prosodic features at 50\,fps:
+\begin{itemize}\itemsep0pt
+    \item \textbf{Pitch}: causal YIN, speaker-normalized by causal running-mean subtraction in cents.
+    \item \textbf{Energy}: RMS of mel spectrogram frames (\texttt{center=False}).
+    \item \textbf{Voice activity}: derived from the YIN voicing confidence.
+\end{itemize}
+
+Each feature is quantized into $c = 128$ uniform bins and embedded via learned tables with an additional \texttt{[MASK]} token.
+The three embeddings are summed and processed by a 16-layer causal Conformer ($D = 256$, 4 heads), with causality enforced via left-only convolutional padding and an upper-triangular attention mask.
+
+\textbf{Training.}
+Following the random masking strategy, each batch samples a segment length $m \sim \text{Uniform}(1, 128)$ and places random contiguous segments until ${\sim}$50\% of frames are masked.
+The model predicts the original bin indices at masked positions via cross-entropy, with each feature loss normalized by $1/\log c$.
+
+\textbf{Inference.}
+The hidden state from the 8th layer (middle of 16) serves as the prosodic representation $\mathbf{p} \in \mathbb{R}^{T \times 256}$.
+
+% ------------------------------------------------------------------
+\subsection{Per-Layer Additive Prosody Conditioning}
+\label{ssec:perlayer}
+
+Content and prosody serve complementary roles: content determines \textit{what} is said (phoneme sequence, timing), while prosody determines \textit{how} it is said (intonation, emphasis, rhythm).
+We design their conditioning pathways to be architecturally distinct.
+
+While content uses FiLM (multiplicative + additive modulation), prosody from the Causal MPM is injected via \textbf{per-layer additive conditioning}:
+\begin{equation}
+    \mathbf{x}_i = \mathbf{x}_i + \mathbf{W}_i \, \mathbf{p}
+\end{equation}
+where $\mathbf{p} \in \mathbb{R}^{256}$ is the MPM hidden state and $\mathbf{W}_i \in \mathbb{R}^{d_\text{hidden} \times 256}$ is a per-layer linear projection.
+All projections are \textbf{zero-initialized} (both weights and biases), inspired by ControlNet and DiT-AdaLN-Zero.
+This ensures that (a)~at training start, the model behaves identically to a model without prosody conditioning, enabling stable integration into a pretrained or jointly trained decoder; and (b)~the prosody gradient path is fully separate from the content FiLM path, preventing the two signals from interfering.
+
+During training, the MPM encoder is frozen and CFG-style dropout is applied: with probability $p_\text{drop}$, the prosody features are zeroed out for a batch element, training the model to generate without prosody and enabling prosody guidance at inference.
+
+% ==================================================================
+\section{Experimental Setup}
+\label{sec:experiments}
+
+% ------------------------------------------------------------------
+\subsection{Datasets}
+\label{ssec:dataset}
+All models are trained on the train-clean-100 and train-clean-360 splits of LibriTTS ($\sim$460,h), resampled to 16,kHz. 
+Utterances of at least 6,s are divided into two contiguous 3,s segments, used as the speaker reference and conversion source, respectively. 
+Since LibriTTS primarily consists of read speech with limited paralinguistic and non-verbal vocalizations, we additionally use the Expresso dataset to increase the diversity of expressive speech during training. 
+Expresso is resampled to 16,kHz and accounts for 30\% of training samples. 
+For Expresso, nearby voice-activity segments separated by short gaps are merged to preserve non-verbal vocalizations and their surrounding context.
+
+\subsection{Evaluation Protocol}
+We follow the VoicePrivacy Challenge 2024 (VPC24) and 2026 (VPC26) evaluation protocols and report three metrics: equal error rate (EER\,$\uparrow$) for privacy, word error rate (WER\,$\downarrow$) for intelligibility, and unweighted average recall (UAR\,$\uparrow$) of a speech emotion recogniser for emotion preservation.
+
+Privacy is measured against two attackers of different strength.
+The \emph{lazy-informed} attacker $\mathrm{ASV}_{\mathrm{eval}}$ follows VPC24: an ECAPA-TDNN speaker verification system trained on the original, unprocessed LibriSpeech \texttt{train-clean-360}, which knows nothing about the anonymisation it is confronted with.
+The \emph{semi-informed} attacker $\mathrm{ASV}^{\mathrm{anon}}_{\mathrm{eval}}$ follows VPC26: a WavLM-ECAPA system fine-tuned on LibriSpeech \texttt{train-clean-360} after that data has itself been anonymised, so the attacker has adapted to the distribution of target voices the system produces.
+We retain $\mathrm{ASV}_{\mathrm{eval}}$ even though VPC26 drops it, because without it no comparison is possible with systems whose published numbers were obtained under VPC24 alone.
+Intelligibility is measured with $\mathrm{ASR}_{\mathrm{eval}}$, trained on LibriSpeech \texttt{train-960}, and emotion with $\mathrm{SER}_{\mathrm{eval}}$, trained on IEMOCAP.
+Apart from $\mathrm{ASV}_{\mathrm{eval}}$, which follows VPC24, every score is computed under VPC26, and all numbers are produced by the official VPC24 and VPC26 Track\,1 evaluation pipelines without modification.
+
+We compare against the challenge baselines B1, a text-to-speech synthesis system, and B2, a neural voice conversion system, together with the published SVA+ system, which uses frame-level emotion2vec distillation for emotion preservation.
+
+\subsection{Model configuration}
+\label{ssec:config}
+Speech is tokenised by JHCodec, a streaming neural audio codec running at 16\,kHz with a 320-sample hop, which gives 50 frames per second and eight residual vector quantisation codebooks of size 1024.
+Every other component operates on this same 20\,ms grid.
+
+Content features come from a frozen streaming Zipformer trained for ASR on LibriSpeech.
+The encoder is a six-stack U-Net with $(2,2,3,4,3,2)$ layers, widths $(192,256,384,512,384,256)$, $(4,4,4,8,4,4)$ attention heads and per-stack temporal downsampling factors of $(1,2,4,8,4,2)$ relative to its internal 50\,Hz rate; attention is chunked, with a chunk of 16 frames and a left context of 128 frames (2.56\,s).
+We tap the representation immediately before the final $50 \rightarrow 25$\,Hz downsampling layer, which yields 512-dimensional features at 50\,fps, and project them to 256 dimensions.
+Because the encoder is causal, its long left context pulls the centre of mass of each output frame behind the codec frame of the same index; we therefore advance the feature stream by six frames, which we measure to be the point at which content best predicts the codec latent, at the cost of 120\,ms of lookahead.
+
+Prosody comes from the frozen Causal MPM of Section~\ref{ssec:mpm}: 16 causal Conformer layers of width 256 with four heads and a depthwise kernel of 7 (21.2\,M parameters), reading pitch, energy and voice activity quantised into 128 bins each from a 1024-point analysis window on the same 320-sample hop.
+The window is positioned so that it \emph{ends} at the boundary of the codec frame it describes rather than starting there, so the prosody branch reads no future sample and contributes no lookahead.
+The representation is taken from the eighth of the 16 layers.
+
+The autoregressive decoder has 12 Transformer layers, hidden dimension 768, eight attention heads and a feed-forward width of 3072, with dropout 0.1.
+It predicts all eight codebooks per step under the capped delay pattern with $c = 3$, and uses ALiBi positional encoding with the codec-prompt region exempted from the distance decay so that speaker information stays accessible regardless of target length.
+Training uses a batch size of 16 and a learning rate of $10^{-4}$, with classifier-free guidance dropout applied independently to the speaker prompt (0.1), the content stream (0.1) and the prosody stream (0.2), together with a joint drop of both conditioning streams (0.1).
+
+These choices fix the algorithmic latency of the system.
+The content encoder must buffer a complete 16-frame chunk before it can emit any frame of that chunk, which costs 320\,ms, and its six-frame alignment advance adds a further 120\,ms; the prosody branch adds nothing; and the capped delay pattern with $c = 3$ contributes 60\,ms, for 500\,ms in total before any per-chunk computation is counted.
+The 320\,ms chunk is a structural rather than an incidental floor.
+The encoder's deepest stack is downsampled eightfold, so it receives only two frames per chunk at a chunk of 16 and a single frame at a chunk of 8, at which point its intra-chunk attention degenerates; chunk sizes that are not multiples of eight are not expressible at all.
+Measured on LibriTTS \texttt{dev-clean}, halving the chunk to 8 frames raises the content encoder's own word error rate from 3.49\% to 5.07\%, which is why we retain the 16-frame setting.
+
+% ------------------------------------------------------------------
+\section{Results}
+\label{ssec:anon_results}
+
+\subsection{Model Comparison}
+\label{ssec:modelcomp}
+
+\begin{table}[t]
+\centering
+\caption{VoicePrivacy 2024 evaluation. EER is the average of female and male aa trials. Higher EER = stronger privacy.}
+\label{tab:vpc24}
+\smallskip
+{\footnotesize
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Method} & \textbf{Mode} & \textbf{WER}\,$\downarrow$ & \textbf{UAR}\,$\uparrow$ & \textbf{EER-L}\,$\uparrow$ & \textbf{EER-S}\,$\uparrow$\\
+\midrule
+Original & Offline & 1.83 & 70.07 & 5.16 & - \\
+\midrule
+EASY & Offline & 2.70 & 63.81 & - & 45.89 \\
+\midrule
+
+TVTSyn & \shortstack{Online,\\80\,ms} & 5.35 & 37.32 & 47.55 & 14.57 \\
+SVA (vctk-1fix) & \shortstack{Online,\\180\,ms} & 4.54 & 39.72 & 47.19 & 15.92 \\
+SVA+ (frame-distill) & \shortstack{Online,\\180\,ms} & 5.77 & 49.22 & 48.98 & 18.30\\
+\midrule
+LiveVoice & \shortstack{Online,\\180\,ms} & \textbf{3.99} & 42.20 & \textbf{48.99} & - \\
+\quad + causal MPM & \shortstack{Online,\\180\,ms} & \textbf{3.33} & \textbf{33.33} & \textbf{33/33} & -\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Table~\ref{tab:vpc24} presents the VPC24 evaluation results.
+LiveVoice achieves the lowest WER (3.99) among all compared systems while maintaining the highest EER (48.99), demonstrating that the Zipformer BNF content representation and codec LM architecture effectively preserve intelligibility without compromising privacy.
+The low WER reflects the quality of the frozen Zipformer BNF, which is trained for ASR and thus inherently retains phonetic content while suppressing speaker-specific variation.
+
+Compared to SVA+, which uses frame-level emotion2vec distillation to achieve high UAR (49.22), LiveVoice achieves substantially better WER (3.99 vs.\ 5.77) and comparable EER.
+SVA+'s emotion distillation from a pretrained emotion model risks leaking speaker information encoded in the emotion representations; our approach avoids this by using speaker-normalized prosodic features as input to the Causal MPM.
+
+% TODO: Fill in MPM results when available. Expected: UAR improvement
+% with minimal EER degradation due to speaker-normalized MPM inputs.
+
+% ------------------------------------------------------------------
+\subsection{causal MPM Evaluation}
+\label{ssec:mpm_eval}
+
+\begin{table}[t]
+\centering
+\caption{MPM representation quality: RAVDESS emotion classification probe with 5-fold speaker-stratified CV.}
+\label{tab:mpm}
+\smallskip
+\begin{tabular}{@{}lcc@{}}
+\toprule
+% \multicolumn{3}{@{}l}{\textit{Intrinsic (masked reconstruction, chance = 0.8\%)}} \\
+% \midrule
+% & Accuracy & \\
+% \cmidrule(r){2-2}
+% Pitch & 41.7\% & \\
+% Energy & 69.4\% & \\
+% VAD & 75.8\% & \\
+% \midrule
+% \multicolumn{3}{@{}l}{\textit{RAVDESS emotion classification}} \\
+% \midrule
+\textbf{Input Feature} & \textbf{WA} & \textbf{UA} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Linear probe}} \\
+\quad Raw pitch, energy, VAD & 0.116 & 0.123 \\
+\quad MPM & 0.240 & 0.230 \\
+\quad causal MPM  & \textbf{0.297} & \textbf{0.283} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Conformer probe}} \\
+\quad Raw pitch, energy, VAD & 0.398 & 0.391 \\
+\quad MPM & 0.370 & 0.360 \\
+\quad causal MPM & \textbf{0.430} & \textbf{0.416} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We evaluate the causal MPM on the RAVDESS dataset (1,440 utterances, 24 speakers, 8 emotions) using 5-fold speaker-stratified cross-validation.
+Following the original protocol, we extract MPM hidden states from the 8th Conformer layer, aggregate to utterance level via mean+max pooling, and train a linear or 2-layer Conformer probe.
+
+As shown in Table~\ref{tab:mpm}, the causal MPM representations substantially outperform raw prosodic features on emotion classification with the linear probe (WA 0.297 vs.\ 0.116, a 2.6$\times$ improvement), confirming that self-supervised learning captures emotion-relevant prosodic structure.
+Notably, our causal model exceeds the bidirectional MPM (WA 0.297 vs.\ 0.240 linear; 0.430 vs.\ 0.370 conformer), suggesting that prosodic contours are largely predictable from left context---a favorable property for streaming applications.
+We attribute this to the longer training data ($\sim$500\,h LibriTTS vs.\ the original's corpus) and the causal constraint acting as a regularizer.
+
+The gap between MPM and raw features is largest with the linear probe, indicating that the MPM representations make prosodic structure \textit{linearly accessible}---critical for efficient downstream conditioning where the projection is a simple linear layer.
+
+\subsection{Real-time Performance}
+\label{ssec:rtf and latency}
+
+% ==================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented LiveVoice, a fully causal streaming speaker anonymization system that preserves emotional prosody through a Causal Masked Prosody Model.
+The system uses Zipformer BNF for content representation, VALL-E-style codec prompt continuation for speaker conditioning, and a capped delay pattern for explicit latency--quality control.
+The Causal MPM provides speaker-independent prosodic representations injected via per-layer zero-initialized additive conditioning, with a gradient path fully separate from content FiLM.
+Experiments on the VoicePrivacy 2024 protocol demonstrate competitive privacy with the lowest word error rate among compared systems.
+The Causal MPM achieves emotion probing performance exceeding the original bidirectional model, confirming that causal attention suffices for capturing prosodic structure relevant to emotion.
+
+
+
+
+
+% To start a new column (but not a new page) and help balance the last-page
+% column length use \vfill\pagebreak.
+% -------------------------------------------------------------------------
+%\vfill
+%\pagebreak
+
+
+
+
+% References should be produced using the bibtex program from suitable
+% BiBTeX files (here: strings, refs, manuals). The IEEEbib.bst bibliography
+% style file from IEEE produces unsorted bibliography list.
+% -------------------------------------------------------------------------
+\bibliographystyle{IEEEbib}
+\bibliography{strings,refs}
+
+\end{document}

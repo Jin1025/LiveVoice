@@ -105,13 +105,33 @@ class LibriTTSDataModule(L.LightningDataModule):
             self.val_dataset = LibriTTSDataset(self.config, split="val")
 
     def train_dataloader(self):
-        # Length-weighted sampling for LibriTTS — utterances vary 1-15s, plain
-        # uniform sampling under-represents long ones. This reaches every 4-s
-        # window at a roughly equal rate over enough epochs.
         item_paths = [it[0] for it in self.train_dataset.items]
         splits_tag = ",".join(self.config.libritts_train_splits)
         cache_path = Path(self.config.output_dir) / "duration_cache" / f"libritts_train_{splits_tag}.json"
-        sampler = _make_length_weighted_sampler(self.train_dataset, item_paths, cache_path)
+        durations = _build_duration_weights(item_paths, cache_path)
+
+        # When Expresso is mixed in, re-weight so Expresso items are sampled at
+        # expresso_weight fraction of all draws (e.g. 0.3 → 30% Expresso batches).
+        expresso_spks = self.train_dataset._expresso_spk_set
+        if expresso_spks:
+            ew = float(getattr(self.config, "expresso_weight", 0.3))
+            n_exp = sum(1 for _, _, spk in self.train_dataset.items if spk in expresso_spks)
+            n_lib = len(self.train_dataset.items) - n_exp
+            if n_exp > 0 and n_lib > 0:
+                # scale = (ew / n_exp) / ((1-ew) / n_lib)
+                scale = (ew * n_lib) / ((1.0 - ew) * n_exp)
+                weights = [
+                    d * (scale if spk in expresso_spks else 1.0)
+                    for d, (_, _, spk) in zip(durations, self.train_dataset.items)
+                ]
+                print(f"[LibriTTSDataModule] expresso sampling: {n_exp} items scaled {scale:.2f}x "
+                      f"(target {ew:.0%} of draws)")
+            else:
+                weights = durations
+        else:
+            weights = durations
+
+        sampler = WeightedRandomSampler(weights, num_samples=len(self.train_dataset), replacement=True)
         return DataLoader(
             self.train_dataset,
             batch_size=self.config.train_batch_size,

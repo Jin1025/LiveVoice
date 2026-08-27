@@ -136,7 +136,7 @@ def _log_audio_batch(logger, tag: str, wav_batch: torch.Tensor, sample_rate: int
         pass
 
 
-def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
+def _load_full_mono_wav(path: str, target_sr: int, peak_normalize: bool = True) -> torch.Tensor:
     """Load entire wav, resample to target_sr, peak-normalize (no window crop)."""
     import torchaudio
 
@@ -151,7 +151,7 @@ def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
         sr = int(sr)
     if sr != target_sr:
         audio = torchaudio.functional.resample(audio, sr, target_sr)
-    return audio / (audio.abs().max() + 1e-8)
+    return audio / (audio.abs().max() + 1e-8) if peak_normalize else audio
 
 
 def _read_libritts_normalized_text(wav_path: str) -> str | None:
@@ -298,7 +298,7 @@ class LiveVoiceLightningModule(L.LightningModule):
     """Train LiveVoiceModel: speaker cross-attn + HuBERT content conditioning."""
 
     # Lazy-loaded eval-only modules (WER Whisper, val spk-sim ECAPA) must not be in ckpt.
-    _CKPT_EXCLUDE_PREFIXES = ("_whisper_model.", "_spk_encoder.")
+    _CKPT_EXCLUDE_PREFIXES = ("_whisper_model.", "_spk_encoder.", "_ser_classifiers.")
 
     @classmethod
     def _strip_eval_only_modules_from_state_dict(cls, state_dict: dict) -> dict:
@@ -340,6 +340,9 @@ class LiveVoiceLightningModule(L.LightningModule):
         self._whisper_loaded = False
         self._spk_encoder = None
         self._spk_encoder_loaded = False
+        self._ser_classifiers: dict[str, object] = {}
+        self._ser_loaded = False
+        self._uar_items: list | None = None
 
         # Announce the configured val spk_sim encoder at construction so it is visible
         # immediately at startup (the actual load stays lazy — first on_train_epoch_end —
@@ -832,7 +835,7 @@ class LiveVoiceLightningModule(L.LightningModule):
 
         def _score(ctn: torch.Tensor, ref_path: str, ref_txt: str):
             """Generate with ref_path as the speaker reference; return (wer, gen, ref)."""
-            ref = _load_full_mono_wav(ref_path, target_sr).unsqueeze(0).to(device)
+            ref = _load_full_mono_wav(ref_path, target_sr, bool(getattr(self.config, "audio_peak_normalize", True))).unsqueeze(0).to(device)
             # Codec speaker encoder emits one prefix token per reference frame (~50 fps),
             # so a full-length reference bloats the sequence (and is off-distribution:
             # training used audio_duration windows). Trim it to the training window.
@@ -864,7 +867,7 @@ class LiveVoiceLightningModule(L.LightningModule):
                 ref_txt = _read_libritts_normalized_text(wav_path)
                 if not ref_txt:
                     continue
-                ctn = _load_full_mono_wav(wav_path, target_sr).unsqueeze(0).to(device)
+                ctn = _load_full_mono_wav(wav_path, target_sr, bool(getattr(self.config, "audio_peak_normalize", True))).unsqueeze(0).to(device)
                 # The model's context is max_seq_len tokens; total generation length =
                 # ref_prefix + ceil(content/hop) + (K-1) must fit. Content longer than
                 # val_max_content_sec (default 15s → ~750 tokens) can't be generated, so
@@ -947,6 +950,231 @@ class LiveVoiceLightningModule(L.LightningModule):
         _log("val/wer_cross", wers_cross)
         _log("val/spk_sim_cross", spk_sims_cross, prog_bar=True)       # → target (HIGH)
         _log("val/spk_sim_cross_src", spk_sims_cross_src)              # → source (LOW)
+
+        self._eval_uar()
+
+    # ── SER / UAR evaluation on IEMOCAP ─────────────────────────────────
+
+    def _get_ser_classifiers(self) -> dict[str, object]:
+        if self._ser_loaded:
+            return self._ser_classifiers
+        self._ser_loaded = True
+        import warnings
+        try:
+            from speechbrain.pretrained.interfaces import foreign_class
+        except ImportError:
+            print("[UAR] speechbrain not available, skipping SER eval")
+            return self._ser_classifiers
+        model_dir = Path(str(getattr(self.config, "uar_ser_model_dir", "")))
+        if not model_dir.exists():
+            print(f"[UAR] SER model dir not found: {model_dir}")
+            return self._ser_classifiers
+        device = str(getattr(self.config, "wer_device", "cpu"))
+        # SpeechBrain 1.1+ renamed HuggingFaceWav2Vec2 → Wav2Vec2; shim old path
+        import sys
+        if "speechbrain.lobes.models.huggingface_wav2vec" not in sys.modules:
+            import types
+            try:
+                from speechbrain.integrations.huggingface.wav2vec2 import Wav2Vec2
+                shim = types.ModuleType("speechbrain.lobes.models.huggingface_wav2vec")
+                shim.HuggingFaceWav2Vec2 = Wav2Vec2
+                sys.modules["speechbrain.lobes.models.huggingface_wav2vec"] = shim
+                import speechbrain.lobes.models as _parent
+                _parent.huggingface_wav2vec = shim
+            except (ImportError, ModuleNotFoundError):
+                pass
+        for fold_dir in sorted(model_dir.glob("fold_*")):
+            fold = fold_dir.name.split("_")[-1]
+            ckpt_dir = fold_dir / "CKPT+1"
+            if not ckpt_dir.exists():
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                clf = foreign_class(
+                    source=str(ckpt_dir), savedir=str(ckpt_dir),
+                    run_opts={"device": device},
+                    classname="CustomEncoderWav2vec2Classifier",
+                    pymodule_file="custom_interface.py",
+                )
+            clf.hparams.label_encoder.ignore_len()
+            self._ser_classifiers[fold] = clf
+        print(f"[UAR] loaded {len(self._ser_classifiers)} SER fold classifiers")
+        return self._ser_classifiers
+
+    def _build_uar_items(self) -> list[dict]:
+        """Fixed set of IEMOCAP items for UAR eval, stratified by emotion."""
+        if self._uar_items is not None:
+            return self._uar_items
+        vpc_root = Path(str(getattr(self.config, "uar_vpc_root", "")))
+        dataset = str(getattr(self.config, "uar_dataset", "IEMOCAP_dev"))
+        data_dir = vpc_root / "data" / dataset
+        if not data_dir.exists():
+            print(f"[UAR] IEMOCAP data dir not found: {data_dir}")
+            self._uar_items = []
+            return self._uar_items
+
+        utt2emo, utt2wav, utt2spk, spk2fold = {}, {}, {}, {}
+        with open(data_dir / "utt2emo") as f:
+            for line in f:
+                u, e = line.strip().split()
+                utt2emo[u] = e
+        with open(data_dir / "wav.scp") as f:
+            for line in f:
+                u, w = line.strip().split(None, 1)
+                utt2wav[u] = str(vpc_root / w)
+        with open(data_dir / "utt2spk") as f:
+            for line in f:
+                u, s = line.strip().split()
+                utt2spk[u] = s
+        with open(data_dir / "spk2fold") as f:
+            for line in f:
+                s, fo = line.strip().split()
+                spk2fold[s] = fo
+
+        # Stratified sample: fixed per emotion
+        n_per = int(getattr(self.config, "uar_samples_per_emotion", 8))
+        seed = int(getattr(self.config, "uar_seed", 54321))
+        rng = random.Random(seed)
+        emo_groups: dict[str, list[str]] = {}
+        for u, e in utt2emo.items():
+            if u in utt2wav and u in utt2spk:
+                emo_groups.setdefault(e, []).append(u)
+
+        # Cross-speaker reference pool, keyed by speaker. The eval must ANONYMIZE, not
+        # reconstruct: prompting with the source utterance itself measures how well the
+        # model copies a voice it was handed, which is a different (and easier) task than
+        # the one VPC scores. Neutral references are preferred where available, following
+        # the protocol note that "a neutral utterance from the target anonymous speaker
+        # conceals source identity" -- an emotional prompt would inject its own prosody
+        # into the output and contaminate the emotion being measured.
+        by_spk: dict[str, list[str]] = {}
+        for u in sorted(utt2wav):
+            if u in utt2spk:
+                by_spk.setdefault(utt2spk[u], []).append(u)
+        neutral = {u for u, e in utt2emo.items() if e == "neu"}
+
+        items = []
+        for emo in sorted(emo_groups):
+            pool = sorted(emo_groups[emo])
+            rng.shuffle(pool)
+            for i, u in enumerate(pool[:n_per]):
+                spk = utt2spk[u]
+                others = [s for s in sorted(by_spk) if s != spk]
+                if not others:
+                    print(f"[UAR] no cross-speaker reference for {u} (spk={spk}) — skipping")
+                    continue
+                # Seeded per item, exactly like the cross-speaker WER path, so every epoch
+                # converts each source to the SAME pseudo-speaker and the trend is readable.
+                # hashlib, not hash(): Python randomises str hashing per process, which
+                # would hand the same utterance a different pseudo-speaker after a resume.
+                h = int.from_bytes(hashlib.md5(u.encode()).digest()[:4], "big")
+                r = random.Random(seed * 1_000_003 + h)
+                ref_spk = r.choice(others)
+                cands = [c for c in by_spk[ref_spk] if c in neutral] or by_spk[ref_spk]
+                items.append({
+                    "utt_id": u, "wav_path": utt2wav[u],
+                    "emotion": emo, "fold": spk2fold.get(spk, "1"),
+                    "speaker": spk,
+                    "ref_path": utt2wav[r.choice(cands)], "ref_speaker": ref_spk,
+                })
+        self._uar_items = items
+        n_neu = sum(1 for it in items if it["ref_path"] in {utt2wav[u] for u in neutral})
+        print(f"[UAR] {len(items)} IEMOCAP items ({n_per}/emotion × {len(emo_groups)} emotions), "
+              f"cross-speaker refs from {len(by_spk)} speakers ({n_neu} neutral)")
+        return self._uar_items
+
+    @torch.no_grad()
+    def _eval_uar(self):
+        if not bool(getattr(self.config, "log_val_uar", False)):
+            return
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+        import torchaudio
+
+        classifiers = self._get_ser_classifiers()
+        if not classifiers:
+            return
+        items = self._build_uar_items()
+        if not items:
+            return
+
+        target_sr = int(self.config.sample_rate)
+        device = next(self.model.parameters()).device
+
+        was_training = self.model.training
+        self.model.eval()
+
+        refs, preds = [], []
+        try:
+            for it in items:
+                wav_path, emo, fold = it["wav_path"], it["emotion"], it["fold"]
+                clf = classifiers.get(fold)
+                if clf is None:
+                    continue
+                ctn = _load_full_mono_wav(
+                    wav_path, target_sr,
+                    bool(getattr(self.config, "audio_peak_normalize", True)),
+                ).unsqueeze(0).to(device)
+
+                content_max_sec = float(getattr(self.config, "val_max_content_sec", 15.0))
+                if ctn.shape[-1] > int(content_max_sec * target_sr):
+                    continue
+
+                # Cross-speaker (anonymizing) reference, fixed per item across epochs.
+                ref = _load_full_mono_wav(
+                    it["ref_path"], target_sr,
+                    bool(getattr(self.config, "audio_peak_normalize", True)),
+                ).unsqueeze(0).to(device)
+                # A codec prompt emits one token per reference frame, so a full-length
+                # reference bloats the AR sequence and is off-distribution (training used
+                # audio_duration windows). ECAPA pools to a fixed length and keeps it all.
+                if str(getattr(self.config, "speaker_encoder_type", "codec")).lower() not in (
+                        "speechbrain_ecapa", "spark_global"):
+                    ref_max = int(float(getattr(self.config, "audio_duration", 4.0)) * target_sr)
+                    if ref.shape[-1] > ref_max:
+                        ref = ref[..., :ref_max]
+                codes = self.model.generate(
+                    reference_audio=ref, content_audio=ctn,
+                    temperature=0.0, top_p=None, top_k=None,
+                    cfg_scale=float(getattr(self.config, "val_cfg_scale", 1.0)),
+                )
+                gen = self.model.decode_to_audio(codes).detach().float().cpu()
+
+                _, _, _, text_lab = clf.classify_batch(gen)
+                pred_emo = text_lab[0]
+                preds.append(pred_emo)
+                refs.append(emo)
+        finally:
+            if was_training:
+                self.model.train()
+
+        if len(refs) < 4:
+            print(f"[UAR] too few predictions ({len(refs)}), skipping")
+            return
+
+        from sklearn.metrics import recall_score
+        emo_list = sorted(set(refs))
+        emo2idx = {e: i for i, e in enumerate(emo_list)}
+        y_true = [emo2idx[e] for e in refs]
+        y_pred = [emo2idx.get(e, 0) for e in preds]
+
+        uar = recall_score(y_true, y_pred, average="macro", labels=list(range(len(emo_list)))) * 100
+        per_class = recall_score(y_true, y_pred, average=None, labels=list(range(len(emo_list)))) * 100
+
+        try:
+            step = int(getattr(self.trainer, "global_step", self.global_step))
+            exp = getattr(self.logger, "experiment", None)
+            self.log("val/uar", uar, on_epoch=True, sync_dist=True, prog_bar=True)
+            if exp is not None and hasattr(exp, "log"):
+                exp.log({"val/uar": uar}, step=step)
+            for emo, recall in zip(emo_list, per_class):
+                key = f"val/uar_{emo}"
+                self.log(key, float(recall), on_epoch=True, sync_dist=True)
+                if exp is not None and hasattr(exp, "log"):
+                    exp.log({key: float(recall)}, step=step)
+        except Exception:
+            pass
+        print(f"[UAR] {uar:.1f}%  " + "  ".join(f"{e}={r:.1f}" for e, r in zip(emo_list, per_class)))
 
     @torch.no_grad()
     def _log_vc_sample(

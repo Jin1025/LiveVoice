@@ -53,7 +53,7 @@ SR = 16000
 HOP = 320          # jhcodec: 50 fps at 16 kHz
 
 
-def load_mono(path: str, target_sr: int) -> torch.Tensor:
+def load_mono(path: str, target_sr: int, peak_normalize: bool = False) -> torch.Tensor:
     import soundfile as sf
     y, sr = sf.read(path, dtype="float32", always_2d=True)
     a = torch.from_numpy(y).float().mean(dim=1)
@@ -62,9 +62,10 @@ def load_mono(path: str, target_sr: int) -> torch.Tensor:
         a = torch.from_numpy(
             librosa.resample(a.numpy(), orig_sr=sr, target_sr=target_sr).astype("float32")
         )
-    peak = a.abs().max()
-    if peak > 1e-8:
-        a = a / peak           # peak-normalise, matching extract_sw2v_features.py
+    if peak_normalize:
+        peak = a.abs().max()
+        if peak > 1e-8:
+            a = a / peak
     return a
 
 

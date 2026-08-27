@@ -8,6 +8,8 @@ Mirrors sonic's SketchTransformer / SketchModel but rewired for speech:
 """
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +31,35 @@ try:
 except Exception:  # pragma: no cover
     def tqdm(iterable, **kwargs):
         return iterable
+
+
+class MPMInputProjection(nn.Module):
+    """DiffAnon-style prosody projection: MPM latent -> one additive term at the decoder
+    input (arXiv:2604.26281 projects c_pro through a conv module and adds it to the latent).
+
+    Normalisation is NOT here — it is the shared mpm_norm flag, so that both conditioning
+    shapes can be run with and without it.
+
+    Convs are left-padded, so frame t never sees t+1 and streaming latency is unchanged.
+    """
+
+    def __init__(self, mpm_dim: int, hidden_dim: int, kernel_size: int = 5):
+        super().__init__()
+        self.pad = kernel_size - 1
+        self.conv1 = nn.Conv1d(mpm_dim, hidden_dim, kernel_size)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size)
+        # Zero-init the last conv so the model starts identical to one without prosody and
+        # opens the path only if the objective pays for it.
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, mpm_feats: torch.Tensor) -> torch.Tensor:
+        """(B, T, mpm_dim) -> (B, T, hidden_dim)."""
+        x = mpm_feats.transpose(1, 2)                     # (B, C, T) for conv1d
+        x = self.act(self.conv1(F.pad(x, (self.pad, 0))))
+        x = self.conv2(F.pad(x, (self.pad, 0)))
+        return x.transpose(1, 2)
 
 
 # =====================================================================
@@ -81,6 +112,38 @@ class LiveVoiceTransformer(nn.Module):
                 nn.init.zeros_(mlp[-1].weight)
                 nn.init.zeros_(mlp[-1].bias)
 
+        # Prosody conditioning from MPM hidden states. Two shapes, see mpm_conditioning:
+        #   perlayer   — a zero-init Linear per decoder layer, added after every layer, on a
+        #                gradient path separate from the content FiLM.
+        #   input_conv — DiffAnon: one causal-conv projection added at the decoder input.
+        _use_mpm = bool(getattr(config, "use_mpm", False))
+        _mode = str(getattr(config, "mpm_conditioning", "perlayer")).lower()
+        if _use_mpm and _mode not in ("perlayer", "input_conv"):
+            raise ValueError(f"unknown mpm_conditioning {_mode!r}; expected "
+                             f"'perlayer' or 'input_conv'")
+        self.use_mpm_perlayer = _use_mpm and _mode == "perlayer"
+        self.use_mpm_input = _use_mpm and _mode == "input_conv"
+        mpm_dim = int(getattr(config, "mpm_perlayer_dim", 256))
+        # Shared by both shapes: CausalMPM.extract() taps layer 8 and returns it
+        # unnormalised (rms~10), which is why the projections only have to grow a little
+        # before they swamp the hidden state they are added to.
+        self.mpm_norm = (nn.LayerNorm(mpm_dim)
+                         if _use_mpm and bool(getattr(config, "mpm_norm", False))
+                         else None)
+        if self.use_mpm_perlayer:
+            self.mpm_layer_projs = nn.ModuleList([
+                nn.Linear(mpm_dim, config.hidden_dim)
+                for _ in range(config.num_decoder_layers)
+            ])
+            for proj in self.mpm_layer_projs:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+        elif self.use_mpm_input:
+            self.mpm_input_proj = MPMInputProjection(
+                mpm_dim, config.hidden_dim,
+                int(getattr(config, "mpm_input_conv_kernel", 5)),
+            )
+
     def encode_speaker(self, speaker_embedding: torch.Tensor) -> torch.Tensor:
         x = speaker_embedding
         for layer in self.encoder_layers:
@@ -94,13 +157,11 @@ class LiveVoiceTransformer(nn.Module):
         film_feats: torch.Tensor | None,
         encoder_output: torch.Tensor | None,
         use_cache: bool = False,
+        mpm_feats: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.use_film:
-            if film_feats is None:
-                raise RuntimeError("content_conditioning='film' requires film_feats.")
-            x = decoder_input
-        else:
-            x = decoder_input + content_add
+        if self.use_film and film_feats is None:
+            raise RuntimeError("content_conditioning='film' requires film_feats.")
+        x = decoder_input + content_add
         for i, layer in enumerate(self.decoder_layers):
             x = layer(x, mem=encoder_output, use_cache=use_cache)
             if self.use_film:
@@ -108,6 +169,8 @@ class LiveVoiceTransformer(nn.Module):
                 gamma = 1.0 + gb[..., : self.hidden_dim]
                 beta = gb[..., self.hidden_dim :]
                 x = x * gamma + beta
+            if self.use_mpm_perlayer and mpm_feats is not None:
+                x = x + self.mpm_layer_projs[i](mpm_feats)
         return self.decoder_norm(x)
 
     def decode_step_stateless(
@@ -118,13 +181,11 @@ class LiveVoiceTransformer(nn.Module):
         encoder_output: torch.Tensor | None,
         caches: list,
         use_cache: bool = False,
+        mpm_feats: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list]:
-        if self.use_film:
-            if film_feats is None:
-                raise RuntimeError("content_conditioning='film' requires film_feats.")
-            x = decoder_input
-        else:
-            x = decoder_input + content_add
+        if self.use_film and film_feats is None:
+            raise RuntimeError("content_conditioning='film' requires film_feats.")
+        x = decoder_input + content_add
         new_caches = []
         for i, layer in enumerate(self.decoder_layers):
             kv_in = caches[i] if caches is not None else {"self": None, "cross": None}
@@ -134,6 +195,8 @@ class LiveVoiceTransformer(nn.Module):
                 gamma = 1.0 + gb[..., : self.hidden_dim]
                 beta = gb[..., self.hidden_dim :]
                 x = x * gamma + beta
+            if self.use_mpm_perlayer and mpm_feats is not None:
+                x = x + self.mpm_layer_projs[i](mpm_feats)
             new_caches.append(kv_out)
         return self.decoder_norm(x), new_caches
 
@@ -144,12 +207,14 @@ class LiveVoiceTransformer(nn.Module):
         film_feats: torch.Tensor | None,
         prev_embeddings: torch.Tensor,
         use_cache: bool = False,
+        mpm_feats: torch.Tensor | None = None,
     ) -> dict:
         encoder_output = self.encode_speaker(speaker_embedding)
         if prev_embeddings is None:
             raise ValueError("prev_embeddings is required (training) — use generate() for inference.")
         decoder_output = self.decode_step(
             prev_embeddings, content_add, film_feats, encoder_output, use_cache,
+            mpm_feats=mpm_feats,
         )
         return {"decoder_output": decoder_output, "encoder_output": encoder_output}
 
@@ -204,13 +269,20 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
       - transformer:      LiveVoiceTransformer
     """
 
-    def __init__(self, config, codec_model, content_extractor, prosody_extractor=None):
+    def __init__(self, config, codec_model, content_extractor, prosody_extractor=None,
+                 cepstral_extractor=None, mpm_extractor=None):
         super().__init__()
         self.config = config
         self.codec_model = codec_model
         self.content_extractor = content_extractor
         self.prosody_extractor = prosody_extractor
+        self.cepstral_extractor = cepstral_extractor
+        self.mpm_extractor = mpm_extractor
+        self.use_cepstral = bool(getattr(config, "use_cepstral", False)) and (cepstral_extractor is not None)
         self.use_prosody = bool(getattr(config, "use_prosody", False)) and (prosody_extractor is not None)
+        self.use_mpm = bool(getattr(config, "use_mpm", False)) and (mpm_extractor is not None)
+        if self.use_mpm:
+            config.mpm_perlayer_dim = mpm_extractor.output_dim
 
         self.transformer = LiveVoiceTransformer(config)
 
@@ -376,6 +448,8 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             build_content_path(self, config, sw2v_dim, log_prefix="[LiveVoiceModel]")
 
     # --------------------- helpers ---------------------
+    _warned_short_align = False
+
     def align_to_tokens(self, feats: torch.Tensor, num_tokens: int, causal: bool = True) -> torch.Tensor:
         """Align (B, T_src, D) features to `num_tokens` decoder positions.
 
@@ -385,6 +459,20 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         if T_src == num_tokens:
             return feats
         if T_src < num_tokens:
+            # A SMALL shortfall means an extractor's analysis window ran off the end of the
+            # audio, not a genuine frame-rate difference. Stretching it here silently warps
+            # the timeline and makes the feature lag more and more towards the end of the
+            # utterance (the CausalMPM path used to lose up to 3 frames / 60 ms this way).
+            # Extractors on the codec grid must emit exactly num_tokens frames instead.
+            if num_tokens - T_src <= 8 and not LiveVoiceModel._warned_short_align:
+                LiveVoiceModel._warned_short_align = True
+                warnings.warn(
+                    f"align_to_tokens: extractor emitted {T_src} frames for {num_tokens} "
+                    f"decoder positions ({num_tokens - T_src} short). This is being "
+                    f"linspace-stretched, which drifts the alignment. Pad the extractor to "
+                    f"the codec grid instead (see CausalFeatureExtractor._causal_pad).",
+                    RuntimeWarning, stacklevel=2,
+                )
             idx = torch.linspace(0, T_src - 1, num_tokens, device=feats.device).long()
             return feats[:, idx, :]
         if causal:
@@ -936,6 +1024,43 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 prosody_add[drop_pro_all] = null[drop_pro_all]
             content_add = content_add + prosody_add
 
+        # 4b. cepstral (additive, same slot as prosody)
+        if self.use_cepstral:
+            ca = prosody_audio if prosody_audio is not None else content_audio
+            cep_raw = self.cepstral_extractor(ca)
+            cep_add = self._align_content_delay(cep_raw, T, use_delay, self.null_content_embedding)
+            drop_cep_all = drop_pro | drop_both
+            if drop_cep_all.any():
+                cep_add = cep_add.clone()
+                nullc = self.null_content_embedding.expand(B, T_seq, -1).to(dtype=cep_add.dtype)
+                cep_add[drop_cep_all] = nullc[drop_cep_all]
+            content_add = content_add + cep_add
+
+        # 4c. MPM (causal masked prosody model). "perlayer" keeps mpm_feats and lets
+        # decode_step add it after every layer; "input_conv" folds it into content_add here,
+        # which is the same injection point DiffAnon uses, and leaves decode_step untouched.
+        mpm_feats = None
+        if self.use_mpm:
+            ma = prosody_audio if prosody_audio is not None else content_audio
+            mpm_raw = self.mpm_extractor(ma)                # (B, T_frames, mpm_dim)
+            mpm_feats = self._align_content_delay(mpm_raw, T, use_delay,
+                torch.zeros(1, 1, mpm_raw.size(-1), device=device, dtype=mpm_raw.dtype))
+            if self.transformer.mpm_norm is not None:
+                mpm_feats = self.transformer.mpm_norm(mpm_feats)
+            drop_mpm_all = drop_pro | drop_both
+            if self.transformer.use_mpm_input:
+                mpm_add = self.transformer.mpm_input_proj(mpm_feats)
+                # Zero AFTER the projection: dropping the input instead would still leave
+                # the conv biases, so the unconditional branch would not be prosody-free.
+                if drop_mpm_all.any():
+                    mpm_add = mpm_add.clone()
+                    mpm_add[drop_mpm_all] = 0.0
+                content_add = content_add + mpm_add.to(dtype=content_add.dtype)
+                mpm_feats = None
+            elif drop_mpm_all.any():
+                mpm_feats = mpm_feats.clone()
+                mpm_feats[drop_mpm_all] = 0.0
+
         # 5. transformer
         if use_cont:
             prompt_add, prompt_film = self._prompt_region_content(
@@ -946,12 +1071,20 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             else:
                 film_full = torch.cat([prompt_film.to(dtype=film_feats.dtype), film_feats], dim=1)
             self._set_prefix_len_for_attn(T_ref)
+            if mpm_feats is not None:
+                mpm_full = torch.cat([
+                    torch.zeros(B, T_ref, mpm_feats.size(-1), device=device, dtype=mpm_feats.dtype),
+                    mpm_feats,
+                ], dim=1)
+            else:
+                mpm_full = None
             decoder_full = self.transformer.decode_step(
                 prev_emb,
                 content_full,
                 film_full,
                 encoder_output=None,
                 use_cache=False,
+                mpm_feats=mpm_full,
             )
             w_prompt = float(getattr(self.config, "codec_prompt_loss_weight", 0.0))
             if w_prompt > 0.0:
@@ -972,12 +1105,20 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 spk, prev_emb, content_add, film_feats,
             )
             self._set_prefix_len_for_attn(prefix.size(1))
+            if mpm_feats is not None:
+                mpm_full = torch.cat([
+                    torch.zeros(B, prefix.size(1), mpm_feats.size(-1), device=device, dtype=mpm_feats.dtype),
+                    mpm_feats,
+                ], dim=1)
+            else:
+                mpm_full = None
             decoder_full = self.transformer.decode_step(
                 prev_full,
                 content_full,
                 film_full,
                 encoder_output=None,
                 use_cache=False,
+                mpm_feats=mpm_full,
             )
             decoder_output = decoder_full[:, prefix.size(1) :, :]
             encoder_output = prefix
@@ -985,7 +1126,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             loss_pos_weights = None
             out = self.transformer(
                 spk, content_add, film_feats, prev_emb,
-                use_cache=False,
+                use_cache=False, mpm_feats=mpm_feats,
             )
             decoder_output = out["decoder_output"]
             encoder_output = out["encoder_output"]
@@ -1143,6 +1284,25 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             prosody_raw = self.prosody_extractor(pa)
             prosody_add = self._align_content_delay(prosody_raw, max_steps, use_delay, self.null_content_embedding)
             content_add = content_add + prosody_add
+        if self.use_cepstral:
+            ca = prosody_audio if prosody_audio is not None else content_audio
+            cep_raw = self.cepstral_extractor(ca)
+            content_add = content_add + self._align_content_delay(
+                cep_raw, max_steps, use_delay, self.null_content_embedding)
+        mpm_feats = None
+        if self.use_mpm:
+            ma = prosody_audio if prosody_audio is not None else content_audio
+            mpm_raw = self.mpm_extractor(ma)
+            mpm_feats = self._align_content_delay(mpm_raw, max_steps, use_delay,
+                torch.zeros(1, 1, mpm_raw.size(-1), device=device, dtype=mpm_raw.dtype))
+            if self.transformer.mpm_norm is not None:
+                mpm_feats = self.transformer.mpm_norm(mpm_feats)
+            if self.transformer.use_mpm_input:
+                # Projected over the whole sequence at once; the convs are left-padded, so
+                # this is identical to projecting frame by frame as tokens are emitted.
+                content_add = content_add + self.transformer.mpm_input_proj(
+                    mpm_feats).to(dtype=content_add.dtype)
+                mpm_feats = None
 
         generated = [[] for _ in range(K)]
         prev_emb = self.transformer.start_token.expand(B, -1, -1)
@@ -1216,6 +1376,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 prefix_film,
                 encoder_output=None,
                 use_cache=False,
+                mpm_feats=None,
             )
             if use_cfg:
                 assert null_caches is not None and null_prefix is not None
@@ -1228,15 +1389,18 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                     encoder_output=None,
                     caches=null_caches,
                     use_cache=False,
+                    mpm_feats=None,
                 )
 
         for t in tqdm(range(T_total), desc="VC generating", leave=False):
             c_t = content_add[:, t : t + 1, :]
             f_t = film_feats[:, t : t + 1, :] if film_feats is not None else None
+            m_t = mpm_feats[:, t : t + 1, :] if mpm_feats is not None else None
             step_use_cache = use_cache and (t > 0 or use_prefix or use_cont)
 
             dec_out = self.transformer.decode_step(
                 prev_emb, c_t, f_t, spk_enc, use_cache=step_use_cache,
+                mpm_feats=m_t,
             )
             hidden_full = dec_out[:, -1, :]
 
@@ -1245,6 +1409,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 null_out, null_caches = self.transformer.decode_step_stateless(
                     prev_emb, c_t, f_t, null_spk_enc, null_caches,
                     use_cache=step_use_cache,
+                    mpm_feats=m_t,
                 )
                 hidden_null = null_out[:, -1, :]
 

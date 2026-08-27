@@ -23,11 +23,29 @@ def config_to_ckpt_dict(config) -> dict:
     return dict(getattr(config, "__dict__", {}))
 
 
+# Fields whose CURRENT default differs from the behaviour every older checkpoint was
+# produced with. Same reasoning as CODEC_PROMPT_FIELD_DEFAULTS below, opposite direction:
+# peak normalisation used to be unconditional, so a stored config without the field was
+# decoded WITH it. Filling in today's False would quietly decode old checkpoints at a
+# different input scale than the one they were evaluated at.
+LEGACY_FIELD_DEFAULTS = {
+    "audio_peak_normalize": True,
+}
+
+
 def read_config_from_ckpt(ckpt_path: str) -> dict | None:
-    """Return the stored config dict, or None for checkpoints saved before this existed."""
+    """Return the stored config dict, or None for checkpoints saved before this existed.
+
+    Missing fields listed in LEGACY_FIELD_DEFAULTS are filled with the value that
+    reproduces how the checkpoint actually behaved, not the current dataclass default.
+    """
     obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = obj.get(CONFIG_CKPT_KEY) if isinstance(obj, dict) else None
-    return cfg if isinstance(cfg, dict) else None
+    if not isinstance(cfg, dict):
+        return None
+    for field, legacy in LEGACY_FIELD_DEFAULTS.items():
+        cfg.setdefault(field, legacy)
+    return cfg
 
 
 def _stored(ckpt_path: str, field: str):

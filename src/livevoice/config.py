@@ -103,10 +103,22 @@ class LiveVoiceConfig:
     # count-mismatch resample. See HuBERTContentExtractor._extract_hidden.
     content_center_align: bool = True
 
+    # Peak-normalise every utterance to |x|max = 1 before it reaches the model.
+    # OFF by default because training never did it: LibriTTSDataset reads the wav and
+    # resamples, nothing more. Inference DID normalise, so the two disagreed — and the
+    # disagreement is not cosmetic: it flattens the loudness contrast that separates
+    # emotions (measured on IEMOCAP_dev, sad/angry RMS ratio 0.145 in the source, 0.674
+    # in our output). Leaving it False makes inference match training.
+    # Checkpoints saved before this field existed are restored with True, since that is
+    # what they were decoded with — see LEGACY_FIELD_DEFAULTS in utils/checkpoint.py.
+    # NOTE this flag does NOT reach the speaker encoders: WavLM-TDNN and SpeechBrain ECAPA
+    # are pretrained on normalised input and would be scored out of distribution without it.
+    audio_peak_normalize: bool = False
+
     # ------------------------------------------------------------------
     # Prosody features (causal)
     # ------------------------------------------------------------------
-    use_prosody: bool = True 
+    use_prosody: bool = False 
     prosody_hop_length: int = 320
     n_fft: int = 1024
     pitch_method: str = "yin" # "yin" | "crepe"
@@ -145,6 +157,53 @@ class LiveVoiceConfig:
     median_filter_min_size: int = 1
     median_filter_max_size: int = 15
     median_filter_inference_size: int = 5
+
+    # ------------------------------------------------------------------
+    # Cepstral conditioning (c0 = frame energy, c1 = spectral tilt)
+    # ------------------------------------------------------------------
+    # the low-order cepstrum does. Both carryn speaker identity, so each coefficient gets its OWN causal filter 
+    # — one shared filter is what made `delta` restore sadness (a shape) while destroying anger (a sustained level).
+    #   c<i>:abs                 raw
+    #   c<i>:delta               x[t]-x[t-1]     'c0:abs,c1:delta'
+    #   c<i>:hp<a>               x[t]-EMA_a(x[t])  'c0:hp0.99,c1:hp0.93'
+    #   c<i>:ms<fast>,<slow>     two channels: (x-EMA_fast) and (EMA_fast-EMA_slow)  'c0:ms0.9,0.99,c1:ms0.9,0.99'
+    # EMA time constant at 50 fps: a=0.90 -> 0.19 s, 0.95 -> 0.39 s, 0.98 -> 0.99 s.
+    use_cepstral: bool = False
+    cepstral_spec: str = "c0:ms0.9,0.99,c1:ms0.9,0.99"
+    cepstral_hidden_dim: int = 128
+
+    # ------------------------------------------------------------------
+    # Causal MPM (Masked Prosody Model) conditioning
+    # ------------------------------------------------------------------
+    use_mpm: bool = True
+    mpm_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/checkpoints/mpm_full/latest.pt"
+    mpm_freeze: bool = True
+    # Where the MPM latent enters the decoder. Changing it changes the parameter set, so a
+    # checkpoint must be decoded with the value it was trained with.
+    #   "perlayer"   — one zero-init Linear per decoder layer, added after every layer.
+    #                  Measured on mpm_220ms @121k: the path DOES open (codes change on
+    #                  92-99% of tokens with MPM on vs off) but it cost 13% relative WER
+    #                  (val 0.2290 vs 0.2016 for the matched no-MPM run) and moved neither
+    #                  UAR (41.86 vs 42.17) nor f0-corr (0.3633 vs 0.3609) on IEMOCAP_dev.
+    #                  CausalMPM.extract() returns the layer-8 hidden UNNORMALISED (rms~10;
+    #                  self.norm only wraps the final layer), so 12 accumulating additions
+    #                  reach ||W@p||~8.75 at the last layer and swamp the hidden state.
+    #   "input_conv" — DiffAnon (arXiv:2604.26281): one causal-conv projection, added once
+    #                  to the decoder input alongside content_add.
+    mpm_conditioning: str = "perlayer"   # perlayer | input_conv
+    # Kernel of each causal conv in the "input_conv" projection (left-padded, so streaming
+    # is unaffected; k frames of receptive field cost nothing in latency).
+    mpm_input_conv_kernel: int = 5
+    # LayerNorm on the MPM latent before either projection. 
+    mpm_norm: bool = True
+
+    # Forwarded to CausalMPMConfig.causal_window: front-pad the prosody analysis window
+    # by (n_fft - hop) so frame t ENDS at the codec frame boundary -- 0 ms lookahead
+    # instead of 44 ms -- and end-pad the last block so the extractor emits exactly
+    # ceil(L/hop) frames (no linspace stretch in align_to_tokens, which used to drift
+    # prosody up to 3 frames / 60 ms by the end of an utterance).
+    # False reproduces checkpoints trained before this fix.
+    mpm_causal_window: bool = True
 
     # ------------------------------------------------------------------
     # Conditioning strategy
@@ -259,12 +318,12 @@ class LiveVoiceConfig:
     # actually needs it (the coarse books carry the signal, the fine tail is low-energy
     # residual) while cutting the latency it costs:
     #     cap 7  0 1 2 3 4 5 6 7   140 ms
-    #     cap 4  0 1 2 3 4 4 4 4    80 ms   ← 160 ms total with zipformer_align_pad_frames=-4
+    #     cap 4  0 1 2 3 4 4 4 4    80 ms   
     #     cap 3  0 1 2 3 3 3 3 3    60 ms
     #     cap 0  0 0 0 0 0 0 0 0     0 ms
     # Changing it changes the AR stream layout, so a checkpoint must be decoded with the same
     # value it was trained with.
-    delay_cap: int = 7
+    delay_cap: int = 3
     n_codebooks_predict: int = 8  # keep it small at 16 kHz (coarse bookss carry most info)
     # Coarse codebooks weighted higher (carry content/prosody, intelligibility);
     # fine codebooks gently down-weighted but not too low (still need detail).
@@ -353,7 +412,7 @@ class LiveVoiceConfig:
     # Front padding (in 50 fps frames)
     #   0  → best lag −4  (content ~80 ms stale, NO added latency)  ← streaming default
     #  −6  → best lag  0  (aligned, but ~120 ms of lookahead)
-    zipformer_align_pad_frames: int = -6
+    zipformer_align_pad_frames: int = -6 #-4
     # Set True when the feature cache was extracted with CMN already applied
     content_cmn_in_cache: bool = False
 
@@ -430,6 +489,17 @@ class LiveVoiceConfig:
     wer_epoch_samples: int = 50
     wer_seed: int = 12345                     # fixed seed for sample selection (stable across epochs)
 
+    # SER (emotion UAR) evaluation on IEMOCAP during training.
+    # Runs once per epoch alongside WER: generates a small fixed set of IEMOCAP
+    # utterances through the model, classifies them with the VPC24 SER models
+    # (fold-aware), and logs val/uar + per-emotion recall.ww
+    log_val_uar: bool = True
+    uar_vpc_root: str = "/mnt/data/disk3/yejin/VPC24"
+    uar_dataset: str = "IEMOCAP_dev"
+    uar_ser_model_dir: str = "/mnt/data/disk3/yejin/VPC24/exp/ser"
+    uar_samples_per_emotion: int = 8
+    uar_seed: int = 54321
+
     # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
@@ -483,6 +553,14 @@ class LiveVoiceConfig:
        # "train-other-500",
     )
     libritts_val_splits: tuple[str, ...] = ("dev-clean",) # "dev-other")
+
+    # Expresso (16 kHz, converted by prepare_expresso.py into LibriTTS layout).
+    # Set to "" to disable. When set, Expresso items are mixed into training with
+    # expresso_weight controlling the sampling ratio vs LibriTTS.
+    expresso_path: str = "/mnt/data/disk3/yejin/LiveVoice/data/expresso16k"
+    expresso_train_splits: tuple[str, ...] = ("train",)
+    expresso_val_splits: tuple[str, ...] = ("dev",)
+    expresso_weight: float = 0.3
 
     # ASR/GRL: extract the full-utterance sw2v features ONLINE from audio (run the encoder live) instead of reading the cache above.
     sw2v_full_online: bool = False

@@ -71,7 +71,10 @@ def load_mono(path: str, target_sr: int = HUBERT_SR) -> torch.Tensor:
 
     if sr != target_sr:
         audio = AF.resample(audio, sr, target_sr)
-    audio = audio / (audio.abs().max() + 1e-8)
+    if peak_normalize:
+        peak = audio.abs().max()
+        if peak > 1e-8:
+            audio = audio / peak
     return audio
 
 

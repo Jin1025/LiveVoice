@@ -6,6 +6,7 @@ Usage (inside docker `yejin2`, conda `sound`):
 import argparse
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -25,9 +26,11 @@ from livevoice.model import (
     StreamVoiceAnonContentEncoder,
     Sw2vContentEncoder,
     ProsodyExtractor,
+    CepstralExtractor,
     LiveVoiceModel,
 )
 from livevoice.lightning import LiveVoiceLightningModule
+from livevoice.utils.checkpoint import load_model_weights_from_ckpt
 from livevoice.data.datamodule import VCTKDataModule, LibriTTSDataModule
 
 
@@ -50,7 +53,11 @@ class EveryNEpochCheckpoint(Callback):
 
 def _CLI_OVERRIDES(args) -> dict:
     """CLI flags allowed to override LiveVoiceConfig. Values of None are dropped."""
-    return {"exp_name": args.exp_name, "train_batch_size": args.train_batch_size}
+    return {
+        "exp_name": args.exp_name,
+        "train_batch_size": args.train_batch_size,
+        "learning_rate": args.learning_rate,
+    }
 
 
 def parse_args():
@@ -76,8 +83,17 @@ def parse_args():
                    help="which dataset to build the datamodule from")
     p.add_argument("--max_steps", type=int, default=400000,
                    help="stop after this many optimizer steps (Trainer arg, not a config field)")
+    p.add_argument("--lr", dest="learning_rate", type=float, default=None,
+                   help="override config.learning_rate (e.g. --lr 5e-5)")
     p.add_argument("--resume_from", type=str, default=None,
-                   help="checkpoint to resume the Trainer from")
+                   help="checkpoint to resume the Trainer from (restores optimizer, step, "
+                        "epoch — use only to continue an INTERRUPTED run of the same config)")
+    p.add_argument("--init_from", type=str, default=None,
+                   help="load model weights only and start a fresh run at step 0. This is the "
+                        "fine-tune entry point: --resume_from would try to restore an optimizer "
+                        "state whose parameter groups no longer match once a new module (e.g. "
+                        "the cepstral extractor) adds parameters. Missing keys are reported and "
+                        "left at their fresh init.")
     # STAGE 2: start from a Stage-1 content tokenizer (train_content_tokenizer.py) and
     # freeze the content path, so the VC decoder can't pull speaker back into content.
     p.add_argument("--content_tokenizer_ckpt", type=str, default=None,
@@ -106,6 +122,8 @@ _RUN_SETTINGS = [
     ("content",  ["content_source", "content_cmn", "content_cmn_prior_frames",
                   "content_cmn_in_cache", "zipformer_align_pad_frames",
                   "use_content_perturbation"]),
+    ("cepstral", ["use_cepstral", "cepstral_spec", "cepstral_hidden_dim"]),
+    ("mpm",      ["use_mpm", "mpm_ckpt", "mpm_freeze"]),
     ("prosody",  ["use_prosody", "pitch_method", "pitch_normalize", "pitch_prior_frames",
                   "pitch_prior_hz", "pitch_fmin", "pitch_fmax", "use_random_median_filter"]),
     ("prompt",   ["codec_prompt_content", "codec_prompt_loss_weight",
@@ -124,7 +142,7 @@ def _print_run_settings(config, args) -> None:
     by what it disables as by what it enables, and a wall of irrelevant sub-settings is how the
     important line gets skimmed past.
     """
-    gates = {"prosody": "use_prosody", "aux loss": None}
+    gates = {"prosody": "use_prosody", "cepstral": "use_cepstral", "mpm": "use_mpm", "aux loss": None}
     print("[train] ---- run settings " + "-" * 46)
     for group, keys in _RUN_SETTINGS:
         gate = gates.get(group)
@@ -228,10 +246,39 @@ def main():
         print(f"[train] content_source={content_source} → skipping HuBERT build")
         content_extractor = None
 
+    cepstral_extractor = None
+    if getattr(config, "use_cepstral", False):
+        print(f"[train] Building CepstralExtractor (spec={config.cepstral_spec})...")
+        cepstral_extractor = CepstralExtractor(config)
+
     prosody_extractor = None
     if config.use_prosody:
         print("[train] Building ProsodyExtractor...")
         prosody_extractor = ProsodyExtractor(config)
+
+    mpm_extractor = None
+    if bool(getattr(config, "use_mpm", False)):
+        from livevoice.model.causal_mpm import CausalMPM, CausalMPMConfig
+        import json as _json
+        mpm_ckpt = str(getattr(config, "mpm_ckpt", ""))
+        if mpm_ckpt:
+            mpm_dir = str(Path(mpm_ckpt).parent)
+            cfg_path = Path(mpm_dir) / "config.json"
+            mpm_cfg = CausalMPMConfig(**_json.load(open(cfg_path))) if Path(cfg_path).exists() else CausalMPMConfig()
+            # the pretrain config.json predates this flag; the LiveVoice config owns it.
+            mpm_cfg.causal_window = bool(getattr(config, "mpm_causal_window", True))
+            mpm_extractor = CausalMPM(mpm_cfg)
+            ckpt_data = torch.load(mpm_ckpt, map_location="cpu", weights_only=False)
+            mpm_extractor.load_state_dict(ckpt_data["model"])
+            if bool(getattr(config, "mpm_freeze", True)):
+                for p in mpm_extractor.parameters():
+                    p.requires_grad_(False)
+                mpm_extractor.eval()
+            print(f"[train] MPM loaded: {mpm_ckpt} "
+                  f"({sum(p.numel() for p in mpm_extractor.parameters())/1e6:.1f}M params, "
+                  f"freeze={getattr(config, 'mpm_freeze', True)})")
+        else:
+            print("[train] WARNING: use_mpm=True but mpm_ckpt is empty — MPM disabled")
 
     # Speaker-GRL adversary needs the class count (train-split speaker vocab) at model
     # build time; the dataset later builds the SAME deterministic mapping for labels.
@@ -242,7 +289,24 @@ def main():
         print(f"[train] speaker-GRL: grl_num_speakers={config.grl_num_speakers} ({kind})")
 
     print("[train] Building LiveVoiceModel...")
-    model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor)
+    model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor,
+                           cepstral_extractor, mpm_extractor=mpm_extractor)
+
+    if args.init_from:
+        print(f"[train] init_from: loading model weights from {args.init_from}")
+        missing, unexpected = load_model_weights_from_ckpt(model, args.init_from,
+                                                          log_prefix="[train]")
+        new_params = [k for k in missing if not k.startswith("codec_model.")]
+        if new_params:
+            print(f"[train]   {len(new_params)} parameter(s) not in the checkpoint — these are "
+                  f"the newly added modules and start from fresh init:")
+            for k in new_params[:12]:
+                print(f"[train]     + {k}")
+            if len(new_params) > 12:
+                print(f"[train]     ... and {len(new_params) - 12} more")
+        if unexpected:
+            print(f"[train]   {len(unexpected)} checkpoint key(s) unused (architecture changed): "
+                  f"{unexpected[:6]}")
 
     if config.compile:
         print("[train] torch.compile ...")

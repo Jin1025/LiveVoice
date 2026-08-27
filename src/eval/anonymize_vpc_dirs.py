@@ -61,12 +61,15 @@ from tqdm import tqdm
 from livevoice.config import LiveVoiceConfig
 from livevoice.lightning import LiveVoiceLightningModule
 from livevoice.model import (
+    CepstralExtractor,
     HuBERTContentExtractor,
+    ProsodyExtractor,
     StreamVoiceAnonContentEncoder,
     Sw2vContentEncoder,
     LiveVoiceModel,
     build_codec,
 )
+from livevoice.model.causal_mpm import CausalMPM, CausalMPMConfig
 from livevoice.utils.checkpoint import (
     infer_codec_prompt_flags_from_ckpt,
     infer_content_source_from_ckpt,
@@ -130,7 +133,7 @@ def _resolve_wav(scp_value: str, wav_base: Path | None = None) -> str:
     )
 
 
-def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
+def _load_full_mono_wav(path: str, target_sr: int, peak_normalize: bool = True) -> torch.Tensor:
     try:
         with sf.SoundFile(path) as f:
             audio_np = f.read(dtype="float32", always_2d=True)
@@ -142,7 +145,7 @@ def _load_full_mono_wav(path: str, target_sr: int) -> torch.Tensor:
         sr = int(sr)
     if sr != target_sr:
         audio = torchaudio.functional.resample(audio, sr, target_sr)
-    return audio / (audio.abs().max() + 1e-8)
+    return audio / (audio.abs().max() + 1e-8) if peak_normalize else audio
 
 
 # ── prompt conditioning ───────────────────────────────────────────────
@@ -234,8 +237,9 @@ def _crop_ending_on_speech(w: torch.Tensor, sr: int, crop_sec: float, top_db: fl
     return w[max(0, stop - n) : stop]
 
 
-def _load_ref(path, target_sr, crop_sec, trim_db: float = 35.0) -> torch.Tensor:
-    w = _load_full_mono_wav(path, target_sr)
+def _load_ref(path, target_sr, crop_sec, trim_db: float = 35.0,
+              peak_normalize: bool = True) -> torch.Tensor:
+    w = _load_full_mono_wav(path, target_sr, peak_normalize)
     if trim_db > 0:
         w = _trim_silence(w, target_sr, trim_db)
         if crop_sec and crop_sec > 0:
@@ -282,12 +286,13 @@ def _decode_entry(entry: str, vpc_root: Path):
         return sf.read(buf, dtype="float32", always_2d=True)
 
 
-def _load_scp_audio(entry: str, vpc_root: Path, target_sr: int) -> torch.Tensor:
+def _load_scp_audio(entry: str, vpc_root: Path, target_sr: int,
+                    peak_normalize: bool = True) -> torch.Tensor:
     audio, sr = _decode_entry(entry, vpc_root)
     w = torch.from_numpy(audio).float().mean(dim=1)
     if int(sr) != target_sr:
         w = torchaudio.functional.resample(w, int(sr), target_sr)
-    return w / (w.abs().max() + 1e-8)
+    return w / (w.abs().max() + 1e-8) if peak_normalize else w
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -420,7 +425,44 @@ def _build_content_extractor(cfg):
 
 def _build_vc_model(args, cfg, dev):
     codec_model = build_codec(cfg)
-    core = LiveVoiceModel(cfg, codec_model, _build_content_extractor(cfg), prosody_extractor=None)
+    # The conditioning modules must be rebuilt here too, not just in train.py: LiveVoiceModel
+    # gates each one on `extractor is not None`, so passing None silently DISABLES a feature the
+    # checkpoint was trained with and the run still completes, producing audio for a different
+    # model than the one being evaluated.
+    pro = ProsodyExtractor(cfg) if bool(getattr(cfg, "use_prosody", False)) else None
+    if pro is not None:
+        print(f"[anon] prosody conditioning: pitch_method={cfg.pitch_method!r} "
+              f"normalize={getattr(cfg, 'pitch_normalize', None)}")
+    cep = CepstralExtractor(cfg) if bool(getattr(cfg, "use_cepstral", False)) else None
+    if cep is not None:
+        print(f"[anon] cepstral conditioning: spec={cfg.cepstral_spec!r} "
+              f"({cep.n_channels} channels)")
+    mpm = None
+    if bool(getattr(cfg, "use_mpm", False)):
+        mpm_ckpt = str(getattr(cfg, "mpm_ckpt", ""))
+        if mpm_ckpt:
+            import json
+            mpm_dir = str(Path(mpm_ckpt).parent)
+            cfg_path = Path(mpm_dir) / "config.json"
+            if cfg_path.exists():
+                mpm_cfg = CausalMPMConfig(**json.load(open(cfg_path)))
+            else:
+                mpm_cfg = CausalMPMConfig()
+            # the pretrain config.json predates this flag; the LiveVoice config owns it.
+            mpm_cfg.causal_window = bool(getattr(cfg, "mpm_causal_window", True))
+            mpm = CausalMPM(mpm_cfg)
+            ckpt_data = torch.load(mpm_ckpt, map_location="cpu", weights_only=False)
+            mpm.load_state_dict(ckpt_data["model"])
+            if bool(getattr(cfg, "mpm_freeze", True)):
+                for p in mpm.parameters():
+                    p.requires_grad_(False)
+                mpm.eval()
+            print(f"[anon] MPM conditioning: {mpm_ckpt} ({sum(p.numel() for p in mpm.parameters())/1e6:.1f}M params)")
+        else:
+            print("[anon] WARNING: use_mpm=True but mpm_ckpt is empty")
+    core = LiveVoiceModel(cfg, codec_model, _build_content_extractor(cfg),
+                          prosody_extractor=pro, cepstral_extractor=cep,
+                          mpm_extractor=mpm)
     missing, unexpected = load_model_weights_from_ckpt(core, args.ckpt, log_prefix="[eval]")
     if missing:
         print(f"[eval] warn: {len(missing)} missing keys (first 3): {missing[:3]}")
@@ -626,6 +668,7 @@ def _run_fingerprint(args) -> dict:
         "cfg_scale": float(args.cfg_scale),
         "top_p": float(args.top_p),
         "top_k": int(args.top_k),
+        "input_gain": float(args.input_gain),
     }
 
 
@@ -769,12 +812,22 @@ def _run_dataset(ds, vpc_root, suffix, lit, cfg, sel, gen_kwargs, dev, args) -> 
     (dst / "wav").mkdir(parents=True, exist_ok=True)
     utts = sorted(scp)[args.shard :: args.num_shards]
     sr = int(cfg.sample_rate)
+    # Restored from the checkpoint (True for anything trained before the flag existed), so a
+    # model is always decoded at the input scale it was evaluated at.
+    pk = bool(getattr(cfg, "audio_peak_normalize", True))
     todo = [u for u in utts if not (dst / "wav" / f"{u}.wav").is_file()]
     print(f"[anon] {ds}: shard {args.shard}/{args.num_shards} → {len(todo)}/{len(utts)} to do")
     for utt in tqdm(todo, desc=f"{ds}[{args.shard}]"):
-        ctn = _load_scp_audio(scp[utt], vpc_root, sr).unsqueeze(0).to(dev)
+        ctn = _load_scp_audio(scp[utt], vpc_root, sr, pk).unsqueeze(0).to(dev)
+        if args.input_gain != 1.0:
+            # ONE scalar for the whole corpus, so the level differences BETWEEN utterances
+            # survive — those are the sad/angry cue (measured sad/ang rms 0.174 on
+            # IEMOCAP_dev). Per-utterance normalisation would erase exactly that.
+            # Applied to the float tensor, so nothing clips: the content path is fbank +
+            # MPM energy, both log-domain, where a gain is a constant offset.
+            ctn = ctn * float(args.input_gain)
         ref = _load_ref(sel.ref_for(utt), sr, args.ref_crop_sec,
-                        float(args.ref_trim_db)).unsqueeze(0).to(dev)
+                        float(args.ref_trim_db), pk).unsqueeze(0).to(dev)
         codes = lit.model.generate(reference_audio=ref, content_audio=ctn, **gen_kwargs)
         aud = lit.model.decode_to_audio(codes)[0].detach().float().cpu()
         # Write via a temp name so an interrupted run never leaves a truncated wav that the
@@ -824,6 +877,13 @@ def main() -> None:
 
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
+    p.add_argument("--input_gain", type=float, default=1.0,
+                   help="single scalar applied to the SOURCE audio before the model, to "
+                        "close the level gap between the training corpus and the one being "
+                        "converted. Measured medians: LibriTTS rms 0.0645, IEMOCAP_dev "
+                        "0.0174, so 3.71 matches them. Corpus-wide by design — a "
+                        "per-utterance normalisation would flatten the between-utterance "
+                        "level differences that distinguish sad from angry.")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top_p", type=float, default=0.0)
     p.add_argument("--top_k", type=int, default=0)

@@ -142,6 +142,30 @@ class LibriTTSDataset(Dataset):
                 utt_id = wav.stem
                 self.speaker_utts.setdefault(spk, []).append((str(wav), utt_id))
 
+        # Expresso (same layout as LibriTTS, produced by prepare_expresso.py)
+        expresso_path = str(getattr(config, "expresso_path", "") or "")
+        self._expresso_spk_set: set[str] = set()
+        if expresso_path:
+            exp_root = Path(expresso_path)
+            if split == "train":
+                exp_splits = tuple(getattr(config, "expresso_train_splits", ("train",)))
+            else:
+                exp_splits = tuple(getattr(config, "expresso_val_splits", ("dev",)))
+            n_before = sum(len(v) for v in self.speaker_utts.values())
+            for s in exp_splits:
+                split_dir = exp_root / s
+                if not split_dir.exists():
+                    print(f"[LibriTTSDataset] expresso split not found: {split_dir} — skipping")
+                    continue
+                for wav in sorted(split_dir.glob("**/*.wav")):
+                    spk = wav.parts[-3]
+                    utt_id = wav.stem
+                    self.speaker_utts.setdefault(spk, []).append((str(wav), utt_id))
+                    self._expresso_spk_set.add(spk)
+            n_after = sum(len(v) for v in self.speaker_utts.values())
+            print(f"[LibriTTSDataset] +expresso: {n_after - n_before} utterances, "
+                  f"{len(self._expresso_spk_set)} speakers")
+
         if self.pairing == "same_speaker":
             self.speaker_utts = {k: v for k, v in self.speaker_utts.items() if len(v) >= 2}
 
