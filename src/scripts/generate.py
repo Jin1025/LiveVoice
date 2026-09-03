@@ -286,6 +286,16 @@ def cmd_vc(args):
         content_extractor = StreamVoiceAnonContentEncoder(config)
     elif config.content_source == "sw2v":
         content_extractor = Sw2vContentEncoder(config)
+    elif config.content_source == "zipformer":
+        from livevoice.model.zipformer_content import ZipformerContentEncoder
+        _lyr = str(config.zipformer_layer)
+        content_extractor = ZipformerContentEncoder(
+            config, config.zipformer_ckpt,
+            layer=(_lyr if _lyr == "out" else int(_lyr)))
+    elif config.content_source == "fastconformer":
+        from livevoice.model.fastconformer_content import FastConformerContentEncoder
+        content_extractor = FastConformerContentEncoder(
+            config, config.fastconformer_ckpt, layer=config.fastconformer_layer)
     else:
         content_extractor = None
     model = LiveVoiceModel(config, codec_model, content_extractor, prosody_extractor=None)

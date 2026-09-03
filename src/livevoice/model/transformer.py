@@ -389,7 +389,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         default_src = "mimi_semantic" if codec_name == "mimi" else "hubert"
         self.content_source = str(getattr(config, "content_source", default_src)).lower()
         valid_content_sources = {"hubert", "mimi_semantic", "streamvoiceanon", "sw2v",
-                                 "zipformer"}
+                                 "zipformer", "fastconformer"}
         if self.content_source not in valid_content_sources:
             raise ValueError(
                 f"content_source must be one of {sorted(valid_content_sources)}; "
@@ -409,11 +409,11 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 "content_source='streamvoiceanon' but content_extractor was not provided. "
                 "Pass StreamVoiceAnonContentEncoder."
             )
-        if self.content_source in ("sw2v", "zipformer") and self.content_extractor is None:
+        if self.content_source in ("sw2v", "zipformer", "fastconformer") and self.content_extractor is None:
             raise ValueError(
                 f"content_source={self.content_source!r} but content_extractor was not "
                 f"provided. Pass "
-                f"{'Sw2vContentEncoder' if self.content_source == 'sw2v' else 'ZipformerContentEncoder'}."
+                f"{'Sw2vContentEncoder' if self.content_source == 'sw2v' else 'FastConformerContentEncoder' if self.content_source == 'fastconformer' else 'ZipformerContentEncoder'}."
             )
         print(
             f"[LiveVoiceModel] content_source={self.content_source}  codec={codec_name}  "
@@ -436,7 +436,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 "[LiveVoiceModel] streamvoiceanon = causal semantic tokenizer "
                 f"(content_dim={config.content_proj_dim})"
             )
-        elif self.content_source in ("sw2v", "zipformer"):
+        elif self.content_source in ("sw2v", "zipformer", "fastconformer"):
             # Continuous encoder output → content_proj_dim → hidden. Both sources share this
             # path (and keep the sw2v_* parameter names so checkpoints stay compatible);
             # only out_dim differs — sw2v 1024, zipformer 512.
@@ -777,7 +777,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 return zeros_add, film_raw
             return self.content_extractor.from_precomputed(content_feats), None
 
-        if content_feats is not None and self.content_source in ("sw2v", "zipformer"):
+        if content_feats is not None and self.content_source in ("sw2v", "zipformer", "fastconformer"):
             # Fast path: precomputed sw2v features (perturbation already baked into cache).
             feats = content_feats.to(device=self.sw2v_proj.weight.device,
                                      dtype=self.sw2v_proj.weight.dtype)
@@ -857,7 +857,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             return self.streamvoiceanon_to_hidden(sva_emb), None
 
         # ── SW2V path: jhcodec AudioEncoder → continuous 1024-d → content_proj_dim ──
-        if self.content_source in ("sw2v", "zipformer"):
+        if self.content_source in ("sw2v", "zipformer", "fastconformer"):
             feat = self.content_extractor(content_audio)      # (B, T_frames, out_dim)
             feat = apply_content_cmn(
                 feat,
@@ -1206,10 +1206,20 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         top_p: float | None = None,
         use_cache: bool = True,
         cfg_scale: float = 1.0,
+        prosody_cfg_scale: float = 1.0,
         speaker_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """If `speaker_override` (B, *, hidden) is given it replaces the speaker
-        representation from `reference_audio` (used by anonymized generation)."""
+        representation from `reference_audio` (used by anonymized generation).
+
+        `prosody_cfg_scale` controls prosody guidance independently of speaker
+        guidance (`cfg_scale`).  When both are != 1.0 the final logit is composed
+        as::
+
+            lg = lg_null_both
+                 + cfg_scale         * (lg_null_pro - lg_null_both)
+                 + prosody_cfg_scale * (lg_null_spk - lg_null_both)
+        """
         use_delay = bool(getattr(self.config, "use_delay_pattern", True))
         d_cb = self._codebook_delays()
         K = self.n_codebooks_predict
@@ -1279,6 +1289,11 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             self._align_content_delay(film_raw, max_steps, use_delay, self.null_film_feature)
             if film_raw is not None else None
         )
+
+        use_pro_cfg = prosody_cfg_scale != 1.0
+        if use_pro_cfg:
+            content_add_null_pro = content_add.clone()
+
         if self.use_prosody:
             pa = prosody_audio if prosody_audio is not None else content_audio
             prosody_raw = self.prosody_extractor(pa)
@@ -1290,6 +1305,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             content_add = content_add + self._align_content_delay(
                 cep_raw, max_steps, use_delay, self.null_content_embedding)
         mpm_feats = None
+        mpm_feats_null_pro = None
         if self.use_mpm:
             ma = prosody_audio if prosody_audio is not None else content_audio
             mpm_raw = self.mpm_extractor(ma)
@@ -1298,11 +1314,11 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             if self.transformer.mpm_norm is not None:
                 mpm_feats = self.transformer.mpm_norm(mpm_feats)
             if self.transformer.use_mpm_input:
-                # Projected over the whole sequence at once; the convs are left-padded, so
-                # this is identical to projecting frame by frame as tokens are emitted.
                 content_add = content_add + self.transformer.mpm_input_proj(
                     mpm_feats).to(dtype=content_add.dtype)
                 mpm_feats = None
+            elif use_pro_cfg:
+                mpm_feats_null_pro = torch.zeros_like(mpm_feats)
 
         generated = [[] for _ in range(K)]
         prev_emb = self.transformer.start_token.expand(B, -1, -1)
@@ -1313,7 +1329,6 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         if use_cfg:
             null_caches = self.transformer.init_caches(B, device)
             if use_cont:
-                # Unconditional branch = the same stream with the prompt region nulled.
                 null_prefix = self.null_speaker_embedding.expand(B, T_ref, -1).to(
                     device=device, dtype=prev_emb.dtype,
                 )
@@ -1333,6 +1348,10 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             null_caches = None
             null_prefix = None
             null_spk_enc = None
+
+        if use_pro_cfg:
+            pro_null_caches = self.transformer.init_caches(B, device)
+            pro_null_spk_enc = spk_enc
 
         if use_cont:
             # Prime the cache with the reference part of the joint AR stream (BOS + delayed
@@ -1391,6 +1410,16 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                     use_cache=False,
                     mpm_feats=None,
                 )
+            if use_pro_cfg:
+                _, pro_null_caches = self.transformer.decode_step_stateless(
+                    prefix,
+                    prefix_content,
+                    prefix_film,
+                    encoder_output=None,
+                    caches=pro_null_caches,
+                    use_cache=False,
+                    mpm_feats=None,
+                )
 
         for t in tqdm(range(T_total), desc="VC generating", leave=False):
             c_t = content_add[:, t : t + 1, :]
@@ -1411,16 +1440,33 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                     use_cache=step_use_cache,
                     mpm_feats=m_t,
                 )
-                hidden_null = null_out[:, -1, :]
+                hidden_null_spk = null_out[:, -1, :]
+
+            if use_pro_cfg:
+                c_t_np = content_add_null_pro[:, t : t + 1, :]
+                m_t_np = mpm_feats_null_pro[:, t : t + 1, :] if mpm_feats_null_pro is not None else m_t
+                pro_null_out, pro_null_caches = self.transformer.decode_step_stateless(
+                    prev_emb, c_t_np, f_t, pro_null_spk_enc, pro_null_caches,
+                    use_cache=step_use_cache,
+                    mpm_feats=m_t_np,
+                )
+                hidden_null_pro = pro_null_out[:, -1, :]
 
             if use_delay:
                 for k in range(K):
                     orig = t - d_cb[k]
                     if 0 <= orig < max_steps:
                         lg = self.codebook_heads[k](hidden_full)
-                        if use_cfg:
-                            lg_n = self.codebook_heads[k](hidden_null)
+                        if use_cfg and use_pro_cfg:
+                            lg_ns = self.codebook_heads[k](hidden_null_spk)
+                            lg_np = self.codebook_heads[k](hidden_null_pro)
+                            lg = lg + (cfg_scale - 1.0) * (lg - lg_ns) + (prosody_cfg_scale - 1.0) * (lg - lg_np)
+                        elif use_cfg:
+                            lg_n = self.codebook_heads[k](hidden_null_spk)
                             lg = lg_n + cfg_scale * (lg - lg_n)
+                        elif use_pro_cfg:
+                            lg_np = self.codebook_heads[k](hidden_null_pro)
+                            lg = lg_np + prosody_cfg_scale * (lg - lg_np)
                         code_k = _sample(lg, temperature, top_k, top_p)
                         generated[k].append(code_k)
                 # next prev_emb
@@ -1431,9 +1477,6 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                     if 0 <= orig < len(generated[k]):
                         nxt += self.decoder_input_projs[k](cb[generated[k][orig]]).unsqueeze(1)
                     elif use_cont and orig < 0 and T_ref + orig >= 0:
-                        # The delay window still straddles the prompt→target boundary, so
-                        # these codebooks read the REFERENCE tail — the joint-stream
-                        # equivalent of what the training forward does at the same positions.
                         nxt += self.decoder_input_projs[k](
                             cb[prompt_codes[:, k, T_ref + orig]]
                         ).unsqueeze(1)
@@ -1441,9 +1484,16 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             else:
                 for k in range(K):
                     lg = self.codebook_heads[k](hidden_full)
-                    if use_cfg:
-                        lg_n = self.codebook_heads[k](hidden_null)
+                    if use_cfg and use_pro_cfg:
+                        lg_ns = self.codebook_heads[k](hidden_null_spk)
+                        lg_np = self.codebook_heads[k](hidden_null_pro)
+                        lg = lg + (cfg_scale - 1.0) * (lg - lg_ns) + (prosody_cfg_scale - 1.0) * (lg - lg_np)
+                    elif use_cfg:
+                        lg_n = self.codebook_heads[k](hidden_null_spk)
                         lg = lg_n + cfg_scale * (lg - lg_n)
+                    elif use_pro_cfg:
+                        lg_np = self.codebook_heads[k](hidden_null_pro)
+                        lg = lg_np + prosody_cfg_scale * (lg - lg_np)
                     generated[k].append(_sample(lg, temperature, top_k, top_p))
                 nxt = torch.zeros(B, 1, self.config.hidden_dim, device=device)
                 for k in range(K):

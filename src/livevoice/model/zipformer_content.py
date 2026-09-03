@@ -130,7 +130,7 @@ class ZipformerContentEncoder(nn.Module):
             pos_dim=arch["pos_dim"],
             dropout=0.0,
             causal=True,                 # streaming checkpoint — must stay causal
-            chunk_size=(16,),            # matches the published chunk_16_left_128 export
+            chunk_size=(getattr(config, "zipformer_chunk_size", 16),),
             left_context_frames=(128,),
         )
         emb_sd = {k[len("encoder_embed."):]: v for k, v in sd.items()

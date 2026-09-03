@@ -56,6 +56,8 @@ class LibriTTSDataset(Dataset):
             feats_base = getattr(config, "sw2v_features_dir", None)
         elif content_source == "zipformer":
             feats_base = getattr(config, "zipformer_features_dir", None)
+        elif content_source == "fastconformer":
+            feats_base = getattr(config, "fastconformer_features_dir", None)
         else:
             feats_base = getattr(config, "features_dir", None)
         self._feats_dir = Path(feats_base) / "libritts" if feats_base else None

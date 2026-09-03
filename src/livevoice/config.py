@@ -38,7 +38,7 @@ class LiveVoiceConfig:
 
     # ------------------------------------------------------------------
     # Codec — "mimi" or "jhcodec"
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------
     codec: str = "jhcodec"
 
     # Mimi (kyutai/mimi) — 24 kHz, 12.5 fps, 8 codebooks, codebook_size 2048
@@ -175,8 +175,8 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     # Causal MPM (Masked Prosody Model) conditioning
     # ------------------------------------------------------------------
-    use_mpm: bool = True
-    mpm_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/checkpoints/mpm_full/latest.pt"
+    use_mpm: bool = False
+    mpm_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/checkpoints/mpm/latest.pt"
     mpm_freeze: bool = True
     # Where the MPM latent enters the decoder. Changing it changes the parameter set, so a
     # checkpoint must be decoded with the value it was trained with.
@@ -394,7 +394,9 @@ class LiveVoiceConfig:
     #   "hubert"        — HuBERT layer-9 hidden states (heavy, bidirectional)
     #   "sw2v"            — jhcodec streaming-wav2vec AudioEncoder, 16 kHz, 50 fps,
     #                       continuous 1024-d (same grid as jhcodec codec tokens).
-    #   "zipformer"       — icefall streaming-Zipformer ASR bottleneck features, 50 fps, 512-d. 
+    #   "zipformer"       — icefall streaming-Zipformer ASR bottleneck features, 50 fps, 512-d.
+    #   "fastconformer"   — NVIDIA FastConformer ASR encoder, 12.5 fps native (512-d).
+    #                       Direct match for mimi (12.5 fps); 4× repeat for jhcodec (50 fps).
     content_source: str = "zipformer"
 
     # Zipformer content encoder (content_source="zipformer").
@@ -412,9 +414,20 @@ class LiveVoiceConfig:
     # Front padding (in 50 fps frames)
     #   0  → best lag −4  (content ~80 ms stale, NO added latency)  ← streaming default
     #  −6  → best lag  0  (aligned, but ~120 ms of lookahead)
+    zipformer_chunk_size: int = 16  # 16 = 320ms, 8 = 160ms (min: 8, due to U-Net 8x stack)
     zipformer_align_pad_frames: int = -6 #-4
     # Set True when the feature cache was extracted with CMN already applied
     content_cmn_in_cache: bool = False
+
+    # FastConformer content encoder (content_source="fastconformer").
+    # Standalone implementation — no NeMo dependency. Weights loaded from .nemo archive.
+    # 12.5 fps native; for jhcodec (50 fps) frames are repeated 4×.
+    fastconformer_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/pretrained_models/fastconformer.nemo"
+    fastconformer_layer: int = 8 #8
+    # Attention context (left, right) in subsampled frames at 12.5 fps.
+    # (70, 0) = causal, no lookahead.  (70, 13) = NeMo default, ~1s lookahead.
+    # right_context=0 means chunk_size=1, fully causal attention.
+    fastconformer_att_context: tuple[int, int] = (70, 0)
 
     # SW2V (jhcodec streaming-wav2vec content encoder).
     sw2v_repo: str = "/workspace/jhcodec"
@@ -493,7 +506,7 @@ class LiveVoiceConfig:
     # Runs once per epoch alongside WER: generates a small fixed set of IEMOCAP
     # utterances through the model, classifies them with the VPC24 SER models
     # (fold-aware), and logs val/uar + per-emotion recall.ww
-    log_val_uar: bool = True
+    log_val_uar: bool = False
     uar_vpc_root: str = "/mnt/data/disk3/yejin/VPC24"
     uar_dataset: str = "IEMOCAP_dev"
     uar_ser_model_dir: str = "/mnt/data/disk3/yejin/VPC24/exp/ser"
@@ -557,7 +570,7 @@ class LiveVoiceConfig:
     # Expresso (16 kHz, converted by prepare_expresso.py into LibriTTS layout).
     # Set to "" to disable. When set, Expresso items are mixed into training with
     # expresso_weight controlling the sampling ratio vs LibriTTS.
-    expresso_path: str = "/mnt/data/disk3/yejin/LiveVoice/data/expresso16k"
+    expresso_path: str = "" # "/mnt/data/disk3/yejin/LiveVoice/data/expresso16k" 
     expresso_train_splits: tuple[str, ...] = ("train",)
     expresso_val_splits: tuple[str, ...] = ("dev",)
     expresso_weight: float = 0.3
@@ -571,6 +584,8 @@ class LiveVoiceConfig:
     # sw2v_features_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/perturbed/sw2v"
     # Precomputed phoneme-id caches (scripts/extract_phonemes.py); mirrors sw2v_features_dir.
     phoneme_cache_dir: str = "/mnt/data/disk2/yejin/LiveVoice/features/phonemes"
+
+    fastconformer_features_dir: str | None = None
 
     # Debug cap
     max_windows: int | None = None

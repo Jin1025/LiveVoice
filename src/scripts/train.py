@@ -169,7 +169,7 @@ def main():
 
     # HuBERT and SW2V both support precomputed caches, but use separate config paths.
     content_source = str(config.content_source).lower()
-    if content_source not in ("hubert", "sw2v", "zipformer"):
+    if content_source not in ("hubert", "sw2v", "zipformer", "fastconformer"):
         config.features_dir = None
 
     if content_source == "hubert":
@@ -242,6 +242,11 @@ def main():
         content_extractor = ZipformerContentEncoder(
             config, config.zipformer_ckpt,
             layer=(_lyr if _lyr == "out" else int(_lyr)))
+    elif content_source == "fastconformer":
+        from livevoice.model.fastconformer_content import FastConformerContentEncoder
+        print(f"[train] Building FastConformer content encoder ({config.fastconformer_ckpt})...")
+        content_extractor = FastConformerContentEncoder(
+            config, config.fastconformer_ckpt, layer=config.fastconformer_layer)
     else:
         print(f"[train] content_source={content_source} → skipping HuBERT build")
         content_extractor = None

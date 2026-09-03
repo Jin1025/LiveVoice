@@ -26,7 +26,7 @@ gaps and are the whole reason for using this corpus.
 
     python src/scripts/prepare_expresso.py \
         --expresso /mnt/data/disk3/yejin/expresso \
-        --out /mnt/data/disk2/yejin/LiveVoice/data/expresso16k
+        --out /mnt/data/disk3/yejin/LiveVoice/data/expresso16k
 """
 from __future__ import annotations
 

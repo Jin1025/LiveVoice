@@ -81,6 +81,13 @@ from livevoice.utils.checkpoint import (
 
 DEFAULT_VPC_ROOT = "/mnt/data/disk3/yejin/VPC"
 
+# Pre-measured LibriTTS training corpus median RMS (train-clean-100, 5000 samples, seed 42).
+# Used as the reference level for universal gain matching: every input corpus is scaled so
+# its median RMS matches this value. Corpus-level (not per-utterance), so causal and
+# preserves between-utterance level differences (emotion cues).
+_LIBRITTS_TRAIN_MEDIAN_RMS = 0.062233
+_GAIN_MATCH_MAX_UTTS = 2000
+
 # The pseudo-speaker, pinned rather than redrawn. The seeded search below is reproducible, but
 # it is reproducible only for a fixed pool + seed + screening rule: retuning --ref_min_sec or
 # --ref_trim_db, or pointing at a differently-populated VCTK copy, silently moves the target
@@ -293,6 +300,40 @@ def _load_scp_audio(entry: str, vpc_root: Path, target_sr: int,
     if int(sr) != target_sr:
         w = torchaudio.functional.resample(w, int(sr), target_sr)
     return w / (w.abs().max() + 1e-8) if peak_normalize else w
+
+
+def _compute_corpus_gain(wavscp: Path, vpc_root: Path, target_sr: int,
+                         peak_normalize: bool) -> float:
+    """Compute gain to match this corpus's median RMS to LibriTTS training level.
+
+    Samples up to _GAIN_MATCH_MAX_UTTS utterances (deterministic seed) to keep
+    startup fast. Returns 1.0 if the corpus is already close (within 10%).
+    """
+    import numpy as np
+    scp = _read_kaldi(wavscp)
+    entries = list(scp.values())
+    if len(entries) > _GAIN_MATCH_MAX_UTTS:
+        rng = np.random.RandomState(42)
+        indices = rng.choice(len(entries), _GAIN_MATCH_MAX_UTTS, replace=False)
+        entries = [entries[i] for i in indices]
+    rms_vals = []
+    for entry in entries:
+        try:
+            w = _load_scp_audio(entry, vpc_root, target_sr, peak_normalize)
+            if w.numel() < 1600:
+                continue
+            rms = float(w.pow(2).mean().sqrt())
+            if rms > 1e-6:
+                rms_vals.append(rms)
+        except Exception:
+            continue
+    if len(rms_vals) < 10:
+        return 1.0
+    median_rms = float(np.median(rms_vals))
+    gain = _LIBRITTS_TRAIN_MEDIAN_RMS / median_rms
+    if 0.9 <= gain <= 1.1:
+        return 1.0
+    return gain
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -666,9 +707,11 @@ def _run_fingerprint(args) -> dict:
         "ref_min_sec": float(args.ref_min_sec),
         "temperature": float(args.temperature),
         "cfg_scale": float(args.cfg_scale),
+        "prosody_cfg_scale": float(args.prosody_cfg_scale),
         "top_p": float(args.top_p),
         "top_k": int(args.top_k),
         "input_gain": float(args.input_gain),
+        "auto_gain": bool(args.auto_gain),
     }
 
 
@@ -812,20 +855,20 @@ def _run_dataset(ds, vpc_root, suffix, lit, cfg, sel, gen_kwargs, dev, args) -> 
     (dst / "wav").mkdir(parents=True, exist_ok=True)
     utts = sorted(scp)[args.shard :: args.num_shards]
     sr = int(cfg.sample_rate)
-    # Restored from the checkpoint (True for anything trained before the flag existed), so a
-    # model is always decoded at the input scale it was evaluated at.
     pk = bool(getattr(cfg, "audio_peak_normalize", True))
+
+    if args.auto_gain:
+        gain = _compute_corpus_gain(src / "wav.scp", vpc_root, sr, pk)
+        print(f"[anon] {ds}: auto_gain={gain:.4f}")
+    else:
+        gain = float(args.input_gain)
+
     todo = [u for u in utts if not (dst / "wav" / f"{u}.wav").is_file()]
     print(f"[anon] {ds}: shard {args.shard}/{args.num_shards} → {len(todo)}/{len(utts)} to do")
     for utt in tqdm(todo, desc=f"{ds}[{args.shard}]"):
         ctn = _load_scp_audio(scp[utt], vpc_root, sr, pk).unsqueeze(0).to(dev)
-        if args.input_gain != 1.0:
-            # ONE scalar for the whole corpus, so the level differences BETWEEN utterances
-            # survive — those are the sad/angry cue (measured sad/ang rms 0.174 on
-            # IEMOCAP_dev). Per-utterance normalisation would erase exactly that.
-            # Applied to the float tensor, so nothing clips: the content path is fbank +
-            # MPM energy, both log-domain, where a gain is a constant offset.
-            ctn = ctn * float(args.input_gain)
+        if gain != 1.0:
+            ctn = ctn * gain
         ref = _load_ref(sel.ref_for(utt), sr, args.ref_crop_sec,
                         float(args.ref_trim_db), pk).unsqueeze(0).to(dev)
         codes = lit.model.generate(reference_audio=ref, content_audio=ctn, **gen_kwargs)
@@ -880,14 +923,16 @@ def main() -> None:
     p.add_argument("--input_gain", type=float, default=1.0,
                    help="single scalar applied to the SOURCE audio before the model, to "
                         "close the level gap between the training corpus and the one being "
-                        "converted. Measured medians: LibriTTS rms 0.0645, IEMOCAP_dev "
-                        "0.0174, so 3.71 matches them. Corpus-wide by design — a "
-                        "per-utterance normalisation would flatten the between-utterance "
-                        "level differences that distinguish sad from angry.")
+                        "converted. Overridden per-dataset by --auto_gain.")
+    p.add_argument("--auto_gain", action="store_true",
+                   help="automatically compute per-corpus gain to match LibriTTS training "
+                        "level (median RMS). Universal preprocessing: the same logic applies "
+                        "to every corpus, no dataset-specific tuning. Overrides --input_gain.")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top_p", type=float, default=0.0)
     p.add_argument("--top_k", type=int, default=0)
     p.add_argument("--cfg_scale", type=float, default=1.0)
+    p.add_argument("--prosody_cfg_scale", type=float, default=1.0)
 
     p.add_argument("--codec", default="jhcodec", choices=["mimi", "jhcodec"])
     p.add_argument("--hidden_dim", type=int, default=768)
@@ -941,7 +986,8 @@ def main() -> None:
     cfg = _build_vc_config(args, str(dev))
     lit = _build_vc_model(args, cfg, dev)
     sel = _make_selector(args)
-    gen_kwargs = dict(temperature=float(args.temperature), cfg_scale=float(args.cfg_scale))
+    gen_kwargs = dict(temperature=float(args.temperature), cfg_scale=float(args.cfg_scale),
+                      prosody_cfg_scale=float(args.prosody_cfg_scale))
     if args.top_p:
         gen_kwargs["top_p"] = float(args.top_p)
     if args.top_k:

@@ -609,6 +609,8 @@ class LiveVoiceLightningModule(L.LightningModule):
         ctn = batch["content_audio"]
         tgt = batch["target_audio"]
         content_feats = batch.get("content_hubert", None)  # (B, T, 768) or None
+        if getattr(self.config, "content_source", "hubert") not in ("hubert",):
+            content_feats = None
         content_paths = batch.get("content_path", None)
         content_starts = batch.get("content_start_sample", None)
         ref_paths = batch.get("ref_path", None)
@@ -748,6 +750,8 @@ class LiveVoiceLightningModule(L.LightningModule):
         tgt = batch["target_audio"]
         content_feats = batch.get("content_hubert", None)
 
+        if getattr(self.config, "content_source", "hubert") not in ("hubert",):
+            content_feats = None
         content_paths = batch.get("content_path", None)
         content_starts = batch.get("content_start_sample", None)
         ref_paths = batch.get("ref_path", None)
@@ -1139,6 +1143,8 @@ class LiveVoiceLightningModule(L.LightningModule):
                     cfg_scale=float(getattr(self.config, "val_cfg_scale", 1.0)),
                 )
                 gen = self.model.decode_to_audio(codes).detach().float().cpu()
+                if target_sr != 16000:
+                    gen = torchaudio.functional.resample(gen, target_sr, 16000)
 
                 _, _, _, text_lab = clf.classify_batch(gen)
                 pred_emo = text_lab[0]
