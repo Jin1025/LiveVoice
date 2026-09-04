@@ -200,6 +200,27 @@ class LiveVoiceTransformer(nn.Module):
             new_caches.append(kv_out)
         return self.decoder_norm(x), new_caches
 
+    def decode_step_cudagraph(
+        self,
+        decoder_input: torch.Tensor,
+        content_add: torch.Tensor,
+        film_feats: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Fixed-shape one-token decoder body used only during CUDA capture."""
+        x = decoder_input + content_add
+        for i, layer in enumerate(self.decoder_layers):
+            x = x + layer.self_attn.forward_cudagraph(layer.ln1(x))
+            x = x + layer.ff(layer.ln3(x))
+            if self.use_film:
+                gb = self.film_mlps[i](film_feats)
+                gamma = 1.0 + gb[..., : self.hidden_dim]
+                beta = gb[..., self.hidden_dim :]
+                x = x * gamma + beta
+        return self.decoder_norm(x)
+
+    def make_decode_cudagraph(self, decoder_input, content_add, film_feats):
+        return _LiveVoiceDecodeGraph(self, decoder_input, content_add, film_feats).capture()
+
     def forward(
         self,
         speaker_embedding: torch.Tensor,
@@ -254,6 +275,65 @@ class LiveVoiceTransformer(nn.Module):
                 layer.self_attn._cache_inited = False
             if hasattr(layer, "cross_attn") and hasattr(layer.cross_attn, "_cache_inited"):
                 layer.cross_attn._cache_inited = False
+
+
+class _LiveVoiceDecodeGraph:
+    """One CUDA-graph replay for the complete 12-layer AR decoder step."""
+
+    def __init__(self, transformer, decoder_input, content_add, film_feats):
+        if decoder_input.shape[0] != 1 or decoder_input.shape[1] != 1:
+            raise ValueError("LiveVoice CUDA graph currently supports B=1, T=1")
+        if transformer.use_mpm_perlayer:
+            raise ValueError("LiveVoice CUDA graph does not support per-layer MPM")
+        self.transformer = transformer
+        self.static_decoder_input = torch.empty_like(decoder_input)
+        self.static_content_add = torch.empty_like(content_add)
+        self.static_film_feats = None if film_feats is None else torch.empty_like(film_feats)
+        for layer in transformer.decoder_layers:
+            if layer.do_cross_attn:
+                raise ValueError("LiveVoice CUDA graph requires decoder-only/prefix conditioning")
+            layer.self_attn.prepare_cudagraph_cache()
+        self.graph = None
+        self.output = None
+
+    def _fn(self):
+        return self.transformer.decode_step_cudagraph(
+            self.static_decoder_input, self.static_content_add, self.static_film_feats)
+
+    def reset(self):
+        for layer in self.transformer.decoder_layers:
+            layer.self_attn.reset_cudagraph_cache()
+
+    def refresh_prefix(self):
+        for layer in self.transformer.decoder_layers:
+            layer.self_attn.refresh_cudagraph_prefix()
+
+    def capture(self):
+        torch.cuda.synchronize()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), torch.no_grad():
+            for _ in range(3):
+                self._fn()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        self.reset()
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.no_grad():
+            self.output = self._fn()
+        torch.cuda.synchronize()
+        self.reset()
+        return self
+
+    @torch.no_grad()
+    def step(self, decoder_input, content_add, film_feats):
+        self.static_decoder_input.copy_(decoder_input)
+        self.static_content_add.copy_(content_add)
+        if self.static_film_feats is not None:
+            self.static_film_feats.copy_(film_feats)
+        self.graph.replay()
+        return self.output
 
 
 # =====================================================================
@@ -1195,6 +1275,75 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
 
     # --------------------- generation ---------------------
     @torch.no_grad()
+    def set_ar_inference_dtype(self, dtype: torch.dtype) -> None:
+        """Cast only the autoregressive decoder path for mixed-precision inference.
+
+        The waveform codec and Zipformer remain fp32.  This avoids autocast's
+        repeated weight conversion on the many B=1 per-token GEMVs.
+        """
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"unsupported AR inference dtype: {dtype}")
+        self.transformer.to(dtype=dtype)
+        self.decoder_input_projs.to(dtype=dtype)
+        self.codebook_heads.to(dtype=dtype)
+        for k in range(self.n_codebooks_predict):
+            name = f"codebook_vectors_{k}"
+            setattr(self, name, getattr(self, name).to(dtype=dtype))
+        for name in (
+            "null_speaker_embedding", "null_content_embedding", "null_prev_embedding",
+            "null_film_feature",
+        ):
+            value = getattr(self, name, None)
+            if value is not None:
+                value.data = value.data.to(dtype=dtype)
+        self._inference_head_pack = None
+
+    def set_fast_inference(self, enabled: bool = True) -> None:
+        """Enable inference-only operator packing on the AR decoder."""
+        for layer in self.transformer.decoder_layers:
+            layer.self_attn.fuse_qkv_inference = bool(enabled)
+            layer.self_attn._inference_qkv_pack = None
+
+    def _packed_codebook_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Evaluate all codebook heads with one GEMM for greedy inference.
+
+        The regular ModuleList path is retained for training and stochastic/CFG
+        decoding.  The packed tensors are rebuilt after any parameter update and
+        are deliberately not persistent checkpoint state.
+        """
+        versions = tuple((h.weight._version, h.bias._version) for h in self.codebook_heads)
+        cache = getattr(self, "_inference_head_pack", None)
+        if cache is None or cache[0] != versions or cache[1].device != hidden.device:
+            weight = torch.cat([h.weight.detach() for h in self.codebook_heads], dim=0)
+            bias = torch.cat([h.bias.detach() for h in self.codebook_heads], dim=0)
+            self._inference_head_pack = (versions, weight, bias)
+        _, weight, bias = self._inference_head_pack
+        logits = F.linear(hidden, weight, bias)
+        return logits.view(hidden.shape[0], self.n_codebooks_predict, -1)
+
+    @torch.no_grad()
+    def _projected_codebook_tables(self) -> torch.Tensor:
+        """Cache proj_k(codebook_k) so token feedback becomes gather + sum.
+
+        This removes K small matrix-vector products from every AR step. Biases
+        are included in each table, exactly matching the original projections.
+        """
+        versions = tuple(
+            (p.weight._version, p.bias._version,
+             getattr(self, f"codebook_vectors_{k}")._version)
+            for k, p in enumerate(self.decoder_input_projs)
+        )
+        cache = getattr(self, "_inference_projected_codebooks", None)
+        device = self.decoder_input_projs[0].weight.device
+        if cache is None or cache[0] != versions or cache[1].device != device:
+            tables = torch.stack([
+                proj(getattr(self, f"codebook_vectors_{k}"))
+                for k, proj in enumerate(self.decoder_input_projs)
+            ])
+            self._inference_projected_codebooks = (versions, tables)
+        return self._inference_projected_codebooks[1]
+
+    @torch.no_grad()
     def generate(
         self,
         reference_audio: torch.Tensor,
@@ -1208,6 +1357,10 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         cfg_scale: float = 1.0,
         prosody_cfg_scale: float = 1.0,
         speaker_override: torch.Tensor | None = None,
+        show_progress: bool = True,
+        fuse_codebook_heads: bool = False,
+        use_cuda_graph: bool = False,
+        content_feats: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """If `speaker_override` (B, *, hidden) is given it replaces the speaker
         representation from `reference_audio` (used by anonymized generation).
@@ -1259,7 +1412,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 spk_prefix = None
                 spk_enc = self.transformer.encode_speaker(spk)
 
-        content_add_raw, film_raw = self.extract_content(content_audio)
+        content_add_raw, film_raw = self.extract_content(content_audio, content_feats)
         if max_steps is None:
             # Use codec frame count as generation horizon.
             # HuBERT/content frames (e.g. 50 fps) can differ from codec frames
@@ -1289,6 +1442,12 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             self._align_content_delay(film_raw, max_steps, use_delay, self.null_film_feature)
             if film_raw is not None else None
         )
+        # Content extraction may intentionally remain fp32 while the latency-
+        # critical AR stack uses static fp16/bf16 weights.
+        ar_dtype = self.transformer.start_token.dtype
+        content_add = content_add.to(dtype=ar_dtype)
+        if film_feats is not None:
+            film_feats = film_feats.to(dtype=ar_dtype)
 
         use_pro_cfg = prosody_cfg_scale != 1.0
         if use_pro_cfg:
@@ -1352,6 +1511,17 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         if use_pro_cfg:
             pro_null_caches = self.transformer.init_caches(B, device)
             pro_null_spk_enc = spk_enc
+
+        # One [K*V, D] GEMM is substantially more efficient than K tiny [V, D]
+        # GEMVs at B=1. It is valid only where each head is decoded greedily and
+        # no CFG branch needs separate logits.
+        use_packed_greedy = bool(fuse_codebook_heads) and not use_cfg and not use_pro_cfg \
+            and (temperature is None or temperature <= 0 or top_k == 1)
+        projected_codebooks = self._projected_codebook_tables() if use_packed_greedy else None
+        codebook_ids = (
+            torch.arange(K, device=device).unsqueeze(0)
+            if projected_codebooks is not None else None
+        )
 
         if use_cont:
             # Prime the cache with the reference part of the joint AR stream (BOS + delayed
@@ -1421,17 +1591,55 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                     mpm_feats=None,
                 )
 
-        for t in tqdm(range(T_total), desc="VC generating", leave=False):
+        decode_graph = None
+        graph_supported = (
+            bool(use_cuda_graph)
+            and B == 1
+            and (use_prefix or use_cont)
+            and spk_enc is None
+            and not use_cfg
+            and not use_pro_cfg
+            and not self.transformer.use_mpm_perlayer
+            and (T_ref + T_total) < int(self.config.max_seq_len)
+        )
+        if graph_supported:
+            graph_key = (
+                T_ref, prev_emb.dtype, prev_emb.device,
+                None if film_feats is None else film_feats.shape[-1],
+            )
+            cached = getattr(self.transformer, "_decode_cudagraph_cache", None)
+            if cached is None or cached[0] != graph_key:
+                decode_graph = self.transformer.make_decode_cudagraph(
+                    prev_emb, content_add[:, :1, :],
+                    film_feats[:, :1, :] if film_feats is not None else None,
+                )
+                self.transformer._decode_cudagraph_cache = (graph_key, decode_graph)
+            else:
+                decode_graph = cached[1]
+                decode_graph.refresh_prefix()
+
+        for t in tqdm(
+            range(T_total), desc="VC generating", leave=False,
+            disable=not show_progress,
+        ):
             c_t = content_add[:, t : t + 1, :]
             f_t = film_feats[:, t : t + 1, :] if film_feats is not None else None
             m_t = mpm_feats[:, t : t + 1, :] if mpm_feats is not None else None
             step_use_cache = use_cache and (t > 0 or use_prefix or use_cont)
 
-            dec_out = self.transformer.decode_step(
-                prev_emb, c_t, f_t, spk_enc, use_cache=step_use_cache,
-                mpm_feats=m_t,
-            )
+            if decode_graph is not None:
+                dec_out = decode_graph.step(prev_emb, c_t, f_t)
+            else:
+                dec_out = self.transformer.decode_step(
+                    prev_emb, c_t, f_t, spk_enc, use_cache=step_use_cache,
+                    mpm_feats=m_t,
+                )
             hidden_full = dec_out[:, -1, :]
+
+            packed_codes = None
+            if use_packed_greedy:
+                packed_codes = torch.argmax(
+                    self._packed_codebook_logits(hidden_full), dim=-1)
 
             if use_cfg:
                 assert null_caches is not None
@@ -1456,33 +1664,47 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                 for k in range(K):
                     orig = t - d_cb[k]
                     if 0 <= orig < max_steps:
-                        lg = self.codebook_heads[k](hidden_full)
-                        if use_cfg and use_pro_cfg:
-                            lg_ns = self.codebook_heads[k](hidden_null_spk)
-                            lg_np = self.codebook_heads[k](hidden_null_pro)
-                            lg = lg + (cfg_scale - 1.0) * (lg - lg_ns) + (prosody_cfg_scale - 1.0) * (lg - lg_np)
-                        elif use_cfg:
-                            lg_n = self.codebook_heads[k](hidden_null_spk)
-                            lg = lg_n + cfg_scale * (lg - lg_n)
-                        elif use_pro_cfg:
-                            lg_np = self.codebook_heads[k](hidden_null_pro)
-                            lg = lg_np + prosody_cfg_scale * (lg - lg_np)
-                        code_k = _sample(lg, temperature, top_k, top_p)
+                        if packed_codes is not None:
+                            code_k = packed_codes[:, k]
+                        else:
+                            lg = self.codebook_heads[k](hidden_full)
+                            if use_cfg and use_pro_cfg:
+                                lg_ns = self.codebook_heads[k](hidden_null_spk)
+                                lg_np = self.codebook_heads[k](hidden_null_pro)
+                                lg = lg + (cfg_scale - 1.0) * (lg - lg_ns) + (prosody_cfg_scale - 1.0) * (lg - lg_np)
+                            elif use_cfg:
+                                lg_n = self.codebook_heads[k](hidden_null_spk)
+                                lg = lg_n + cfg_scale * (lg - lg_n)
+                            elif use_pro_cfg:
+                                lg_np = self.codebook_heads[k](hidden_null_pro)
+                                lg = lg_np + prosody_cfg_scale * (lg - lg_np)
+                            code_k = _sample(lg, temperature, top_k, top_p)
                         generated[k].append(code_k)
                 # next prev_emb
-                nxt = torch.zeros(B, 1, self.config.hidden_dim, device=device)
-                for k in range(K):
-                    orig = t - d_cb[k]
-                    cb = getattr(self, f"codebook_vectors_{k}")
-                    if 0 <= orig < len(generated[k]):
-                        nxt += self.decoder_input_projs[k](cb[generated[k][orig]]).unsqueeze(1)
-                    elif use_cont and orig < 0 and T_ref + orig >= 0:
-                        nxt += self.decoder_input_projs[k](
-                            cb[prompt_codes[:, k, T_ref + orig]]
-                        ).unsqueeze(1)
+                # In the long body all K feedback tokens exist. Use one table
+                # gather and reduction instead of K decoder-input GEMVs.
+                if projected_codebooks is not None and max(d_cb) <= t < max_steps:
+                    feedback_idx = torch.stack(
+                        [generated[k][t - d_cb[k]] for k in range(K)], dim=1)
+                    nxt = projected_codebooks[codebook_ids, feedback_idx].sum(dim=1, keepdim=True)
+                else:
+                    nxt = torch.zeros(
+                        B, 1, self.config.hidden_dim, device=device, dtype=prev_emb.dtype)
+                    for k in range(K):
+                        orig = t - d_cb[k]
+                        cb = getattr(self, f"codebook_vectors_{k}")
+                        if 0 <= orig < len(generated[k]):
+                            nxt += self.decoder_input_projs[k](cb[generated[k][orig]]).unsqueeze(1)
+                        elif use_cont and orig < 0 and T_ref + orig >= 0:
+                            nxt += self.decoder_input_projs[k](
+                                cb[prompt_codes[:, k, T_ref + orig]]
+                            ).unsqueeze(1)
                 prev_emb = nxt
             else:
                 for k in range(K):
+                    if packed_codes is not None:
+                        generated[k].append(packed_codes[:, k])
+                        continue
                     lg = self.codebook_heads[k](hidden_full)
                     if use_cfg and use_pro_cfg:
                         lg_ns = self.codebook_heads[k](hidden_null_spk)
@@ -1495,10 +1717,15 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
                         lg_np = self.codebook_heads[k](hidden_null_pro)
                         lg = lg_np + prosody_cfg_scale * (lg - lg_np)
                     generated[k].append(_sample(lg, temperature, top_k, top_p))
-                nxt = torch.zeros(B, 1, self.config.hidden_dim, device=device)
-                for k in range(K):
-                    cb = getattr(self, f"codebook_vectors_{k}")
-                    nxt += self.decoder_input_projs[k](cb[generated[k][-1]]).unsqueeze(1)
+                if projected_codebooks is not None:
+                    feedback_idx = torch.stack([generated[k][-1] for k in range(K)], dim=1)
+                    nxt = projected_codebooks[codebook_ids, feedback_idx].sum(dim=1, keepdim=True)
+                else:
+                    nxt = torch.zeros(
+                        B, 1, self.config.hidden_dim, device=device, dtype=prev_emb.dtype)
+                    for k in range(K):
+                        cb = getattr(self, f"codebook_vectors_{k}")
+                        nxt += self.decoder_input_projs[k](cb[generated[k][-1]]).unsqueeze(1)
                 prev_emb = nxt
 
         return torch.stack([torch.stack(generated[k], dim=1) for k in range(K)], dim=1)
@@ -1509,6 +1736,12 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
 
 
 def _sample(logits, temperature, top_k, top_p):
+    # top_k=1 has exactly the same distribution as greedy decoding. Handle it
+    # before the diagnostic reductions: the old path synchronized CUDA on
+    # isfinite(...).all() several times for every codebook and every frame,
+    # then ran topk + softmax + multinomial to sample a one-point distribution.
+    if temperature is None or temperature <= 0 or top_k == 1:
+        return torch.argmax(logits, dim=-1)
     # Guard against a diverged model producing NaN/Inf logits: torch.multinomial on
     # non-finite/negative probs triggers a CUDA device-side assert that corrupts the whole
     # context and crashes the run (surfacing later as a misleading CUBLAS_INTERNAL_ERROR).
@@ -1516,8 +1749,6 @@ def _sample(logits, temperature, top_k, top_p):
     # validation sample degrades to noise instead of killing training.
     if not torch.isfinite(logits).all():
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
-    if temperature is None or temperature <= 0:
-        return torch.argmax(logits, dim=-1)
     lg = _top_k_top_p(logits, top_k, top_p)
     probs = F.softmax(lg / temperature, dim=-1)
     if not torch.isfinite(probs).all() or (probs.sum(dim=-1) <= 0).any():

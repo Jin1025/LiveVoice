@@ -386,6 +386,41 @@ class Conv2dSubsampling(nn.Module):
 
         return x, x_lens, cached_left_pad
 
+    def streaming_forward_exact(
+        self,
+        x: torch.Tensor,
+        cached_left_pad: Tensor,
+        num_output_frames: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Streaming subsampling with an explicit output count and exact EOF flush.
+
+        ``x`` starts at the fbank frame corresponding to the next un-emitted
+        subsampled frame.  For a normal 16-frame chunk it contains 45 fbank
+        frames, producing 16 current plus 3 ConvNeXt lookahead frames.  At EOF
+        fewer lookahead frames may exist; padding *after* the strided conv is
+        then exactly the right padding used by the batch ConvNeXt path.
+        """
+        if num_output_frames <= 0:
+            raise ValueError("num_output_frames must be positive")
+        x = self.conv(x.unsqueeze(1))
+        needed = num_output_frames + self.convnext.padding[0]
+        if x.size(2) < num_output_frames:
+            raise ValueError(
+                f"frontend produced {x.size(2)} frames, needs {num_output_frames}")
+        if x.size(2) < needed:
+            x = torch.nn.functional.pad(x, (0, 0, 0, needed - x.size(2)))
+        elif x.size(2) > needed:
+            x = x[:, :, :needed]
+        x, cached_left_pad = self.convnext.streaming_forward(
+            x, cached_left_pad=cached_left_pad)
+
+        b, c, t, f = x.size()
+        assert t == num_output_frames, (t, num_output_frames)
+        x = x.transpose(1, 2).reshape(b, t, c * f)
+        x = self.out(x)
+        x = self.out_norm(x)
+        return x, cached_left_pad
+
     @torch.jit.export
     def get_init_states(
         self,

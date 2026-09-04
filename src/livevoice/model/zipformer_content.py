@@ -23,7 +23,7 @@ as LibriTTS, so no domain mismatch (unlike MeanVC 2's WenetSpeech/Mandarin check
 from __future__ import annotations
 
 import re
-from typing import Sequence
+from typing import Callable, Sequence
 
 import torch
 import torch.nn as nn
@@ -202,13 +202,17 @@ class ZipformerContentEncoder(nn.Module):
     # for a streaming target; set negative to buy alignment with latency.
     ALIGN_PAD_FRAMES = 0
 
-    @torch.no_grad()
-    def forward(self, audio: torch.Tensor, sample_rate: int = 16000,
-                align_to_codec: bool = True) -> torch.Tensor:
+    def _prepare_aligned_audio(
+        self,
+        audio: torch.Tensor,
+        sample_rate: int,
+        align_to_codec: bool,
+    ) -> tuple[torch.Tensor, int]:
+        """Apply the exact waveform alignment used by the existing batch path."""
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         hop = sample_rate // 50
-        n_target = -(-int(audio.shape[-1]) // hop)          # ceil — what jhcodec emits
+        n_target = -(-int(audio.shape[-1]) // hop)
         if align_to_codec:
             pad = int(getattr(self.config_pad, "zipformer_align_pad_frames",
                               self.ALIGN_PAD_FRAMES))
@@ -216,14 +220,16 @@ class ZipformerContentEncoder(nn.Module):
                 audio = torch.nn.functional.pad(audio, (pad * hop, 0))
             elif pad < 0:
                 audio = audio[..., -pad * hop:]
-            # Conv2dSubsampling emits (T_fbank - 7)//2 frames, so the front shift alone
-            # leaves the output SHORT of ceil(len/hop). Pad the AUDIO at the tail until the
-            # encoder can emit enough real frames — zero-filling the feature tensor instead
-            # would hand the model fabricated all-zero content at the end of every utterance.
-            # jhcodec end-pads its final block the same way.
             need_samples = (2 * n_target + 7) * (sample_rate // 100) - audio.shape[-1]
             if need_samples > 0:
                 audio = torch.nn.functional.pad(audio, (0, int(need_samples)))
+        return audio, n_target
+
+    @torch.no_grad()
+    def forward(self, audio: torch.Tensor, sample_rate: int = 16000,
+                align_to_codec: bool = True) -> torch.Tensor:
+        audio, n_target = self._prepare_aligned_audio(
+            audio, sample_rate, align_to_codec)
         x = self._fbank(audio, sample_rate).to(next(self.parameters()).device)
         x_lens = torch.full((x.size(0),), x.size(1), dtype=torch.int64, device=x.device)
         x, x_lens = self.encoder_embed(x, x_lens)
@@ -247,3 +253,179 @@ class ZipformerContentEncoder(nn.Module):
                     f"tail audio padding above should have prevented this. Zero-filling here "
                     f"would feed the model fabricated content.")
         return feats
+
+    @torch.no_grad()
+    def forward_encoder_streaming(
+        self,
+        audio: torch.Tensor,
+        sample_rate: int = 16000,
+        align_to_codec: bool = True,
+    ) -> torch.Tensor:
+        """Run Zipformer one chunk at a time with its real state/cache API.
+
+        This first equivalence stage intentionally keeps waveform alignment, fbank,
+        and Conv2dSubsampling identical to ``forward``.  It isolates the stateful
+        Zipformer boundary before incremental frontend buffering is implemented.
+        """
+        audio, n_target = self._prepare_aligned_audio(
+            audio, sample_rate, align_to_codec)
+        x = self._fbank(audio, sample_rate).to(next(self.parameters()).device)
+        x_lens = torch.full(
+            (x.size(0),), x.size(1), dtype=torch.int64, device=x.device)
+        x, x_lens = self.encoder_embed(x, x_lens)
+
+        chunk_size = int(self.encoder.chunk_size[0])
+        if chunk_size <= 0:
+            raise ValueError(
+                "forward_encoder_streaming requires a positive Zipformer chunk size")
+        batch_size, total_frames, _ = x.shape
+        states = self.encoder.get_init_states(batch_size=batch_size, device=x.device)
+        left_context = int(self.encoder.left_context_frames[0])
+        cache_padding = torch.ones(
+            batch_size, left_context, dtype=torch.bool, device=x.device)
+        pieces: list[torch.Tensor] = []
+
+        for start in range(0, total_frames, chunk_size):
+            chunk = x[:, start:start + chunk_size]
+            valid = int(chunk.shape[1])
+            if valid < chunk_size:
+                chunk = torch.nn.functional.pad(chunk, (0, 0, 0, chunk_size - valid))
+            chunk_lens = torch.full(
+                (batch_size,), valid, dtype=torch.int64, device=x.device)
+            current_padding = (
+                torch.arange(chunk_size, device=x.device)[None, :] >= chunk_lens[:, None]
+            )
+            padding_mask = torch.cat([cache_padding, current_padding], dim=1)
+            self._tap = None
+            out, _, states = self.encoder.streaming_forward(
+                chunk.permute(1, 0, 2), chunk_lens, states, padding_mask)
+            cache_padding = torch.cat(
+                [cache_padding, current_padding], dim=1)[:, -left_context:]
+            if self.layer == "out":
+                piece = out.permute(1, 0, 2)
+            else:
+                assert self._tap is not None, "tap hook did not fire in streaming forward"
+                piece, self._tap = self._tap.permute(1, 0, 2), None
+            pieces.append(piece[:, :valid])
+
+        feats = torch.cat(pieces, dim=1)
+        if align_to_codec and self.layer != "out":
+            if feats.shape[1] < n_target:
+                raise RuntimeError(
+                    f"streaming Zipformer emitted {feats.shape[1]} frames but needs {n_target}")
+            feats = feats[:, :n_target]
+        return feats
+
+    @torch.no_grad()
+    def waveform_streaming_chunks(
+        self,
+        audio: torch.Tensor,
+        sample_rate: int = 16000,
+        input_chunk_samples: int | None = None,
+        align_to_codec: bool = True,
+        on_chunk: Callable[[torch.Tensor], None] | None = None,
+    ) -> list[torch.Tensor]:
+        """Simulate raw waveform arrival and return finalized 50-Hz chunks.
+
+        No future waveform is read while processing a non-final input block.
+        Fbank frames whose 25-ms analysis window touches the current right edge
+        are held back.  The subsampler consumes overlapping fbank windows and
+        both it and Zipformer retain their real streaming states.  EOF uses the
+        same waveform tail padding and ConvNeXt right padding as ``forward``.
+        """
+        if self.layer == "out":
+            raise NotImplementedError("25-Hz output taps are not used by LiveVoice streaming")
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        if audio.size(0) != 1:
+            raise ValueError("waveform_streaming_chunks currently supports batch size 1")
+        hop = sample_rate // 50
+        chunk_size = int(self.encoder.chunk_size[0])
+        if chunk_size <= 0:
+            raise ValueError("streaming requires a positive Zipformer chunk size")
+        if input_chunk_samples is None:
+            input_chunk_samples = chunk_size * hop
+        if input_chunk_samples <= 0:
+            raise ValueError("input_chunk_samples must be positive")
+
+        pad = int(getattr(self.config_pad, "zipformer_align_pad_frames",
+                          self.ALIGN_PAD_FRAMES)) if align_to_codec else 0
+        front_zeros = max(0, pad) * hop
+        front_skip = max(0, -pad) * hop
+        device = next(self.parameters()).device
+        embed_state = self.encoder_embed.get_init_states(1, device)
+        encoder_states = self.encoder.get_init_states(batch_size=1, device=device)
+        left_context = int(self.encoder.left_context_frames[0])
+        cache_padding = torch.ones(1, left_context, dtype=torch.bool, device=device)
+        fbank_offset = 0
+        emitted = 0
+        output_chunks: list[torch.Tensor] = []
+
+        def run_encoder(embedded: torch.Tensor, valid: int) -> None:
+            nonlocal encoder_states, cache_padding
+            if valid < chunk_size:
+                embedded = torch.nn.functional.pad(
+                    embedded, (0, 0, 0, chunk_size - valid))
+            current_padding = (
+                torch.arange(chunk_size, device=device)[None, :] >= valid
+            )
+            padding_mask = torch.cat([cache_padding, current_padding], dim=1)
+            self._tap = None
+            _, _, encoder_states = self.encoder.streaming_forward(
+                embedded.permute(1, 0, 2),
+                torch.tensor([valid], dtype=torch.int64, device=device),
+                encoder_states,
+                padding_mask,
+            )
+            cache_padding = torch.cat(
+                [cache_padding, current_padding], dim=1)[:, -left_context:]
+            assert self._tap is not None, "tap hook did not fire in waveform streaming"
+            piece, self._tap = self._tap.permute(1, 0, 2)[:, :valid], None
+            output_chunks.append(piece)
+            if on_chunk is not None:
+                on_chunk(piece)
+
+        def aligned_prefix(end: int) -> torch.Tensor:
+            prefix = audio[..., :end]
+            if front_zeros:
+                prefix = torch.nn.functional.pad(prefix, (front_zeros, 0))
+            elif front_skip:
+                prefix = prefix[..., min(front_skip, prefix.shape[-1]):]
+            return prefix
+
+        # A snip_edges=False 25-ms frame at index i needs samples through
+        # i*10ms+17.5ms.  Only commit frames whose right edge has arrived.
+        frame_shift = sample_rate // 100
+        right_extent = 7 * sample_rate // 400  # 17.5 ms
+        total_samples = int(audio.shape[-1])
+        for end in range(input_chunk_samples, total_samples, input_chunk_samples):
+            prefix = aligned_prefix(end)
+            n_prefix = int(prefix.shape[-1])
+            stable = max(0, (n_prefix - right_extent - 1) // frame_shift + 1)
+            # 45 fbank frames -> 19 strided-conv frames -> 16 finalized
+            # ConvNeXt frames.  Each following window advances by 32 fbanks.
+            if stable < fbank_offset + 2 * chunk_size + 13:
+                continue
+            fbanks = self._fbank(prefix, sample_rate).to(device)
+            while stable >= fbank_offset + 2 * chunk_size + 13:
+                segment = fbanks[:, fbank_offset:fbank_offset + 2 * chunk_size + 13]
+                embedded, embed_state = self.encoder_embed.streaming_forward_exact(
+                    segment, embed_state, chunk_size)
+                run_encoder(embedded, chunk_size)
+                fbank_offset += 2 * chunk_size
+                emitted += chunk_size
+
+        # Flush using exactly the same aligned/tail-padded waveform as batch mode.
+        final_audio, n_target = self._prepare_aligned_audio(
+            audio, sample_rate, align_to_codec)
+        final_fbanks = self._fbank(final_audio, sample_rate).to(device)
+        while emitted < n_target:
+            valid = min(chunk_size, n_target - emitted)
+            segment = final_fbanks[:, fbank_offset:]
+            embedded, embed_state = self.encoder_embed.streaming_forward_exact(
+                segment, embed_state, valid)
+            run_encoder(embedded, valid)
+            fbank_offset += 2 * valid
+            emitted += valid
+
+        return output_chunks

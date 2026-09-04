@@ -196,6 +196,8 @@ class MultiHeadAttention(nn.Module):
         self.value = nn.Linear(model_dim, model_dim)
         self.query = nn.Linear(model_dim, model_dim)
         self.proj = nn.Linear(model_dim, model_dim)
+        self.fuse_qkv_inference = False
+        self._inference_qkv_pack = None
 
         # Dropout layers
         self.attn_dropout = nn.Dropout(dropout)
@@ -311,7 +313,11 @@ class MultiHeadAttention(nn.Module):
         
         batch_size, in_seq_len, _ = x.size()
         # Project inputs
-        q = self._reshape(self.query(x))
+        if not self.cross_attn and self.fuse_qkv_inference:
+            q, new_k, new_v = self._project_qkv(x)
+        else:
+            q = self._reshape(self.query(x))
+            new_k = new_v = None
         if self.cross_attn:
             if mem is None:
                 new_k = None
@@ -322,8 +328,9 @@ class MultiHeadAttention(nn.Module):
                 new_v = self._reshape(self.value(mem))
                 in_cache_len = mem.size(1)
         else:
-            new_k = self._reshape(self.key(x))
-            new_v = self._reshape(self.value(x))
+            if new_k is None:
+                new_k = self._reshape(self.key(x))
+                new_v = self._reshape(self.value(x))
             in_cache_len = in_seq_len
         
         # Update cache
@@ -400,7 +407,11 @@ class MultiHeadAttention(nn.Module):
             Tuple[torch.Tensor, dict]: (attn_out [B, Lq, D], kv_cache_out)
         """
         batch_size, in_seq_len, _ = x.size()
-        q = self._reshape(self.query(x))
+        if not self.cross_attn and self.fuse_qkv_inference:
+            q, new_k, new_v = self._project_qkv(x)
+        else:
+            q = self._reshape(self.query(x))
+            new_k = new_v = None
         
         if self.cross_attn:
             if mem is None:
@@ -412,8 +423,9 @@ class MultiHeadAttention(nn.Module):
                 new_v = self._reshape(self.value(mem))
                 in_cache_len = mem.size(1)
         else:
-            new_k = self._reshape(self.key(x))
-            new_v = self._reshape(self.value(x))
+            if new_k is None:
+                new_k = self._reshape(self.key(x))
+                new_v = self._reshape(self.value(x))
             in_cache_len = in_seq_len
         
         # kv_cache_in이 None이면 초기화
@@ -466,6 +478,78 @@ class MultiHeadAttention(nn.Module):
         y = y.transpose(1, 2).reshape(batch_size, in_seq_len, -1)
         return self.proj_dropout(self.proj(y)), kv_cache_out
     
+    def _project_qkv(self, x):
+        """Project self-attention Q/K/V in one inference GEMM."""
+        versions = (
+            self.query.weight._version, self.query.bias._version,
+            self.key.weight._version, self.key.bias._version,
+            self.value.weight._version, self.value.bias._version,
+        )
+        cache = self._inference_qkv_pack
+        if cache is None or cache[0] != versions or cache[1].device != x.device:
+            weight = torch.cat(
+                (self.query.weight.detach(), self.key.weight.detach(), self.value.weight.detach()),
+                dim=0,
+            )
+            bias = torch.cat(
+                (self.query.bias.detach(), self.key.bias.detach(), self.value.bias.detach()),
+                dim=0,
+            )
+            self._inference_qkv_pack = (versions, weight, bias)
+        _, weight, bias = self._inference_qkv_pack
+        q, k, v = F.linear(x, weight, bias).chunk(3, dim=-1)
+        return self._reshape(q), self._reshape(k), self._reshape(v)
+
+    @torch.no_grad()
+    def prepare_cudagraph_cache(self) -> None:
+        """Create fixed-shape cache state from the current eager prefix cache."""
+        if self.cross_attn or not self._cache_inited:
+            raise RuntimeError("CUDA graph cache requires a primed self-attention cache")
+        self._cg_prefix_len = int(self.cur_cache_len)
+        self._cg_prefix_k = self.k_cache.clone()
+        self._cg_prefix_v = self.v_cache.clone()
+        self._cg_k = self.k_cache.clone()
+        self._cg_v = self.v_cache.clone()
+        self._cg_pos = torch.tensor(
+            [self._cg_prefix_len], device=self.k_cache.device, dtype=torch.long)
+        # Fixed [1,H,L,L] bias permits a fixed-capacity SDPA graph. Rows at
+        # positions >= prefix_len are the only rows replayed. Prompt columns
+        # receive the same ALiBi exemption as the eager implementation.
+        bias = self.causal_attn_bias + self.alibi_attn_bias
+        exempt = min(int(self._active_prefix_len), bias.shape[-1])
+        if exempt > 0:
+            bias = bias.clone()
+            bias[..., :exempt] = 0.0
+        self._cg_attn_bias = bias.contiguous()
+
+    @torch.no_grad()
+    def refresh_cudagraph_prefix(self) -> None:
+        """Refresh fixed graph buffers from a newly primed identical-length prefix."""
+        if int(self.cur_cache_len) != int(self._cg_prefix_len):
+            raise RuntimeError(
+                f"CUDA graph prefix changed: {self.cur_cache_len} != {self._cg_prefix_len}")
+        self._cg_prefix_k.copy_(self.k_cache)
+        self._cg_prefix_v.copy_(self.v_cache)
+        self.reset_cudagraph_cache()
+
+    @torch.no_grad()
+    def reset_cudagraph_cache(self) -> None:
+        self._cg_k.copy_(self._cg_prefix_k)
+        self._cg_v.copy_(self._cg_prefix_v)
+        self._cg_pos.fill_(self._cg_prefix_len)
+
+    def forward_cudagraph(self, x: torch.Tensor) -> torch.Tensor:
+        """Fixed-capacity, graph-capturable one-token self-attention."""
+        q, new_k, new_v = self._project_qkv(x)
+        self._cg_k.index_copy_(2, self._cg_pos, new_k)
+        self._cg_v.index_copy_(2, self._cg_pos, new_v)
+        bias = self._cg_attn_bias.index_select(2, self._cg_pos)
+        y = F.scaled_dot_product_attention(
+            q, self._cg_k, self._cg_v, attn_mask=bias, dropout_p=0.0)
+        self._cg_pos.add_(1)
+        y = y.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1)
+        return self.proj(y)
+
     def _reshape(self, x):
         """Reshape tensor for multi-head computation."""
         return x.view(x.size(0), x.size(1), self.num_heads, self.head_dim).transpose(1, 2)
@@ -499,6 +583,7 @@ class MultiHeadAttention(nn.Module):
         """Reset cache for new sequence and initialize sink at indices 0..sink_size-1."""
         capacity = self.self_capacity
         device = new_k.device if new_k is not None else self.query.weight.device
+        dtype = new_k.dtype if new_k is not None else self.query.weight.dtype
         batch_size = new_k.size(0) if new_k is not None else 1
         sink = self.sink_size
 
@@ -509,6 +594,7 @@ class MultiHeadAttention(nn.Module):
             capacity,
             self.head_dim,
             device=device,
+            dtype=dtype,
         )
         self.v_cache = torch.zeros(
             batch_size,
@@ -516,6 +602,7 @@ class MultiHeadAttention(nn.Module):
             capacity,
             self.head_dim,
             device=device,
+            dtype=dtype,
         )
 
         # Initialize sink at indices [0..sink_size-1]
@@ -550,6 +637,14 @@ class MultiHeadAttention(nn.Module):
             v = self.v_cache[:, :, :sink, :]
             self.cur_cache_len = sink
             return k, v
+        # Until the ring has wrapped, valid entries already occupy one contiguous
+        # prefix. Returning views avoids two arange kernels, cat/index expansion,
+        # and full-cache gathers in every layer at every autoregressive step.
+        # Once wrapping occurs we retain the general chronological gather below.
+        if tail < ring_size and self._ring_write_pos == sink + tail:
+            end = sink + tail
+            self.cur_cache_len = end
+            return self.k_cache[:, :, :end, :], self.v_cache[:, :, :end, :]
         # Compute chronological indices in non-sink ring [sink..L-1]
         start = (self._ring_write_pos - tail - sink) % ring_size  # 0-based in [0..ring_size-1]
         idx = (start + torch.arange(tail, device=self.k_cache.device)) % ring_size
@@ -669,5 +764,3 @@ def gather_cache_view_ext(kv_cache: dict):
     v = torch.gather(kv_cache["v"], 2, index)
     kv_cache["cur_cache_len"] = sink + tail
     return k, v, kv_cache
-
-
