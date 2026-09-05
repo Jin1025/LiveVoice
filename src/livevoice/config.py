@@ -175,8 +175,8 @@ class LiveVoiceConfig:
     # ------------------------------------------------------------------
     # Causal MPM (Masked Prosody Model) conditioning
     # ------------------------------------------------------------------
-    use_mpm: bool = False
-    mpm_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/checkpoints/mpm/latest.pt"
+    use_mpm: bool = True
+    mpm_ckpt: str = "/mnt/data/disk2/yejin/LiveVoice/checkpoints/mpm_full/latest.pt"
     mpm_freeze: bool = True
     # Where the MPM latent enters the decoder. Changing it changes the parameter set, so a
     # checkpoint must be decoded with the value it was trained with.
@@ -190,7 +190,9 @@ class LiveVoiceConfig:
     #                  reach ||W@p||~8.75 at the last layer and swamp the hidden state.
     #   "input_conv" — DiffAnon (arXiv:2604.26281): one causal-conv projection, added once
     #                  to the decoder input alongside content_add.
-    mpm_conditioning: str = "perlayer"   # perlayer | input_conv
+    #   "film"       — FiLM: per-layer scale/shift modulation of the decoder hidden state.
+    #                  Physically separate from content_add, so prosody never corrupts content.
+    mpm_conditioning: str = "film"   # perlayer | input_conv | film
     # Kernel of each causal conv in the "input_conv" projection (left-padded, so streaming
     # is unaffected; k frames of receptive field cost nothing in latency).
     mpm_input_conv_kernel: int = 5
@@ -295,11 +297,20 @@ class LiveVoiceConfig:
     val_cfg_scale: float = 1.0
 
     use_cfg_dropout: bool = True
-    cfg_drop_both_p: float = 0.1
-    cfg_drop_speaker_p: float = 0.1
-    cfg_drop_content_p: float = 0.1
-    cfg_drop_prosody_p: float = 0.2
-    prev_emb_dropout_p: float = 0.1
+    cfg_drop_both_p: float = 0.2 # 0.2 # 0.1
+    cfg_drop_speaker_p: float = 0 # 0 #  0.1
+    cfg_drop_content_p: float = 0 # 0 # 0.1
+    cfg_drop_prosody_p: float = 0.3 # 0.3 # 0.2
+    prev_emb_dropout_p: float = 0.1 # 0.1
+
+    # ------------------------------------------------------------------
+    # MPM finetuning (init from pretrained baseline, add FiLM)
+    # ------------------------------------------------------------------
+    # When True: DiffAnon-style mutually exclusive CFG dropout + separate param groups.
+    # FiLM at mpm_finetune_film_lr, backbone at mpm_finetune_backbone_lr.
+    mpm_finetune: bool = True
+    mpm_finetune_film_lr: float = 1e-4
+    mpm_finetune_backbone_lr: float = 1e-5
 
     # ------------------------------------------------------------------
     # Training
@@ -570,7 +581,7 @@ class LiveVoiceConfig:
     # Expresso (16 kHz, converted by prepare_expresso.py into LibriTTS layout).
     # Set to "" to disable. When set, Expresso items are mixed into training with
     # expresso_weight controlling the sampling ratio vs LibriTTS.
-    expresso_path: str = "" # "/mnt/data/disk3/yejin/LiveVoice/data/expresso16k" 
+    expresso_path: str = "/mnt/data/disk3/yejin/LiveVoice/data/expresso16k" 
     expresso_train_splits: tuple[str, ...] = ("train",)
     expresso_val_splits: tuple[str, ...] = ("dev",)
     expresso_weight: float = 0.3

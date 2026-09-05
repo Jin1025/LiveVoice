@@ -39,6 +39,7 @@ class LibriTTSDataset(Dataset):
         self.duration = float(config.audio_duration)
         self.target_len = int(round(self.duration * self.target_sr))
         self.pairing = str(getattr(config, "pairing", "same_speaker"))
+        self.peak_normalize = bool(getattr(config, "audio_peak_normalize", True))
 
         root = Path(config.libritts_path)
 
@@ -437,11 +438,8 @@ class LibriTTSDataset(Dataset):
         else:
             audio = torch.nn.functional.pad(audio, (0, self.target_len - n))
 
-        # Peak-normalise only. A random training gain used to be applied here, but the
-        # CACHED content features are extracted from peak-normalised audio with no such
-        # gain (scripts/extract_sw2v_features.py), so the codec tokens saw a random level
-        # the content features never did — an unintended train-time inconsistency.
-        audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
+        if self.peak_normalize:
+            audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
         return audio, start
 
     def _load_feats(self, spk: str, utt_id: str, start_sample: int) -> torch.Tensor | None:

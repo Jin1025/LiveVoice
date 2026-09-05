@@ -112,17 +112,19 @@ class LiveVoiceTransformer(nn.Module):
                 nn.init.zeros_(mlp[-1].weight)
                 nn.init.zeros_(mlp[-1].bias)
 
-        # Prosody conditioning from MPM hidden states. Two shapes, see mpm_conditioning:
-        #   perlayer   — a zero-init Linear per decoder layer, added after every layer, on a
-        #                gradient path separate from the content FiLM.
+        # Prosody conditioning from MPM hidden states. Three shapes, see mpm_conditioning:
+        #   perlayer   — a zero-init Linear per decoder layer, added after every layer.
         #   input_conv — DiffAnon: one causal-conv projection added at the decoder input.
+        #   film       — FiLM: per-layer scale/shift modulation. Does NOT touch content_add,
+        #                so content and prosody paths are physically separate.
         _use_mpm = bool(getattr(config, "use_mpm", False))
         _mode = str(getattr(config, "mpm_conditioning", "perlayer")).lower()
-        if _use_mpm and _mode not in ("perlayer", "input_conv"):
+        if _use_mpm and _mode not in ("perlayer", "input_conv", "film"):
             raise ValueError(f"unknown mpm_conditioning {_mode!r}; expected "
-                             f"'perlayer' or 'input_conv'")
+                             f"'perlayer', 'input_conv', or 'film'")
         self.use_mpm_perlayer = _use_mpm and _mode == "perlayer"
         self.use_mpm_input = _use_mpm and _mode == "input_conv"
+        self.use_mpm_film = _use_mpm and _mode == "film"
         mpm_dim = int(getattr(config, "mpm_perlayer_dim", 256))
         # Shared by both shapes: CausalMPM.extract() taps layer 8 and returns it
         # unnormalised (rms~10), which is why the projections only have to grow a little
@@ -132,17 +134,27 @@ class LiveVoiceTransformer(nn.Module):
                          else None)
         if self.use_mpm_perlayer:
             self.mpm_layer_projs = nn.ModuleList([
-                nn.Linear(mpm_dim, config.hidden_dim)
+                nn.Linear(mpm_dim, config.hidden_dim, bias=False)
                 for _ in range(config.num_decoder_layers)
             ])
             for proj in self.mpm_layer_projs:
                 nn.init.zeros_(proj.weight)
-                nn.init.zeros_(proj.bias)
         elif self.use_mpm_input:
             self.mpm_input_proj = MPMInputProjection(
                 mpm_dim, config.hidden_dim,
                 int(getattr(config, "mpm_input_conv_kernel", 5)),
             )
+        elif self.use_mpm_film:
+            self.mpm_film_mlps = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(mpm_dim, config.hidden_dim, bias=False),
+                    nn.GELU(),
+                    nn.Linear(config.hidden_dim, 2 * config.hidden_dim, bias=False),
+                )
+                for _ in range(config.num_decoder_layers)
+            ])
+            for mlp in self.mpm_film_mlps:
+                nn.init.zeros_(mlp[-1].weight)
 
     def encode_speaker(self, speaker_embedding: torch.Tensor) -> torch.Tensor:
         x = speaker_embedding
@@ -171,6 +183,11 @@ class LiveVoiceTransformer(nn.Module):
                 x = x * gamma + beta
             if self.use_mpm_perlayer and mpm_feats is not None:
                 x = x + self.mpm_layer_projs[i](mpm_feats)
+            if self.use_mpm_film and mpm_feats is not None:
+                gb = self.mpm_film_mlps[i](mpm_feats)
+                gamma = 1.0 + gb[..., : self.hidden_dim]
+                beta = gb[..., self.hidden_dim :]
+                x = x * gamma + beta
         return self.decoder_norm(x)
 
     def decode_step_stateless(
@@ -197,6 +214,11 @@ class LiveVoiceTransformer(nn.Module):
                 x = x * gamma + beta
             if self.use_mpm_perlayer and mpm_feats is not None:
                 x = x + self.mpm_layer_projs[i](mpm_feats)
+            if self.use_mpm_film and mpm_feats is not None:
+                gb = self.mpm_film_mlps[i](mpm_feats)
+                gamma = 1.0 + gb[..., : self.hidden_dim]
+                beta = gb[..., self.hidden_dim :]
+                x = x * gamma + beta
             new_caches.append(kv_out)
         return self.decoder_norm(x), new_caches
 
@@ -526,6 +548,14 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
             # parameter names — a Stage-1 checkpoint loads straight in. See
             # model/content_supervision.py.
             build_content_path(self, config, sw2v_dim, log_prefix="[LiveVoiceModel]")
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode:
+            for m in (self.codec_model, self.content_extractor, self.mpm_extractor):
+                if m is not None and not any(p.requires_grad for p in m.parameters()):
+                    m.eval()
+        return self
 
     # --------------------- helpers ---------------------
     _warned_short_align = False
@@ -1005,10 +1035,19 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         drop_ctn = torch.zeros(B, dtype=torch.bool, device=device)
         drop_pro = torch.zeros(B, dtype=torch.bool, device=device)
         if self.training and bool(getattr(self.config, "use_cfg_dropout", False)):
-            drop_both = torch.rand(B, device=device) < float(self.config.cfg_drop_both_p)
-            drop_spk = torch.rand(B, device=device) < float(self.config.cfg_drop_speaker_p)
-            drop_ctn = torch.rand(B, device=device) < float(self.config.cfg_drop_content_p)
-            drop_pro = torch.rand(B, device=device) < float(self.config.cfg_drop_prosody_p)
+            if bool(getattr(self.config, "mpm_finetune", False)):
+                # DiffAnon-style mutually exclusive: full / prosody-null / prosody+speaker-null.
+                # Content is NEVER dropped; speaker is NEVER dropped alone.
+                p_pro = float(self.config.cfg_drop_prosody_p)
+                p_both = float(self.config.cfg_drop_both_p)
+                r = torch.rand(B, device=device)
+                drop_pro = (r < p_pro) & (r >= p_both)
+                drop_both = r < p_both
+            else:
+                drop_both = torch.rand(B, device=device) < float(self.config.cfg_drop_both_p)
+                drop_spk = torch.rand(B, device=device) < float(self.config.cfg_drop_speaker_p)
+                drop_ctn = torch.rand(B, device=device) < float(self.config.cfg_drop_content_p)
+                drop_pro = torch.rand(B, device=device) < float(self.config.cfg_drop_prosody_p)
 
         # 0. VALL-E continuation: the reference codes are the FIRST part of the SAME AR
         # stream as the target (single BOS at the very front, one delay pattern across
@@ -1080,7 +1119,7 @@ class LiveVoiceModel(nn.Module, ContentSupervisionMixin):
         # FiLM path zero-initialised and an AR stream that can be continued from prev_emb
         # alone, "the decoder ignores content" is a real failure mode; this measures it the
         # same way null_speaker measures prompt usage.
-        drop_ctn_all = drop_ctn | drop_both
+        drop_ctn_all = drop_ctn if bool(getattr(self.config, "mpm_finetune", False)) else (drop_ctn | drop_both)
         if null_content:
             drop_ctn_all = torch.ones(B, dtype=torch.bool, device=device)
         if drop_ctn_all.any():

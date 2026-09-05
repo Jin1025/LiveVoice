@@ -1204,12 +1204,34 @@ class LiveVoiceLightningModule(L.LightningModule):
         return gen_audio
 
     def configure_optimizers(self):
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(
-            params,
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-        )
+        use_ft = bool(getattr(self.config, "mpm_finetune", False))
+
+        if not use_ft:
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            opt = torch.optim.AdamW(
+                params,
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+            )
+        else:
+            film_lr = float(getattr(self.config, "mpm_finetune_film_lr", 1e-4))
+            backbone_lr = float(getattr(self.config, "mpm_finetune_backbone_lr", 1e-5))
+            film_ids = set()
+            if self.model.transformer.use_mpm_film:
+                film_ids = {id(p) for p in self.model.transformer.mpm_film_mlps.parameters()}
+            film_params = [p for p in self.model.parameters()
+                           if p.requires_grad and id(p) in film_ids]
+            backbone_params = [p for p in self.model.parameters()
+                               if p.requires_grad and id(p) not in film_ids]
+            groups = []
+            if film_params:
+                groups.append({"params": film_params, "lr": film_lr})
+            if backbone_params:
+                groups.append({"params": backbone_params, "lr": backbone_lr})
+            opt = torch.optim.AdamW(groups, weight_decay=self.config.weight_decay)
+            print(f"[mpm_finetune] FiLM LR={film_lr} ({len(film_params)} tensors), "
+                  f"backbone LR={backbone_lr} ({len(backbone_params)} tensors)")
+
         try:
             total_steps = self.trainer.estimated_stepping_batches
         except Exception:
